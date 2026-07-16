@@ -19,6 +19,7 @@ import fitz
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
+from app.airlines import airline_terminology_payload, get_airline_terminology
 from app.parsers import select_parser
 from app.reporting import build_bid_report
 
@@ -106,7 +107,7 @@ INDEX_HTML = r"""
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#071525">
   <title>CrewBidIQ</title>
-  <link rel="stylesheet" href="/static/app.css?v=0403">
+  <link rel="stylesheet" href="/static/app.css?v=0407">
 </head>
 <body>
 <div class="app-shell">
@@ -117,7 +118,7 @@ INDEX_HTML = r"""
       <a href="#upload" class="nav-link">⇧ <span>Upload</span></a>
       <a href="#resultsPanel" class="nav-link">▥ <span>Results</span></a>
       <a href="#preferences" class="nav-link">⚙ <span>Preferences</span></a>
-      <button id="guideBtn" class="nav-link nav-button">? <span>User Guide</span></button>
+      <button id="guideBtn" class="nav-link nav-button"><span>User Guide</span></button>
     </nav>
     <div class="side-footer">CrewBidIQ v0.2.4 test</div>
   </aside>
@@ -127,7 +128,7 @@ INDEX_HTML = r"""
       <div class="brand-word">CrewBid<span>IQ</span></div>
       <div class="header-controls">
         <select id="themeChoice" aria-label="Appearance"><option value="system">System</option><option value="dark">Dark</option><option value="light">Light</option></select>
-        <button id="mobileGuideBtn" class="round-button" aria-label="Open guide">?</button>
+        <button id="mobileGuideBtn" class="round-button guide-button" aria-label="Open user guide">Guide</button>
       </div>
     </header>
 
@@ -206,14 +207,117 @@ INDEX_HTML = r"""
       </section>
 
       <section id="guide" class="surface guide-panel hidden">
-        <div class="surface-title"><div><span class="section-number">?</span><h2>Complete User Guide</h2></div><button id="closeGuideBtn" class="text-button">Close</button></div>
-        <h3>Airline terminology</h3><p><strong>Rotation:</strong> Delta’s term for a complete trip sequence. <strong>Pairing:</strong> the term used by many other airlines. CrewBidIQ changes labels automatically.</p>
-        <h3>Match ratings</h3><p><strong>Excellent, Strong, Good, Fair, and Low Match</strong> describe how closely a rotation follows your selected preferences. The hidden numerical score only determines rank.</p>
-        <h3>Duty legs</h3><p><strong>Legs by day</strong> shows working flight segments in each duty period. <strong>First-day legs</strong>, <strong>last-day legs</strong>, and <strong>legs after redeye rest</strong> identify demanding duty patterns.</p>
-        <h3>Redeyes</h3><p><strong>Redeye start</strong> begins the trip overnight. <strong>Mid-rotation redeye</strong> occurs before the final duty period. Recovery describes the duty workload after required rest.</p>
-        <h3>Conflicts</h3><p>A conflict is any required day off, preferred day off, holiday, time limit, or duty limit that the rotation violates.</p>
-        <h3>Soft credit</h3><p>Delta displays EDP, HOL, and SIT when detected. Other airlines display N/A until airline-specific rules are defined.</p>
-        <h3>Storage</h3><p>Preferences are saved only in this browser. Uploaded files are processed by the server and should always be verified against the original airline bid package.</p>
+        <div class="surface-title"><div><h2>Complete User Guide</h2></div><button id="closeGuideBtn" class="text-button">Close</button></div>
+        <p class="guide-intro">CrewBidIQ helps answer “What trips fit my life?” Upload the airline bid package once, set the preferences that matter to you, and use <strong>Run preferences</strong> whenever you want to rerank the same parsed package. You do not need to upload it again.</p>
+
+        <div class="guide-grid">
+          <article class="guide-card">
+            <h3>1. Upload and analyze</h3>
+            <ul class="guide-list">
+              <li><strong>Airline:</strong> choose the airline before selecting the file so the correct parser and terminology are used.</li>
+              <li><strong>PDF bid packages:</strong> use the PDF picker for Delta, American, and other supported PDF formats.</li>
+              <li><strong>Southwest packages:</strong> upload one ZIP, or the Pairings and Lines text files with optional cover and seniority files.</li>
+              <li><strong>Analyze bid package:</strong> extracts the trips, identifies operating legs and true overnights, and creates the first ranked list.</li>
+              <li><strong>Interrupted uploads:</strong> CrewBidIQ keeps the active job and offers Resume analysis when the connection returns.</li>
+            </ul>
+          </article>
+
+          <article class="guide-card">
+            <h3>2. Airline terminology</h3>
+            <p>The labels follow the airline automatically. Delta uses <strong>Rotation</strong>, American uses <strong>Sequence</strong>, Southwest uses <strong>Line</strong>, and other airlines may use <strong>Pairing</strong> or another configured term.</p>
+            <p>American equipment codes are decoded only when the meaning is confirmed. Unconfirmed codes remain visible exactly as printed instead of being guessed.</p>
+          </article>
+        </div>
+
+        <h3>Preference guide</h3>
+        <p>Comma-separated fields accept entries such as <strong>SAN, HNL, BOS</strong>. Dates use <strong>YYYY-MM-DD</strong>. Most empty list and workload fields add no restriction. If left blank, CrewBidIQ uses 06:00 for earliest report, 22:00 for latest release, one allowed deadhead, and zero allowed airport transfers.</p>
+        <div class="guide-grid">
+          <article class="guide-card">
+            <h4>Layovers and trip shape</h4>
+            <ul class="guide-list">
+              <li><strong>Highest-priority layovers:</strong> gives the strongest positive preference to sequences that overnight in those cities.</li>
+              <li><strong>Preferred layovers:</strong> gives a smaller positive preference to desirable overnight cities.</li>
+              <li><strong>Avoid layovers:</strong> lowers sequences that overnight in those cities. Airports merely touched while operating are not treated as layovers.</li>
+              <li><strong>Preferred trip lengths:</strong> favors the listed number of duty days, such as 2, 3, or 4.</li>
+              <li><strong>Minimum layover hours:</strong> lowers a result for each overnight shorter than the entered minimum.</li>
+            </ul>
+          </article>
+
+          <article class="guide-card">
+            <h4>Report, release, and calendar</h4>
+            <ul class="guide-list">
+              <li><strong>Earliest report:</strong> lowers trips that report before your preferred starting time.</li>
+              <li><strong>Latest release:</strong> lowers trips that release after your preferred ending time.</li>
+              <li><strong>Required days off:</strong> a hard conflict. Any overlap receives the largest penalty and a Low rating.</li>
+              <li><strong>Preferred days off:</strong> a soft conflict. Overlaps reduce the rank but do not automatically make the result Low.</li>
+              <li><strong>Holidays / special dates:</strong> dates to check when Avoid holidays is enabled.</li>
+              <li><strong>Avoid holidays:</strong> lowers trips touching a listed holiday. <strong>Work holidays</strong> removes that avoidance preference.</li>
+              <li><strong>Weekends off and preferred weekdays off:</strong> are saved as planning context; separate weekday weighting is not yet applied to ranking.</li>
+            </ul>
+          </article>
+
+          <article class="guide-card">
+            <h4>Duty workload</h4>
+            <ul class="guide-list">
+              <li><strong>Maximum legs any duty day:</strong> lowers trips when a working duty exceeds the limit.</li>
+              <li><strong>Maximum first-day legs:</strong> focuses that limit on day one.</li>
+              <li><strong>Maximum last-day legs:</strong> helps protect the trip home from a heavy final day.</li>
+              <li><strong>Maximum deadheads:</strong> lowers trips with more deadhead segments than allowed. A flight-number D suffix in American packages is shown as a provisional deadhead until airline documentation confirms it.</li>
+              <li><strong>Maximum transfers:</strong> lowers known same-city airport transfers, such as JFK–LGA or DCA–IAD, above your limit.</li>
+            </ul>
+          </article>
+
+          <article class="guide-card">
+            <h4>Redeyes and aircraft</h4>
+            <ul class="guide-list">
+              <li><strong>Allow mid-rotation redeyes:</strong> reduces the general redeye penalty when overnight flying is detected.</li>
+              <li><strong>Allow redeye starts, Avoid final redeyes, and Maximum legs after redeye rest:</strong> are saved for planning; phase-specific redeye weighting will become active as airline duty classification expands.</li>
+              <li><strong>Preferred aircraft codes:</strong> favors matching codes found in the package. Use the airline’s printed code, such as 321E, rather than relying only on a marketing aircraft name.</li>
+            </ul>
+          </article>
+        </div>
+
+        <h3>How to read your results</h3>
+        <div class="guide-grid">
+          <article class="guide-card">
+            <h4>Rating and rank</h4>
+            <p><strong>★★★★★ Excellent, ★★★★ Strong, ★★★ Good, ★★ Fair, and ★ Low</strong> summarize how closely each result follows your preferences. The internal score orders the list; the stars are the pilot-facing summary. A required-day conflict always produces Low.</p>
+            <p><strong>Why it matched</strong> names the preference signals, workload limits, and conflicts that affected the recommendation so you can understand the rank.</p>
+          </article>
+
+          <article class="guide-card">
+            <h4>Snapshot and core metrics</h4>
+            <ul class="guide-list">
+              <li><strong>Top match:</strong> rating of the first recommendation.</li>
+              <li><strong>Credit:</strong> airline-provided trip or sequence credit when available.</li>
+              <li><strong>TAFB:</strong> total time away from base.</li>
+              <li><strong>Trip length:</strong> number of parsed duty periods.</li>
+              <li><strong>Recovery:</strong> a quick description of workload around detected redeye flying.</li>
+              <li><strong>Legs by duty day:</strong> working flight segments in each RPT-to-RLS duty period; deadheads are counted separately.</li>
+            </ul>
+          </article>
+
+          <article class="guide-card">
+            <h4>Layovers, timeline, and source</h4>
+            <ul class="guide-list">
+              <li><strong>Overnights:</strong> only contractual rest or hotel cities, not every city the trip touches.</li>
+              <li><strong>All operating cities:</strong> expandable list of every departure and arrival airport.</li>
+              <li><strong>Timeline and duty legs:</strong> flight order, local departure and arrival times, flight number, operating/deadhead status, and equipment.</li>
+              <li><strong>View original sequence/rotation:</strong> the preserved airline-formatted source block for comparison with the bid package.</li>
+            </ul>
+          </article>
+
+          <article class="guide-card">
+            <h4>Conflicts, soft credit, and report</h4>
+            <ul class="guide-list">
+              <li><strong>Conflicts:</strong> lists required-day, preferred-day, and holiday overlaps. Time and workload mismatches appear under Why it matched.</li>
+              <li><strong>Soft credit:</strong> shows airline-specific pay signals when supported. Delta may show EDP, HOL, and SIT; unsupported airline rules display N/A.</li>
+              <li><strong>PDF report:</strong> creates a printable package containing your preferences, top recommendations, detail pages, original airline formatting, and definitions.</li>
+            </ul>
+          </article>
+        </div>
+
+        <div class="guide-note"><strong>Important:</strong> CrewBidIQ is a planning aid. Always verify dates, legality, pay, hotels, transportation, deadheads, and equipment against the original airline bid package before submitting a bid. Preferences are saved only in this browser.</div>
       </section>
     </main>
 
@@ -222,7 +326,7 @@ INDEX_HTML = r"""
     </nav>
   </div>
 </div>
-<script src="/static/app.js?v=0403"></script>
+<script src="/static/app.js?v=0407"></script>
 <script>document.getElementById('mobileGuideBtn').addEventListener('click',()=>document.getElementById('guideBtn').click());</script>
 </body></html>
 """
@@ -237,12 +341,17 @@ def health() -> dict[str, str]:
     return {"status": "ok", "service": "CrewBidIQ"}
 
 
+@app.get("/api/airlines/terminology")
+def airline_terminology() -> dict[str, dict[str, str]]:
+    return airline_terminology_payload()
+
+
 def extract_text(path: Path, suffix: str, job_id: str) -> str:
     if suffix == ".pdf":
         doc = fitz.open(path)
         parts = []
         for i, page in enumerate(doc):
-            parts.append(page.get_text("text", sort=True))
+            parts.append(f"<<<CREWBIDIQ_PAGE:{i + 1}>>>\n" + page.get_text("text", sort=True))
             update_job(
                 job_id,
                 progress=15 + int((i + 1) / max(len(doc), 1) * 45),
@@ -401,10 +510,7 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
             score -= float(w.get("penalty") or 18); reasons.append(f"{city} is an overnight you prefer to avoid")
 
     parsed_equipment = [leg.get("aircraft") for leg in pairing.get("legs", []) if leg.get("aircraft")]
-    if pairing.get("equipment_mapping_status") == "raw_unmapped":
-        aircraft_hits = []
-    else:
-        aircraft_hits = sorted(set([x for x in aircraft if x and (x in upper or x in parsed_equipment)]))
+    aircraft_hits = sorted(set([x for x in aircraft if x and (x in upper or x in parsed_equipment)]))
     score += len(aircraft_hits) * float(w.get("aircraft") or 20)
     if aircraft_hits:
         reasons.append("Includes preferred aircraft: " + ", ".join(aircraft_hits))
@@ -509,6 +615,9 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
             reasons.append("Shorter-than-preferred overnight in " + ", ".join(str(x) for x in short))
 
     level = match_level(score, calendar_conflicts)
+    parser_id = pairing.get("parser", "")
+    airline = pairing.get("airline") or ("delta" if parser_id.startswith("delta") else ("american" if parser_id.startswith("american") else "generic"))
+    terminology = get_airline_terminology(airline)
     return {
         "pairing": pairing["id"],
         "score": round(score, 1),
@@ -537,13 +646,20 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
         "soft_credit": " ".join(re.findall(r"\b(?:\d{1,3})?(?:EDP|HOL|SIT)\b", upper)) or None,
         "item_type": "pairing",
         "match_level": level,
-        "display_label": "Rotation" if pairing.get("parser", "").startswith("delta") else ("Sequence" if pairing.get("parser", "").startswith("american") else "Pairing"),
+        "display_label": terminology.singular,
         "original_display": block,
         "operations": pairing.get("operations"),
         "positions": pairing.get("positions", []),
         "fleet": pairing.get("fleet"),
         "satellite": pairing.get("satellite"),
         "operation_qualifiers": pairing.get("operation_qualifiers", []),
+        "airline": airline,
+        "source_terminology": pairing.get("source_terminology"),
+        "fleet_section": pairing.get("fleet_section"),
+        "source_pdf_page": pairing.get("source_pdf_page"),
+        "duty_periods": pairing.get("duty_periods", []),
+        "total_flight_segments": pairing.get("total_flight_segments", len(pairing.get("legs", []))),
+        "aircraft_display_names": pairing.get("aircraft_display_names", []),
     }
 
 
@@ -627,7 +743,7 @@ def score_southwest_line(line: dict[str, Any], pairing_scores: dict[str, dict[st
         "credit": " + ".join(credits) if credits else None, "tafb": None, "checkin": None, "release": None,
         "layovers": layovers, "legs": [leg for item in members for leg in item.get("legs", [])], "soft_credit": None, "pairing_ids": line["pairing_ids"],
         "duty_legs": duty_legs, "first_day_legs": duty_legs[0] if duty_legs else 0, "last_day_legs": duty_legs[-1] if duty_legs else 0,
-        "match_level": match_level(score, conflicts), "display_label": "Line", "original_display": line.get("block", ""),
+        "match_level": match_level(score, conflicts), "display_label": get_airline_terminology("southwest").singular, "original_display": line.get("block", ""),
     }
 
 

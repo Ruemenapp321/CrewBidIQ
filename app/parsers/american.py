@@ -4,7 +4,9 @@ import re
 import unicodedata
 from typing import Any
 
-from .base import Leg, Layover, Pairing
+from app.airlines import decode_equipment, get_aircraft_display_name
+
+from .base import Leg, Pairing
 
 
 SECTION = re.compile(r"^(?P<base>[A-Z]{3})(?:\s+(?P<satellite>ONT|SAN|SNA))?\s+(?P<fleet>777|787|320|737)$")
@@ -15,7 +17,7 @@ SEQUENCE = re.compile(
 )
 LEG = re.compile(
     r"^(?P<duty>\d+)\s+(?P<departure_day>\d+)/(?P<arrival_day>\d+)\s+"
-    r"(?P<equipment>[A-Z0-9]{2,3})\s+(?P<flight>\d+[A-Z]?)\s+"
+    r"(?P<equipment>[A-Z0-9]{2,4})\s+(?P<flight>\d+[A-Z]?)\s+"
     r"(?P<departure>[A-Z]{3})\s+(?P<departure_local>\d{4})/(?P<departure_home>\d{4})\s+"
     r"(?:(?P<meal>[A-Z])\s+)?(?P<arrival>[A-Z]{3})\s+"
     r"(?P<arrival_local>\d{4})/(?P<arrival_home>\d{4})(?:\s+(?P<tail>.*))?$"
@@ -37,12 +39,17 @@ MONTHS = {
 }
 MONTH_ABBR = {name[:3]: index for name, index in MONTHS.items()}
 QUALIFIER = re.compile(r"\b(?:SPANISH|JAPANESE|ITALIAN)\s+OPERATION\b|\bREPLACES\s+PRIOR\s+MONTH\b", re.I)
+PAGE_MARKER = re.compile(r"^<<<CREWBIDIQ_PAGE:(\d+)>>>$")
+
+
+def _normalize_line(line: str) -> str:
+    line = "".join(char for char in line if unicodedata.category(char) != "Cf")
+    line = line.translate(str.maketrans({"−": "-", "–": "-", "—": "-", " ": " ", "•": "", "‧": ""}))
+    return re.sub(r"[ \t]+", " ", line).strip()
 
 
 def _normalize(text: str) -> str:
-    text = "".join(char for char in text if unicodedata.category(char) != "Cf")
-    text = text.translate(str.maketrans({"−": "-", "–": "-", "—": "-", " ": " ", "•": "", "‧": ""}))
-    return "\n".join(re.sub(r"[ \t]+", " ", line).strip() for line in text.replace("\r", "\n").splitlines())
+    return "\n".join(_normalize_line(line) for line in text.replace("\r", "\n").splitlines())
 
 
 def detect(text: str) -> float:
@@ -99,7 +106,7 @@ def _positions(value: str) -> tuple[list[str], list[str], str]:
     return positions, qualifiers, re.sub(r"\s+", " ", value).strip()
 
 
-def _hotel(line: str) -> tuple[str, str, str] | None:
+def _hotel(line: str) -> dict[str, str | None] | None:
     match = re.match(r"^([A-Z]{3})\s+(.+)$", line)
     if not match:
         return None
@@ -107,8 +114,20 @@ def _hotel(line: str) -> tuple[str, str, str] | None:
     if not duration:
         return None
     before_duration = match.group(2)[: duration.start()].strip()
-    hotel = re.sub(r"\s+\+?\d[\d() -]{5,}$", "", before_duration).strip()
-    return match.group(1), duration.group(1), hotel or before_duration
+    phone_match = re.search(r"(?:^|\s)(\+?\d[\d() -]{5,})$", before_duration)
+    phone = phone_match.group(1).strip() if phone_match else None
+    hotel = before_duration[: phone_match.start()].strip() if phone_match else before_duration
+    return {"city": match.group(1), "duration": duration.group(1), "hotel": hotel or before_duration, "hotel_phone": phone}
+
+
+def _transport(line: str) -> dict[str, str | None] | None:
+    upper = line.upper()
+    if not (upper.startswith("SHUTTLE") or "TRANS INFO" in upper or upper.startswith("TRANSPORT")):
+        return None
+    phone_match = re.search(r"(?:^|\s)(\+?\d[\d() -]{5,})$", line)
+    phone = phone_match.group(1).strip() if phone_match else None
+    provider = line[: phone_match.start()].strip() if phone_match else line.strip()
+    return {"transportation_provider": provider or None, "transportation_phone": phone}
 
 
 def _totals(line: str) -> tuple[str | None, str | None, str | None, str | None]:
@@ -122,25 +141,57 @@ def _totals(line: str) -> tuple[str | None, str | None, str | None, str | None]:
     return block, synthetic, trip_pay, tafb
 
 
+def _duty_values(line: str) -> dict[str, str | None]:
+    values = re.findall(r"\b\d{1,3}\.\d{2}\b", line)
+    names = ("block", "synthetic", "trip_pay", "duty", "fdp")
+    return {name: values[index] if index < len(values) else None for index, name in enumerate(names)}
+
+
 def _build_sequence(current: dict[str, Any], month: int | None, year: int | None) -> dict[str, Any]:
     lines: list[str] = current["lines"]
     legs: list[Leg] = []
     leg_details: list[dict[str, Any]] = []
-    layovers: list[Layover] = []
+    layovers: list[dict[str, Any]] = []
     reports: list[dict[str, str]] = []
     releases: list[dict[str, str]] = []
+    duty_periods: list[dict[str, Any]] = []
+    active_duty: dict[str, Any] | None = None
+    pending_layover: dict[str, Any] | None = None
     awaiting_layover = False
     block_total = synthetic_total = trip_pay_total = tafb = None
 
     for line in lines[1:]:
         report = REPORT.match(line)
         if report:
-            reports.append({"local": report.group(1), "home_base": report.group(2)})
+            report_pair = {"local": report.group(1), "home_base": report.group(2)}
+            reports.append(report_pair)
+            active_duty = {
+                "number": len(duty_periods) + 1,
+                "report_local": report.group(1),
+                "report_home_base": report.group(2),
+                "legs": [],
+            }
+            duty_periods.append(active_duty)
             awaiting_layover = False
+            pending_layover = None
             continue
         release = RELEASE.match(line)
         if release:
-            releases.append({"local": release.group(1), "home_base": release.group(2)})
+            release_pair = {"local": release.group(1), "home_base": release.group(2)}
+            releases.append(release_pair)
+            if active_duty is None:
+                active_duty = {"number": len(duty_periods) + 1, "legs": []}
+                duty_periods.append(active_duty)
+            active_duty.update(
+                {
+                    "release_local": release.group(1),
+                    "release_home_base": release.group(2),
+                    **_duty_values(line),
+                    "leg_count": len(active_duty["legs"]),
+                    "working_leg_count": sum(not leg["deadhead"] for leg in active_duty["legs"]),
+                    "deadhead_leg_count": sum(leg["deadhead"] for leg in active_duty["legs"]),
+                }
+            )
             awaiting_layover = True
             continue
         total = TOTAL.match(line)
@@ -165,6 +216,7 @@ def _build_sequence(current: dict[str, Any], month: int | None, year: int | None
             )
             legs.append(parsed_leg)
             detail = parsed_leg.__dict__.copy()
+            equipment = decode_equipment("american", leg.group("equipment"))
             detail.update(
                 {
                     "raw_flight": raw_flight,
@@ -175,26 +227,43 @@ def _build_sequence(current: dict[str, Any], month: int | None, year: int | None
                     "arrival_home_time": leg.group("arrival_home"),
                     "pay_values_raw": leg.group("tail") or "",
                     "deadhead_provisional": deadhead,
+                    "aircraft_name": equipment.aircraft,
+                    "aircraft_display_name": get_aircraft_display_name("american", leg.group("equipment")),
+                    "equipment_known": equipment.known,
                 }
             )
             leg_details.append(detail)
+            if active_duty is None:
+                active_duty = {"number": len(duty_periods) + 1, "legs": []}
+                duty_periods.append(active_duty)
+            active_duty["legs"].append(detail)
             awaiting_layover = False
+            pending_layover = None
             continue
         if awaiting_layover:
             hotel = _hotel(line)
             if hotel:
-                layovers.append(Layover(city=hotel[0], duration=hotel[1], hotel=hotel[2]))
+                hotel.update({"transportation_provider": None, "transportation_phone": None})
+                layovers.append(hotel)
+                pending_layover = hotel
+                if active_duty is not None:
+                    active_duty["layover_after"] = hotel
                 awaiting_layover = False
+                continue
+        if pending_layover:
+            transport = _transport(line)
+            if transport:
+                pending_layover.update(transport)
 
     dates = _calendar_dates(lines, month, year)
     positions, qualifiers, position_text = _positions(current["position_text"])
-    raw = "\n".join(lines).strip()
+    raw = "\n".join(current.get("raw_lines") or lines).strip()
     confidence = 0.98 if legs and trip_pay_total and len(dates) == current["operations"] else (0.92 if legs else 0.55)
     pairing = Pairing(
         pairing_id=current["id"],
         raw=raw,
         legs=legs,
-        layovers=layovers,
+        layovers=[],
         credit=trip_pay_total,
         tafb=tafb,
         checkin=reports[0]["local"] if reports else None,
@@ -204,8 +273,15 @@ def _build_sequence(current: dict[str, Any], month: int | None, year: int | None
         confidence=confidence,
     ).to_dict()
     pairing["legs"] = leg_details
+    pairing["layovers"] = layovers
+    equipment_codes = list(dict.fromkeys(leg["equipment_code"] for leg in leg_details))
+    known_equipment = [decode_equipment("american", code).known for code in equipment_codes]
+    mapping_status = "mapped" if known_equipment and all(known_equipment) else ("partially_mapped" if any(known_equipment) else "raw_unmapped")
+    section_parts = [current["section"].get(key) for key in ("base", "satellite", "fleet")]
     pairing.update(
         {
+            "airline": "american",
+            "source_terminology": "sequence",
             "operations": current["operations"],
             "positions": positions,
             "position_text": position_text,
@@ -213,14 +289,19 @@ def _build_sequence(current: dict[str, Any], month: int | None, year: int | None
             "base": current["section"].get("base"),
             "satellite": current["section"].get("satellite"),
             "fleet": current["section"].get("fleet"),
+            "fleet_section": " ".join(part for part in section_parts if part),
             "start_dates": dates,
+            "source_pdf_page": current.get("source_pdf_page"),
             "block_total": block_total,
             "synthetic_total": synthetic_total,
             "trip_pay_total": trip_pay_total,
-            "equipment_codes": list(dict.fromkeys(leg["equipment_code"] for leg in leg_details)),
-            "equipment_mapping_status": "raw_unmapped",
+            "equipment_codes": equipment_codes,
+            "aircraft_display_names": [get_aircraft_display_name("american", code) for code in equipment_codes],
+            "equipment_mapping_status": mapping_status,
             "duty_reports": reports,
             "duty_releases": releases,
+            "duty_periods": duty_periods,
+            "total_flight_segments": len(leg_details),
         }
     )
     return pairing
@@ -231,9 +312,15 @@ def _parse_cockpit_package(text: str) -> list[dict[str, Any]]:
     month, year = _month_context(normalized)
     section: dict[str, str | None] = {"base": None, "satellite": None, "fleet": None}
     current: dict[str, Any] | None = None
+    current_page: int | None = None
     results: list[dict[str, Any]] = []
 
-    for line in normalized.splitlines():
+    for raw_line in text.replace("\r", "\n").splitlines():
+        line = _normalize_line(raw_line)
+        page_marker = PAGE_MARKER.match(line)
+        if page_marker:
+            current_page = int(page_marker.group(1))
+            continue
         section_match = SECTION.match(line)
         if section_match:
             section = section_match.groupdict()
@@ -247,11 +334,14 @@ def _parse_cockpit_package(text: str) -> list[dict[str, Any]]:
                 "operations": int(header.group("operations")),
                 "position_text": header.group("positions"),
                 "section": section.copy(),
+                "source_pdf_page": current_page,
                 "lines": [line],
+                "raw_lines": [raw_line.rstrip()],
             }
             continue
         if current:
             current["lines"].append(line)
+            current["raw_lines"].append(raw_line.rstrip())
             if TOTAL.match(line):
                 # Keep the calendar fields on the total row, then close the sequence.
                 results.append(_build_sequence(current, month, year))
