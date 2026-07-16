@@ -66,6 +66,7 @@ def test_synopsis_summarizes_redeyes_deadheads_lengths_starts_and_fleets():
     assert synopsis["total"] == 2
     assert synopsis["redeye"] == {"count": 1, "percent": 50.0}
     assert synopsis["deadhead"] == {"count": 1, "percent": 50.0}
+    assert synopsis["overnight_city_count"] == 1
     assert {row["airport"] for row in synopsis["start_airports"]} == {"JFK", "LGA"}
     assert {row["fleet"] for row in synopsis["fleets"]} == {"320", "737"}
 
