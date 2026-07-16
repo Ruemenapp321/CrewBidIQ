@@ -44,6 +44,8 @@ def _pay_rows(item: dict[str, Any], airline: str) -> list[list[Any]]:
         if unknown:
             rows.append(["Unmapped source pay", ", ".join(f"{label} {value}" for label, value in unknown.items())])
         return rows
+    if airline == "american":
+        return [["Total Pay", item.get("total_pay")]]
     return [["Credit", item.get("credit")]]
 
 

@@ -30,14 +30,14 @@ function airlineName(value) {
 
 function payGoalLabel() {
   if (sessionJob?.airline === 'southwest') return 'TFP and efficiency';
-  if (sessionJob?.airline === 'delta') return 'Total Pay and efficiency';
+  if (sessionJob?.airline === 'delta' || sessionJob?.airline === 'american') return 'Total Pay and efficiency';
   return 'Trip value and efficiency';
 }
 
 function resultPay(item) {
   const airline = item.airline || sessionJob?.airline;
   if (airline === 'southwest') return { label: item.item_type === 'line' ? 'Line TFP' : 'Pairing TFP', value: item.item_type === 'line' ? item.line_tfp : item.pairing_tfp };
-  if (airline === 'delta') return { label: 'Total Pay', value: item.total_pay };
+  if (airline === 'delta' || airline === 'american') return { label: 'Total Pay', value: item.total_pay };
   return { label: 'Credit', value: item.credit };
 }
 

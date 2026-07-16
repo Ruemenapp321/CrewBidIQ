@@ -5,6 +5,7 @@ import unicodedata
 from typing import Any
 
 from app.airlines import decode_equipment, get_aircraft_display_name
+from app.pay import format_pay_minutes, parse_clock_minutes
 
 from .base import Leg, Pairing
 
@@ -143,8 +144,11 @@ def _totals(line: str) -> tuple[str | None, str | None, str | None, str | None]:
 
 def _duty_values(line: str) -> dict[str, str | None]:
     values = re.findall(r"\b\d{1,3}\.\d{2}\b", line)
-    names = ("block", "synthetic", "trip_pay", "duty", "fdp")
-    return {name: values[index] if index < len(values) else None for index, name in enumerate(names)}
+    names = ("block", "synthetic", "raw_tpay", "duty", "fdp")
+    parsed = {name: values[index] if index < len(values) else None for index, name in enumerate(names)}
+    parsed["total_pay"] = format_pay_minutes(parse_clock_minutes(parsed["raw_tpay"]))
+    parsed["trip_pay"] = parsed["raw_tpay"]  # Backward-compatible raw source alias.
+    return parsed
 
 
 def _build_sequence(current: dict[str, Any], month: int | None, year: int | None) -> dict[str, Any]:
@@ -158,7 +162,7 @@ def _build_sequence(current: dict[str, Any], month: int | None, year: int | None
     active_duty: dict[str, Any] | None = None
     pending_layover: dict[str, Any] | None = None
     awaiting_layover = False
-    block_total = synthetic_total = trip_pay_total = tafb = None
+    block_total = synthetic_total = raw_total_pay = tafb = None
 
     for line in lines[1:]:
         report = REPORT.match(line)
@@ -196,7 +200,7 @@ def _build_sequence(current: dict[str, Any], month: int | None, year: int | None
             continue
         total = TOTAL.match(line)
         if total:
-            block_total, synthetic_total, trip_pay_total, tafb = _totals(total.group(1))
+            block_total, synthetic_total, raw_total_pay, tafb = _totals(total.group(1))
             awaiting_layover = False
             continue
         leg = LEG.match(line)
@@ -258,13 +262,14 @@ def _build_sequence(current: dict[str, Any], month: int | None, year: int | None
     dates = _calendar_dates(lines, month, year)
     positions, qualifiers, position_text = _positions(current["position_text"])
     raw = "\n".join(current.get("raw_lines") or lines).strip()
-    confidence = 0.98 if legs and trip_pay_total and len(dates) == current["operations"] else (0.92 if legs else 0.55)
+    total_pay = format_pay_minutes(parse_clock_minutes(raw_total_pay))
+    confidence = 0.98 if legs and total_pay and len(dates) == current["operations"] else (0.92 if legs else 0.55)
     pairing = Pairing(
         pairing_id=current["id"],
         raw=raw,
         legs=legs,
         layovers=[],
-        credit=trip_pay_total,
+        credit=raw_total_pay,  # Legacy API alias; pilot-facing AA output uses total_pay.
         tafb=tafb,
         checkin=reports[0]["local"] if reports else None,
         release=releases[-1]["local"] if releases else None,
@@ -294,7 +299,10 @@ def _build_sequence(current: dict[str, Any], month: int | None, year: int | None
             "source_pdf_page": current.get("source_pdf_page"),
             "block_total": block_total,
             "synthetic_total": synthetic_total,
-            "trip_pay_total": trip_pay_total,
+            "trip_pay_total": raw_total_pay,
+            "raw_total_pay": raw_total_pay,
+            "total_pay": total_pay,
+            "source_total_pay_label": "TPAY" if raw_total_pay else None,
             "equipment_codes": equipment_codes,
             "aircraft_display_names": [get_aircraft_display_name("american", code) for code in equipment_codes],
             "equipment_mapping_status": mapping_status,

@@ -55,6 +55,8 @@ function updatePayPriority(airline) {
     ['', 'Quality of life first'], ['monthly_tfp', 'High TFP'], ['tfp_per_duty_period', 'TFP per duty period'], ['tfp_per_day_away', 'TFP efficiency']
   ] : airline === 'delta' ? [
     ['', 'Quality of life first'], ['trip_credit', 'Trip Credit'], ['total_pay', 'Total Pay'], ['additional_pay', 'Additional Pay'], ['credit_per_duty_day', 'Credit per duty day'], ['total_pay_per_duty_day', 'Total pay per duty day']
+  ] : airline === 'american' ? [
+    ['', 'Quality of life first'], ['total_pay', 'Total Pay'], ['total_pay_per_duty_day', 'Total pay per duty day']
   ] : [];
   field.classList.toggle('hidden', !options.length);
   select.innerHTML = options.map(([value, label]) => `<option value="${value}">${label}</option>`).join('');
@@ -163,6 +165,13 @@ function payPresentation(item) {
       snapshotLabel: 'Total Pay', snapshotValue: item.total_pay,
       metrics: [['Total Pay', item.total_pay], ['Trip Credit', item.trip_credit || item.credit], ['Additional Pay', item.additional_pay], ['Total pay / duty day', item.total_pay_per_duty_day]],
       detail: `<p><strong>Trip Credit:</strong> ${esc(item.trip_credit || item.credit || 'N/A')}</p><p><strong>Additional Pay:</strong> ${esc(item.additional_pay ?? 'N/A')}</p>${rows}<p><strong>Total Pay:</strong> ${esc(item.total_pay ?? 'N/A')}</p>${unknown ? `<p><strong>Unmapped source pay:</strong> ${esc(unknown)}</p>` : ''}`
+    };
+  }
+  if (airline === 'american') {
+    return {
+      snapshotLabel: 'Total Pay', snapshotValue: item.total_pay,
+      metrics: [['Total Pay', item.total_pay], ['TAFB', item.tafb], ['Legs by duty day', legs], ['Total pay / duty day', item.total_pay_per_duty_day]],
+      detail: `<p><strong>Total Pay:</strong> ${esc(item.total_pay ?? 'N/A')}</p>`
     };
   }
   return { snapshotLabel: 'Credit', snapshotValue: item.credit, metrics: [['Credit', item.credit], ['TAFB', item.tafb], ['Legs by duty day', legs], ['First / Last', `${item.first_day_legs ?? '—'} / ${item.last_day_legs ?? '—'}`]], detail: `<p><strong>Credit:</strong> ${esc(item.credit || 'N/A')}</p>` };

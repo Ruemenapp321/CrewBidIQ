@@ -35,7 +35,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR / "data"))
 UPLOAD_DIR = DATA_DIR / "uploads"
 DB_PATH = DATA_DIR / "pairingiq.db"
-PARSER_CACHE_VERSION = "2026-07-16.3"
+PARSER_CACHE_VERSION = "2026-07-16.4"
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_PARSE_SECONDS = int(os.environ.get("MAX_PARSE_SECONDS", "600"))
 
@@ -382,9 +382,10 @@ INDEX_HTML = r"""
               <li><strong>Top match:</strong> rating of the first recommendation.</li>
               <li><strong>Southwest TFP:</strong> Trips for Pay is shown as Pairing TFP or Line TFP. Carry-out TFP and TFP efficiency remain separate.</li>
               <li><strong>Delta Total Pay:</strong> Trip Credit plus confidently parsed EDP, HOL, and SIT. Missing or unsupported components are never assumed to be zero.</li>
+              <li><strong>American Total Pay:</strong> the bottom total printed in the package's TPAY column. The original TPAY value remains preserved with the sequence.</li>
               <li><strong>Other-airline credit:</strong> airline-provided trip or sequence credit when available. Total Pay appears only after that airline's pay rules are defined.</li>
               <li><strong>TAFB:</strong> total time away from base.</li>
-              <li><strong>Trip length:</strong> number of parsed duty periods.</li>
+              <li><strong>Trip length:</strong> elapsed trip days represented by the airline package. Flying duty periods are shown separately.</li>
               <li><strong>Fatigue risk:</strong> flags flight legs departing during WOCL (02:00 through 05:59 local).</li>
               <li><strong>Legs by duty day:</strong> working flight segments in each RPT-to-RLS duty period; deadheads are counted separately.</li>
             </ul>
@@ -1142,6 +1143,13 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
             "raw_total_pay": pairing.get("raw_total_pay"),
             "unknown_pay_components": pairing.get("unknown_pay_components"),
             "credit_per_duty_day": pay_minutes_per_duty_day(pairing.get("trip_credit") or pairing.get("credit"), len(duty_counts)),
+            "total_pay_per_duty_day": pay_minutes_per_duty_day(pairing.get("total_pay"), len(duty_counts)),
+        })
+    elif airline == "american" and pairing.get("total_pay") is not None:
+        result.update({
+            "total_pay": pairing.get("total_pay"),
+            "raw_total_pay": pairing.get("raw_total_pay"),
+            "source_total_pay_label": pairing.get("source_total_pay_label"),
             "total_pay_per_duty_day": pay_minutes_per_duty_day(pairing.get("total_pay"), len(duty_counts)),
         })
 

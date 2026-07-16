@@ -1,5 +1,5 @@
 from app.parsers import american
-from app.main import detect_airports, detect_layover_cities
+from app.main import detect_airports, detect_layover_cities, score_pairing
 
 
 SAMPLE = """<<<CREWBIDIQ_PAGE:8>>>
@@ -65,6 +65,9 @@ def test_parses_duties_deadheads_layovers_totals_and_dates():
     assert row["legs"][0]["departure_home_time"] == "0957"
     assert row["layovers"] == [{"city": "MIA", "duration": "11.42", "hotel": "MIAMI AIRPORT MARRIOTT", "hotel_phone": "305-649-5000", "transportation_provider": "SHUTTLE SUPER SHUTTLE", "transportation_phone": "305-555-0100"}]
     assert row["credit"] == "12.14"
+    assert row["raw_total_pay"] == "12.14"
+    assert row["total_pay"] == "12:14"
+    assert row["source_total_pay_label"] == "TPAY"
     assert row["tafb"] == "30.37"
     assert row["equipment_codes"] == ["92", "83", "26"]
     assert row["equipment_mapping_status"] == "raw_unmapped"
@@ -78,6 +81,8 @@ def test_parses_duties_deadheads_layovers_totals_and_dates():
     assert row["duty_periods"][0]["release_local"] == "2113"
     assert row["duty_periods"][0]["release_home_base"] == "1813"
     assert row["duty_periods"][0]["trip_pay"] == "6.05"
+    assert row["duty_periods"][0]["raw_tpay"] == "6.05"
+    assert row["duty_periods"][0]["total_pay"] == "6:05"
     assert "SEQ 520  2 OPS" in row["block"]
 
 
@@ -111,3 +116,13 @@ def test_tracks_fleet_changes_and_long_haul_source_page():
 def test_intro_pages_do_not_create_false_sequences():
     intro = """AMERICAN AIRLINES\nAUGUST 2026\nSEQUENCE CONSTRUCTION NOTES\nPOSN CA FO\nSYNTH TPAY TAFB\n"""
     assert american.parse(intro) == []
+
+
+def test_american_tpay_total_is_exposed_and_rankable_as_total_pay():
+    pairing = american.parse(SAMPLE)[0]
+    result = score_pairing(pairing, {"pay_priority": "total_pay", "prefer_operate": False})
+    assert result["total_pay"] == "12:14"
+    assert result["raw_total_pay"] == "12.14"
+    assert result["total_pay_per_duty_day"] == "6:07"
+    assert result["pay_explanation"] == "Total Pay: 12:14"
+    assert "pay_components" not in result
