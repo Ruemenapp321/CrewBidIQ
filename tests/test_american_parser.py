@@ -1,0 +1,72 @@
+from app.parsers import american
+from app.main import score_pairing
+
+
+SAMPLE = """LAX - LOS ANGELES
+AUGUST 2026
+DAY  --DEPARTURE--  ---ARRIVAL---  GRND/ REST/
+DP D/A EQ FLT# STA DLCL/DHBT ML STA ALCL/AHBT BLOCK SYNTH TPAY DUTY TAFB FDP CALENDAR 08/01-08/30
+LAX 777
+SEQ 520 2 OPS POSN CA FO MO TU WE TH FR SA SU
+RPT 0927/0927
+1 1/1 92 1595D LAX 0957/0957 PHX 1129/1129 AA 1.32 1.41X -- -- 5 -- -- -- --
+1 1/1 83 404 PHX 1310/1310 L MIA 2043/1743 4.33 -- -- -- -- -- -- --
+RLS 2113/1813 4.33 1.32 6.05 8.46 8.16 -- -- -- -- -- -- --
+MIA MIAMI AIRPORT MARRIOTT 305-649-5000 11.42 -- -- -- -- -- -- --
+RPT 0855/0555 -- 12 -- -- -- -- --
+2 2/2 83 3172 MIA 0955/0655 L PHX 1141/1141 4.46 2.30X
+2 2/2 26 3119D PHX 1411/1411 LAX 1534/1534 AA 1.23
+RLS 1604/1604 4.46 1.23 6.09 10.09 5.46
+TTL 9.19 2.55 12.14 30.37
+LAX 777
+SEQ 591•‧‧ 1 OPS POSN FB JAPANESE OPERATION MO TU WE TH FR SA SU
+RPT 2155/2155
+1 1/3 •‧‧82 73 LAX 2255/2255 D SYD 0705/1405 15.10 -- -- -- -- 15 -- --
+RLS 0735/1435 15.10 0.00 15.10 16.40 16.10
+SYD PULLMAN SYDNEY HYDE PARK 6 129-361-8400 24.35
+RPT 0810/1510
+2 4/4 82 72 SYD 0910/1610 L LAX 0635/0635 13.55
+RLS 0705/0705 13.55 0.00 13.55 15.25 14.55
+TTL 29.05 0.00 29.05 56.40
+"""
+
+
+def test_detects_aa_cockpit_sequence_package():
+    assert american.detect(SAMPLE) >= 0.9
+
+
+def test_parses_duties_deadheads_layovers_totals_and_dates():
+    rows = american.parse(SAMPLE)
+    assert len(rows) == 2
+    row = rows[0]
+    assert row["id"] == "520"
+    assert row["operations"] == 2
+    assert row["positions"] == ["CA", "FO"]
+    assert row["fleet"] == "777"
+    assert row["start_dates"] == ["2026-08-05", "2026-08-12"]
+    assert len(row["legs"]) == 4
+    assert row["legs"][0]["deadhead"] is True
+    assert row["legs"][0]["raw_flight"] == "1595D"
+    assert row["legs"][0]["departure_home_time"] == "0957"
+    assert row["layovers"] == [{"city": "MIA", "duration": "11.42", "hotel": "MIAMI AIRPORT MARRIOTT"}]
+    assert row["credit"] == "12.14"
+    assert row["tafb"] == "30.37"
+    assert row["equipment_codes"] == ["92", "83", "26"]
+    assert row["equipment_mapping_status"] == "raw_unmapped"
+
+
+def test_parses_relief_position_qualifier_and_date_line_days():
+    row = american.parse(SAMPLE)[1]
+    assert row["id"] == "591"
+    assert row["positions"] == ["FB"]
+    assert row["operation_qualifiers"] == ["JAPANESE OPERATION"]
+    assert row["legs"][0]["departure_day"] == 1
+    assert row["legs"][0]["arrival_day"] == 3
+    assert row["start_dates"] == ["2026-08-15"]
+
+
+def test_unmapped_aa_equipment_codes_are_not_scored_as_preferences():
+    row = american.parse(SAMPLE)[0]
+    result = score_pairing(row, {"preferred_aircraft": ["92"], "weights": {"aircraft": 100}})
+    assert result["preferred_aircraft"] == []
+    assert result["equipment_codes"] == ["92", "83", "26"]
