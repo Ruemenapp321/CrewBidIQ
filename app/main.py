@@ -105,7 +105,7 @@ INDEX_HTML = r"""
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#071525">
   <title>CrewBidIQ</title>
-  <link rel="stylesheet" href="/static/app.css?v=0311">
+  <link rel="stylesheet" href="/static/app.css?v=0401">
 </head>
 <body>
 <div class="app-shell">
@@ -221,7 +221,7 @@ INDEX_HTML = r"""
     </nav>
   </div>
 </div>
-<script src="/static/app.js?v=0311"></script>
+<script src="/static/app.js?v=0401"></script>
 <script>document.getElementById('mobileGuideBtn').addEventListener('click',()=>document.getElementById('guideBtn').click());</script>
 </body></html>
 """
@@ -782,6 +782,7 @@ def job_status(job_id: str):
 
 
 @app.get("/api/jobs/{job_id}/report.pdf")
+@app.get("/api/jobs/{job_id}/csv", include_in_schema=False)
 def job_report(job_id: str):
     row = get_job(job_id)
     if not row or row["status"] != "complete":
