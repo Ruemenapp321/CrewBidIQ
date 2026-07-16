@@ -25,6 +25,7 @@ from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from app.airlines import airline_terminology_payload, get_airline_terminology
 from app.airports import coterminal_group_for_airport, coterminal_payload, expand_airports
+from app.labs import labs_enabled, router as labs_router
 from app.parsers import select_parser
 from app.reporting import build_bid_report
 
@@ -43,6 +44,7 @@ log = logging.getLogger("pairingiq")
 app = FastAPI(title="CrewBidIQ")
 app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "app" / "static"), name="static")
+app.include_router(labs_router)
 job_lock = threading.Lock()
 
 
@@ -171,17 +173,17 @@ INDEX_HTML = r"""
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#071525">
   <title>CrewBidIQ</title>
-  <link rel="stylesheet" href="/static/app.css?v=0417">
+  <link rel="stylesheet" href="/static/app.css?v=0420">
 </head>
-<body>
+<body data-classic-page="__CLASSIC_PAGE__">
 <div class="app-shell">
   <aside class="desktop-sidebar">
     <div class="side-brand"><span class="wing">✈</span><strong>CrewBid<span>IQ</span></strong></div>
     <nav>
-      <a href="#upload" class="nav-link active">⌂ <span>Home</span></a>
-      <a href="#upload" class="nav-link">⇧ <span>Upload</span></a>
-      <a href="#resultsPanel" class="nav-link">▥ <span>Results</span></a>
-      <a href="#preferences" class="nav-link">⚙ <span>Preferences</span></a>
+      <a href="/" class="nav-link __HOME_ACTIVE__">⌂ <span>Home</span></a>
+      <a href="/#upload" class="nav-link">⇧ <span>Upload</span></a>
+      <a href="/results" class="nav-link __RESULTS_ACTIVE__">▥ <span>Results</span></a>
+      <a href="/#preferences" class="nav-link">⚙ <span>Preferences</span></a>
       <button id="guideBtn" class="nav-link nav-button"><span>User Guide</span></button>
     </nav>
     <div class="side-footer">CrewBidIQ v0.2.4 test</div>
@@ -189,7 +191,10 @@ INDEX_HTML = r"""
 
   <div class="app-main">
     <header class="mobile-header">
-      <div class="brand-word">CrewBid<span>IQ</span></div>
+      <div class="header-identity">
+        <a class="brand-word" href="/">CrewBid<span>IQ</span></a>
+        __LABS_SWITCH__
+      </div>
       <div class="header-controls">
         <button id="mobileGuideBtn" class="round-button guide-button" aria-label="Open user guide">Guide</button>
       </div>
@@ -274,7 +279,7 @@ INDEX_HTML = r"""
       <section class="results-section" id="resultsPanel">
         <div class="results-header">
           <div><span class="kicker">YOUR RESULTS</span><h2 id="resultsTitle">Recommended rotations</h2><p id="summary">Load sample results or analyze a bid package.</p></div>
-          <div class="results-actions"><select id="resultLimit"><option value="25">Top 25</option><option value="50">Top 50</option><option value="100">Top 100</option><option value="all">All</option></select><a id="csvLink" class="secondary button disabled" href="#">PDF report</a></div>
+          <div class="results-actions"><select id="resultLimit"><option value="25">Top 25</option><option value="50">Top 50</option><option value="100">Top 100</option><option value="all">All</option></select><a id="csvLink" class="secondary button disabled" href="#">PDF report</a>__CONTINUE_LABS__</div>
         </div>
         <div class="snapshot" id="snapshot">
           <div><span>Top match</span><strong id="snapshotMatch">—</strong></div>
@@ -412,19 +417,67 @@ INDEX_HTML = r"""
       </div>
     </div>
 
-    <nav class="bottom-nav">
-      <a href="#upload"><span>⌂</span>Home</a><a href="#upload"><span>⇧</span>Upload</a><a href="#resultsPanel" class="active"><span>▥</span>Results</a><a href="#preferences"><span>⚙</span>Preferences</a>
-    </nav>
+    __MOBILE_NAV__
   </div>
 </div>
-<script src="/static/app.js?v=0417"></script>
+<script src="/static/app.js?v=0420"></script>
 <script>document.getElementById('mobileGuideBtn').addEventListener('click',()=>document.getElementById('guideBtn').click());</script>
 </body></html>
 """
 
+
+def classic_html(page: str) -> str:
+    enabled = labs_enabled()
+    home_active = "active" if page == "home" else ""
+    results_active = "active" if page == "results" else ""
+    labs_switch = (
+        '<nav class="experience-switch" aria-label="CrewBidIQ experience">'
+        '<a href="/" class="active">Classic</a><a href="/labs">Labs <small>Beta</small></a></nav>'
+        if enabled
+        else ""
+    )
+    continue_labs = (
+        '<a id="continueLabs" class="labs-button button hidden" href="/labs">Continue in Labs</a>'
+        if enabled
+        else ""
+    )
+    if enabled:
+        mobile_nav = (
+            '<nav class="bottom-nav three" aria-label="Primary navigation">'
+            f'<a href="/" class="{home_active}"><span>A</span>Analyze</a>'
+            f'<a href="/results" class="{results_active}"><span>R</span>Results</a>'
+            '<a href="/labs"><span>L</span>Labs</a></nav>'
+        )
+    else:
+        mobile_nav = (
+            '<nav class="bottom-nav">'
+            f'<a href="/" class="{home_active}"><span>⌂</span>Home</a>'
+            '<a href="/#upload"><span>⇧</span>Upload</a>'
+            f'<a href="/results" class="{results_active}"><span>▥</span>Results</a>'
+            '<a href="/#preferences"><span>⚙</span>Preferences</a></nav>'
+        )
+    replacements = {
+        "__CLASSIC_PAGE__": page,
+        "__HOME_ACTIVE__": home_active,
+        "__RESULTS_ACTIVE__": results_active,
+        "__LABS_SWITCH__": labs_switch,
+        "__CONTINUE_LABS__": continue_labs,
+        "__MOBILE_NAV__": mobile_nav,
+    }
+    html = INDEX_HTML
+    for marker, value in replacements.items():
+        html = html.replace(marker, value)
+    return html
+
+
 @app.get("/", response_class=HTMLResponse)
 def home() -> HTMLResponse:
-    return HTMLResponse(INDEX_HTML)
+    return HTMLResponse(classic_html("home"))
+
+
+@app.get("/results", response_class=HTMLResponse)
+def classic_results() -> HTMLResponse:
+    return HTMLResponse(classic_html("results"))
 
 
 @app.get("/api/health")
@@ -1206,6 +1259,7 @@ def job_status(job_id: str):
     payload = {
         "job_id": row["id"],
         "filename": row["filename"],
+        "airline": row["airline"],
         "status": row["status"],
         "progress": row["progress"],
         "message": row["message"],

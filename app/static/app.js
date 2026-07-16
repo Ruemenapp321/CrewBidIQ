@@ -28,8 +28,9 @@ function applySaved() { try { const p = JSON.parse(localStorage.getItem('crewbid
 function setJob(show, status = '', progress = 0, message = '') { $('jobPanel').classList.toggle('hidden', !show); $('jobStatus').textContent = status; $('jobPercent').textContent = `${progress}%`; $('progressFill').style.width = `${progress}%`; $('jobMessage').textContent = message; }
 function showError(message) { $('errorBox').textContent = message; $('errorBox').classList.remove('hidden'); }
 function clearError() { $('errorBox').classList.add('hidden'); }
+function setLabsContinuation(show) { const link = $('continueLabs'); if (link) link.classList.toggle('hidden', !show); }
 function terminology() { const configured = airlineTerminology[$('airlineChoice').value] || airlineTerminology.generic; return { single: configured.singular, plural: configured.plural, title: configured.recommended, details: configured.details, viewOriginal: configured.view_original, analyzed: configured.analyzed }; }
-async function loadAirlineTerminology() { try { const response = await fetch('/api/airlines/terminology', { headers: { Accept: 'application/json' } }); if (response.ok) airlineTerminology = await response.json(); } catch (_) {} updateAirlineUI(); }
+async function loadAirlineTerminology() { try { const response = await fetch('/api/airlines/terminology', { headers: { Accept: 'application/json' } }); if (response.ok) airlineTerminology = await response.json(); } catch (_) {} updateAirlineUI(); if (allResults.length) render(); }
 function uploadIsReady() {
   const airline = $('airlineChoice').value;
   if (!airline) return false;
@@ -83,9 +84,46 @@ async function pollJob() {
   try {
     const response = await fetch(`/api/jobs/${activeJob}`, { headers: { Accept: 'application/json' } }); const body = await response.json(); if (!response.ok) throw new Error(body.detail || 'Could not read job status');
     pollFailures = 0; setJob(true, body.status, body.progress, body.message || '');
-    if (body.status === 'complete') { clearInterval(pollTimer); localStorage.removeItem('crewbidiqActiveJob'); latestJob = activeJob; localStorage.setItem('crewbidiqLatestJob', latestJob); $('analyzeBtn').textContent = 'Analyze bid package'; updateAnalyzeAvailability(); $('runPreferencesBtn').disabled = false; allResults = body.results || []; bidSynopsis = body.synopsis || null; renderSynopsis(); render(); $('csvLink').href = `/api/jobs/${latestJob}/report.pdf`; $('csvLink').classList.remove('disabled'); }
+    if (body.status === 'complete') { const completedJob = activeJob; clearInterval(pollTimer); localStorage.removeItem('crewbidiqActiveJob'); activeJob = null; applyCompletedJob(completedJob, body); $('analyzeBtn').textContent = 'Analyze bid package'; updateAnalyzeAvailability(); }
     else if (body.status === 'failed') { clearInterval(pollTimer); localStorage.removeItem('crewbidiqActiveJob'); activeJob = null; $('analyzeBtn').textContent = 'Analyze bid package'; updateAnalyzeAvailability(); showError(body.error || 'Analysis failed'); }
   } catch (error) { pollFailures += 1; setJob(true, 'Reconnecting', 1, 'Your upload is safe. Reconnecting to the analysis…'); if (pollFailures >= 8) { clearInterval(pollTimer); $('analyzeBtn').disabled = false; $('analyzeBtn').textContent = 'Resume analysis'; showError('The connection is taking longer than expected. Tap Resume analysis to try again.'); } }
+}
+
+function applyCompletedJob(jobId, body) {
+  latestJob = jobId;
+  localStorage.setItem('crewbidiqLatestJob', latestJob);
+  if (body.airline && Array.from($('airlineChoice').options).some(option => option.value === body.airline)) {
+    $('airlineChoice').value = body.airline;
+    updateAirlineUI();
+  }
+  $('runPreferencesBtn').disabled = false;
+  allResults = body.results || [];
+  bidSynopsis = body.synopsis || null;
+  renderSynopsis();
+  render();
+  $('csvLink').href = `/api/jobs/${latestJob}/report.pdf`;
+  $('csvLink').classList.remove('disabled');
+  setLabsContinuation(true);
+}
+
+async function loadLatestJob() {
+  if (!latestJob || activeJob) {
+    requestAnimationFrame(() => $('resultsPanel').scrollIntoView({ block: 'start' }));
+    return;
+  }
+  try {
+    const response = await fetch(`/api/jobs/${latestJob}`, { headers: { Accept: 'application/json' } });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.detail || 'Could not load the saved analysis');
+    if (body.status === 'complete') applyCompletedJob(latestJob, body);
+  } catch (error) {
+    localStorage.removeItem('crewbidiqLatestJob');
+    latestJob = null;
+    setLabsContinuation(false);
+    showError(error.message || 'Could not load the saved analysis');
+  } finally {
+    requestAnimationFrame(() => $('resultsPanel').scrollIntoView({ block: 'start' }));
+  }
 }
 
 function esc(value) { return String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
@@ -176,4 +214,5 @@ $('diagnosticModal').addEventListener('click', event => { if (event.target === $
 $('avoidHolidays').addEventListener('change', () => { if ($('avoidHolidays').checked) $('workHolidays').checked = false; }); $('workHolidays').addEventListener('change', () => { if ($('workHolidays').checked) $('avoidHolidays').checked = false; });
 $('demoBtn').addEventListener('click', () => { allResults = [{ pairing: '2478', display_label: 'Rotation', match_level: 'excellent', credit: '21:35', tafb: '72:10', start_airport: 'ATL', fleet: '320', layovers: [{ city: 'SAN', duration: '16:00' }], cities: ['SAN'], touched_cities: ['ATL', 'MCO', 'SAN'], redeye: 'none', deadheads: 0, duty_legs: [2, 3, 1], first_day_legs: 2, last_day_legs: 1, calendar_conflicts: [], reasons: ['SAN is a highest-priority overnight', 'Matches your preferred trip length', 'No required-day conflicts'], legs: [{ departure: 'ATL', departure_time: '0830', arrival: 'SAN', arrival_time: '1035', flight: '1234', aircraft: '321', deadhead: false }], original_display: '#2478 ATL 0830 SAN 1035' }, { pairing: '1884', display_label: 'Rotation', match_level: 'strong', credit: '19:50', tafb: '67:20', start_airport: 'ATL', fleet: '320', layovers: [{ city: 'BOS', duration: '14:20' }], cities: ['BOS'], touched_cities: ['ATL', 'BOS'], redeye: 'possible', deadheads: 1, duty_legs: [1, 3, 2], first_day_legs: 1, last_day_legs: 2, calendar_conflicts: ['Preferred off: 2026-08-11'], reasons: ['BOS is a preferred overnight', 'One deadhead', 'Touches a preferred day off'] }]; bidSynopsis = { total: 2, complete: 2, incomplete: 0, redeye: { count: 1, percent: 50 }, deadhead: { count: 1, percent: 50 }, trip_lengths: [{ days: '3', count: 2, percent: 100 }], start_airports: [{ airport: 'ATL', count: 2, percent: 100 }], fleets: [{ fleet: '320', count: 2, percent: 100 }], layover_cities: [{ city: 'SAN', count: 1, percent: 50 }, { city: 'BOS', count: 1, percent: 50 }] }; renderSynopsis(); render(); });
 if (activeJob) { setJob(true, 'Resuming', 1, 'Reconnecting to your analysis…'); pollTimer = setInterval(pollJob, 1500); pollJob(); }
-if (latestJob) { $('runPreferencesBtn').disabled = false; $('csvLink').href = `/api/jobs/${latestJob}/report.pdf`; $('csvLink').classList.remove('disabled'); }
+if (latestJob) { $('runPreferencesBtn').disabled = false; $('csvLink').href = `/api/jobs/${latestJob}/report.pdf`; $('csvLink').classList.remove('disabled'); setLabsContinuation(true); }
+if (document.body.dataset.classicPage === 'results') loadLatestJob();
