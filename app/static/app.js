@@ -9,10 +9,12 @@ function terminology(){const a=$('airlineChoice').value;if(a==='delta')return{si
 function updateAirlineUI(){const sw=$('airlineChoice').value==='southwest';$('pdfUploads').classList.toggle('hidden',sw);$('southwestUploads').classList.toggle('hidden',!sw);$('resultsTitle').textContent=terminology().title}
 function setTheme(v){document.documentElement.dataset.theme=v;localStorage.setItem('crewbidiqTheme',v);$('themeChoice').value=v}
 $('themeChoice').addEventListener('change',e=>setTheme(e.target.value));setTheme(localStorage.getItem('crewbidiqTheme')||'system');$('airlineChoice').addEventListener('change',updateAirlineUI);updateAirlineUI();applySaved();
-function showChosenFile(inputId,labelId){const input=$(inputId),label=$(labelId);if(!input||!label)return;input.addEventListener('change',()=>{label.textContent=input.files&&input.files[0]?input.files[0].name:'No file selected'})}
-showChosenFile('pdfFile','pdfFileName');showChosenFile('southwestZip','southwestZipName');
+function syncChosenFile(inputId,labelId){const input=$(inputId),label=$(labelId);if(!input||!label)return false;const file=input.files&&input.files[0];label.textContent=file&&file.name?file.name:'No file selected';label.classList.toggle('has-file',Boolean(file));return Boolean(file)}
+function bindChosenFile(inputId,labelId){const input=$(inputId);if(!input)return;const sync=()=>{syncChosenFile(inputId,labelId);setTimeout(()=>syncChosenFile(inputId,labelId),0);setTimeout(()=>syncChosenFile(inputId,labelId),250)};input.addEventListener('change',sync);input.addEventListener('input',sync);window.addEventListener('pageshow',sync)}
+bindChosenFile('pdfFile','pdfFileName');bindChosenFile('southwestZip','southwestZipName');
 $('analyzeBtn').addEventListener('click',async()=>{
   clearError();
+  syncChosenFile('pdfFile','pdfFileName');syncChosenFile('southwestZip','southwestZipName');
   const airline=$('airlineChoice').value,data=new FormData();
   data.append('airline',airline);data.append('context',airline);data.append('profile_json',JSON.stringify(profile()));
   if(airline==='southwest'){
