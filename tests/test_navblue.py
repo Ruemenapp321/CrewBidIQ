@@ -21,7 +21,6 @@ def test_navblue_plan_builds_ordered_actual_requests():
     }, results, "LAX AUG 2026.pdf")
     requests = [request["request"] for layer in plan["layers"] for request in layer["requests"]]
     assert requests == [
-        "Start Pairings",
         "Prefer Off Date August 11, 2026",
         "Avoid Pairings If Layover In DFW",
         "Avoid Pairings If Pairing Check-In Time Before < 08:00",
@@ -30,8 +29,9 @@ def test_navblue_plan_builds_ordered_actual_requests():
         "Award Pairings If Pairing Length Between 2 Days And 3 Days",
         "Award Pairings",
     ]
-    assert plan["layers"][0]["title"] == "Protect non-negotiables"
-    assert plan["request_count"] == 8
+    assert plan["layers"][0] == {"number": 1, "title": "Start Pairing Group", "requests": []}
+    assert plan["layers"][1]["title"] == "Protect non-negotiables"
+    assert plan["request_count"] == 7
 
 
 def test_navblue_endpoint_uses_same_completed_classic_job(monkeypatch):
@@ -48,4 +48,5 @@ def test_navblue_endpoint_uses_same_completed_classic_job(monkeypatch):
         with db() as conn:
             conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
     assert response.status_code == 200
+    assert response.json()["layers"][0] == {"number": 1, "title": "Start Pairing Group", "requests": []}
     assert response.json()["layers"][1]["requests"][0]["request"] == "Award Pairings If Layover In HNL"

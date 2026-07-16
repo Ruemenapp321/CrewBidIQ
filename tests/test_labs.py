@@ -229,6 +229,32 @@ def test_labs_mobile_upload_layout_keeps_actions_above_bottom_navigation():
     assert "Files app, iCloud Drive, or this device" in script
 
 
+def test_package_metadata_labels_and_values_are_stacked_and_wrap_safely():
+    with TestClient(app) as client:
+        css = client.get("/static/app.css").text
+        script = client.get("/static/labs.js").text
+
+    assert script.count('class="package-meta-item"') == 4
+    for label in ("Base", "Fleet / category", "Parsed", "Last parsed"):
+        assert f"<span>{label}</span><strong>" in script
+    assert ".package-meta-item strong{display:block" in css
+    assert "overflow-wrap:anywhere" in css
+    assert "@media(max-width:440px){.package-meta-grid{grid-template-columns:1fr}}" in css
+
+
+def test_labs_builder_saves_current_fields_and_rescores_before_recommendations():
+    with TestClient(app) as client:
+        script = client.get("/static/labs.js").text
+
+    assert 'id="openLabsRecommendations"' in script
+    assert "addEventListener('click', () => saveCurrentDraft(false))" in script
+    assert "loadRefinedRecommendations(jobId)" in script
+    assert "fetch(`/api/jobs/${jobId}/rescore`" in script
+    assert "Applying your saved trip preferences" in script
+    assert "parsed trip${request.matching_trip_count" not in script
+    assert "trip${request.matching_trip_count === 1 ? '' : 's'} associated with this request" in script
+
+
 def test_job_status_exposes_package_identity_for_labs(monkeypatch):
     monkeypatch.setenv("LABS_ENABLED", "true")
     job_id = "labs-shared-session-test"

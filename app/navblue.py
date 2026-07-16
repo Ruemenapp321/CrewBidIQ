@@ -60,11 +60,13 @@ def build_navblue_layers(
 ) -> dict[str, Any]:
     """Build a pilot-reviewable NavBlue PBS request order from CrewBidIQ preferences."""
     layers: list[dict[str, Any]] = []
-    hard_requests = [_request("Start Pairings", "Begin the pairing bid group.", len(results))]
+    layers.append({"number": 1, "title": "Start Pairing Group", "requests": []})
+    hard_requests: list[dict[str, Any]] = []
     for value in _list(profile.get("required_days_off")):
         day = _navblue_date(value, filename)
         hard_requests.append(_request(f"Prefer Off Date {day}", f"Protect required day off {day}."))
-    layers.append({"number": 1, "title": "Protect non-negotiables", "requests": hard_requests})
+    if hard_requests:
+        layers.append({"number": len(layers) + 1, "title": "Protect non-negotiables", "requests": hard_requests})
 
     avoid_requests: list[dict[str, Any]] = []
     for city in _list(profile.get("penalty_cities")):

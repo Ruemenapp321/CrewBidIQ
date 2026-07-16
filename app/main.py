@@ -177,7 +177,7 @@ INDEX_HTML = r"""
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#071525">
   <title>CrewBidIQ</title>
-  <link rel="stylesheet" href="/static/app.css?v=0423">
+  <link rel="stylesheet" href="/static/app.css?v=0424">
 </head>
 <body data-classic-page="__CLASSIC_PAGE__">
 <div class="app-shell">
@@ -858,9 +858,12 @@ def sort_results(results: list[dict[str, Any]]) -> None:
         )
         pay_preference = bool(item.get("pay_priority"))
         pay_value = item.get("pay_priority_value")
+        length_preference = bool(item.get("trip_length_preference_active"))
+        preferred_length_match = not length_preference or bool(item.get("trip_length_match"))
         return (
             complete,
             not hard_conflict,
+            preferred_length_match,
             pay_preference and pay_value is not None,
             pay_value if pay_preference and pay_value is not None else float("-inf"),
             item.get("score", 0),
@@ -1071,6 +1074,9 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
         "layovers": pairing.get("layovers", []),
         "legs": result_legs,
         "duty_legs": duty_counts,
+        "trip_length_preference_active": bool(preferred_lengths),
+        "trip_length_match": bool(preferred_lengths and len(duty_counts) in preferred_lengths),
+        "preferred_trip_lengths": sorted(preferred_lengths),
         "first_day_legs": duty_counts[0] if duty_counts else 0,
         "last_day_legs": duty_counts[-1] if duty_counts else 0,
         "item_type": "pairing",

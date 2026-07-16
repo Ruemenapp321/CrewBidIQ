@@ -11,6 +11,9 @@ let navbluePlanError = '';
 let labsUploadBusy = false;
 let labsUploadController = null;
 let labsUploadError = '';
+let refinedRecommendationsLoading = false;
+let refinedRecommendationsError = '';
+let refinedRecommendationsSignature = '';
 
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, character => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -78,7 +81,7 @@ function packageCard() {
   const status = complete ? 'Ready for Labs' : (sessionJob.status === 'failed' ? 'Analysis needs attention' : 'Analysis in progress');
   return `<section class="surface package-status ${escapeHtml(sessionJob.status)}">
     <div class="status-light"></div>
-    <div class="package-status-main"><span>Current bid package</span><strong>${escapeHtml(metadata.filename || sessionJob.filename || 'Uploaded package')}</strong><small>${escapeHtml(airlineName(metadata.airline || sessionJob.airline))} · ${escapeHtml(metadata.bid_month || inferredBidMonth(sessionJob.filename))}</small><div class="package-meta-grid"><small><b>Base</b>${escapeHtml(metadata.base || 'Not detected')}</small><small><b>Fleet / category</b>${escapeHtml(metadata.fleet_category || 'Not detected')}</small><small><b>Parsed</b>${complete ? `${escapeHtml(metadata.parsed_count ?? sessionJob.results?.length ?? 0)} ${escapeHtml(metadata.record_label || 'records')}` : 'Processing'}</small><small><b>Last parsed</b>${escapeHtml(formatParsedTime(metadata.last_parsed_at))}</small></div></div>
+    <div class="package-status-main"><span>Current bid package</span><strong>${escapeHtml(metadata.filename || sessionJob.filename || 'Uploaded package')}</strong><small>${escapeHtml(airlineName(metadata.airline || sessionJob.airline))} · ${escapeHtml(metadata.bid_month || inferredBidMonth(sessionJob.filename))}</small><div class="package-meta-grid"><div class="package-meta-item"><span>Base</span><strong>${escapeHtml(metadata.base || 'Not detected')}</strong></div><div class="package-meta-item"><span>Fleet / category</span><strong>${escapeHtml(metadata.fleet_category || 'Not detected')}</strong></div><div class="package-meta-item"><span>Parsed</span><strong>${complete ? `${escapeHtml(metadata.parsed_count ?? sessionJob.results?.length ?? 0)} ${escapeHtml(metadata.record_label || 'records')}` : 'Processing'}</strong></div><div class="package-meta-item"><span>Last parsed</span><strong>${escapeHtml(formatParsedTime(metadata.last_parsed_at))}</strong></div></div></div>
     <div class="package-status-state"><span>${escapeHtml(status)}</span><strong>${escapeHtml(sessionJob.progress ?? 0)}%</strong><div class="package-status-actions">${complete ? '<a class="text-button button" href="/labs/recommendations">Use Current Package</a>' : ''}<a class="text-button button" href="#labsUpload">Replace Bid Package</a></div></div>
   </section>`;
 }
@@ -170,7 +173,7 @@ function builderPage() {
         <label>Latest release<input id="labsLatestRelease" type="time" value="${escapeHtml(value('latestRelease'))}"></label>
       </div>
       <label class="labs-notes">What would make this a successful month?<textarea id="labsNotes" placeholder="Example: Protect my daughter's birthday and favor longer Hawaii layovers.">${escapeHtml(value('notes'))}</textarea></label>
-      <div class="labs-builder-actions"><button id="saveLabsDraft" class="secondary">Save draft</button><a class="primary button" href="/labs/recommendations">Refine recommendations</a></div>
+      <div class="labs-builder-actions"><button id="saveLabsDraft" class="secondary">Save draft</button><a id="openLabsRecommendations" class="primary button" href="/labs/recommendations">Refine recommendations</a></div>
     </section>
     <section class="surface labs-next-step"><div><span class="labs-step">2</span><div><h2>Ready for a proposed plan?</h2><p>Review the available trips first, then arrange your strongest options into a working bid order.</p></div></div><a class="text-button button" href="/labs/plan">Open bid plan</a></section>`;
 }
@@ -199,11 +202,11 @@ function recommendationCards(results) {
 function recommendationsPage() {
   const ready = sessionJob?.status === 'complete';
   const results = sessionJob?.results || [];
-  return `${pageHeader('REFINED RECOMMENDATIONS', 'See the trips worth your attention', 'A quieter review of the strongest recommendations from your current Classic preferences.')}
+  return `${pageHeader('REFINED RECOMMENDATIONS', 'See the trips worth your attention', 'A quieter review reranked from your current Classic preferences and saved Labs draft.')}
     ${packageCard()}
     ${uploadPanel()}
     ${postParseActions()}
-    ${!ready ? emptyFeature('Complete a Classic analysis first') : `<section class="surface labs-recommendations-panel"><div class="surface-title"><div><div><h2>Priority review</h2><p>${escapeHtml(results.length)} analyzed trips · showing the first ${Math.min(results.length, 8)}</p></div></div><a class="text-button button" href="/results">Open full Classic results</a></div><div class="labs-recommendation-list">${recommendationCards(results)}</div></section>`}
+    ${!ready ? emptyFeature('Complete a Classic analysis first') : refinedRecommendationsLoading ? `<section class="surface labs-loading"><strong>Applying your saved trip preferences...</strong><p>Reranking the parsed package without uploading or parsing it again.</p></section>` : refinedRecommendationsError ? `<section class="surface labs-feature-empty"><h2>Recommendations could not be refreshed</h2><p>${escapeHtml(refinedRecommendationsError)}</p><a class="primary button" href="/labs/build">Review preferences</a></section>` : `<section class="surface labs-recommendations-panel"><div class="surface-title"><div><div><h2>Priority review</h2><p>${escapeHtml(results.length)} analyzed trips · showing the first ${Math.min(results.length, 8)}</p></div></div><a class="text-button button" href="/results">Open full Classic results</a></div><div class="labs-recommendation-list">${recommendationCards(results)}</div></section>`}
     <div class="labs-page-actions"><a class="secondary button" href="/labs/build">Adjust bid priorities</a><a class="primary button" href="/labs/plan">Build proposed plan</a></div>`;
 }
 
@@ -255,7 +258,7 @@ function planPage() {
   const focus = ({ quality: 'Quality of life', days_off: 'Protect days off', layovers: 'Preferred layovers', credit: payGoalLabel(), commute: 'Commute-friendly trips' })[draft.focus] || 'Classic preference ranking';
   const planBody = navbluePlanError ? `<section class="surface labs-feature-empty"><h2>Bid plan could not be generated</h2><p>${escapeHtml(navbluePlanError)}</p><button class="primary" type="button" onclick="window.location.reload()">Try again</button></section>` : !navbluePlan ? `<section class="surface labs-loading"><strong>Building your NavBlue request layers...</strong><p>Translating your saved preferences into an ordered, pilot-reviewable bid.</p></section>` : `<section class="surface bid-plan navblue-plan">
       <div class="surface-title"><div><div><span class="kicker">NAVBLUE PBS REQUEST PLAN</span><h2>${escapeHtml(focus)}</h2><p>${escapeHtml(navbluePlan.request_count)} ordered requests derived from your Classic preferences and Labs draft.</p></div></div><span class="beta-badge">Draft</span></div>
-      <div class="navblue-layer-list">${navbluePlan.layers.map(layer => `<article class="navblue-layer"><header><span>Layer ${escapeHtml(layer.number)}</span><h3>${escapeHtml(layer.title)}</h3></header><ol>${layer.requests.map(request => `<li><code>${escapeHtml(request.request)}</code><p>${escapeHtml(request.reason)}</p>${request.matching_trip_count !== undefined ? `<small>${escapeHtml(request.matching_trip_count)} parsed trip${request.matching_trip_count === 1 ? '' : 's'} associated with this request</small>` : ''}</li>`).join('')}</ol></article>`).join('')}</div>
+      <div class="navblue-layer-list">${navbluePlan.layers.map(layer => `<article class="navblue-layer"><header><span>Layer ${escapeHtml(layer.number)}</span><h3>${escapeHtml(layer.title)}</h3></header><ol>${layer.requests.map(request => `<li><code>${escapeHtml(request.request)}</code><p>${escapeHtml(request.reason)}</p>${request.matching_trip_count !== undefined ? `<small>${escapeHtml(request.matching_trip_count)} trip${request.matching_trip_count === 1 ? '' : 's'} associated with this request</small>` : ''}</li>`).join('')}</ol></article>`).join('')}</div>
       <div class="labs-plan-note"><strong>Before you submit</strong>${navbluePlan.warnings.map(warning => `<p>${escapeHtml(warning)}</p>`).join('')}</div>
     </section>`;
   return `${pageHeader('PROPOSED BID PLAN', 'Build actual NavBlue request layers', 'Review an ordered PBS request strategy—not another list of pairings—and enter it in NavBlue only after pilot verification.')}
@@ -399,7 +402,7 @@ function bindBuilder() {
   if (!button) return;
   const draft = readJson(draftKey, {}) || {};
   document.getElementById('labsFocus').value = draft.focus || 'quality';
-  button.addEventListener('click', () => {
+  const saveCurrentDraft = (showConfirmation = true) => {
     const saved = {
       focus: document.getElementById('labsFocus').value,
       requiredDays: document.getElementById('labsRequiredDays').value.trim(),
@@ -413,11 +416,38 @@ function bindBuilder() {
       savedAt: new Date().toISOString()
     };
     localStorage.setItem(draftKey, JSON.stringify(saved));
+    refinedRecommendationsSignature = '';
+    if (!showConfirmation) return;
     const status = document.getElementById('draftStatus');
     status.textContent = 'Saved just now';
     button.textContent = 'Saved';
     setTimeout(() => { button.textContent = 'Save draft'; }, 1200);
-  });
+  };
+  button.addEventListener('click', () => saveCurrentDraft(true));
+  document.getElementById('openLabsRecommendations')?.addEventListener('click', () => saveCurrentDraft(false));
+}
+
+async function loadRefinedRecommendations(jobId) {
+  const profile = mergedLabsProfile();
+  const signature = `${jobId}:${JSON.stringify(profile)}`;
+  if (!jobId || refinedRecommendationsLoading || refinedRecommendationsSignature === signature) return;
+  refinedRecommendationsLoading = true;
+  refinedRecommendationsError = '';
+  render();
+  try {
+    const data = new FormData();
+    data.append('profile_json', JSON.stringify(profile));
+    const response = await fetch(`/api/jobs/${jobId}/rescore`, { method: 'POST', body: data, headers: { Accept: 'application/json' } });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.detail || 'Could not apply the saved trip preferences');
+    sessionJob = { ...sessionJob, results: body.results || [], synopsis: body.synopsis || sessionJob.synopsis };
+    refinedRecommendationsSignature = signature;
+  } catch (error) {
+    refinedRecommendationsError = error.message || 'Could not refresh recommendations';
+  } finally {
+    refinedRecommendationsLoading = false;
+    render();
+  }
 }
 
 async function loadNavbluePlan(jobId) {
@@ -454,6 +484,7 @@ async function loadSharedSession() {
     }
     sessionLoading = false;
     render();
+    if (labsPage === 'recommendations' && sessionJob.status === 'complete') loadRefinedRecommendations(jobId);
     if (labsPage === 'plan' && sessionJob.status === 'complete') loadNavbluePlan(jobId);
     if (sessionJob.status === 'queued' || sessionJob.status === 'processing') setTimeout(loadSharedSession, 2000);
   } catch (_) {

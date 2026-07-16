@@ -47,3 +47,31 @@ def test_old_analysis_explains_that_one_reupload_is_required():
         response = client.post(f"/api/jobs/{job_id}/rescore", data={"profile_json": "{}"})
     assert response.status_code == 409
     assert "Upload the bid package one more time" in response.json()["detail"]
+
+
+def test_five_day_only_preference_never_explains_a_three_day_match():
+    job_id = "five-day-rescore-test"
+    three_day = pairing("3003", "OMA")
+    three_day["legs"].append({"day": "C", "deadhead": False, "departure": "ATL", "departure_time": "0900", "arrival": "OMA", "arrival_time": "1100", "aircraft": "321"})
+    five_day = pairing("5005", "BOS")
+    for day in ("C", "D", "E"):
+        five_day["legs"].append({"day": day, "deadhead": False, "departure": "ATL", "departure_time": "0900", "arrival": "BOS", "arrival_time": "1100", "aircraft": "321"})
+    source = {"kind": "pairings", "pairings": [three_day, five_day]}
+    profile = {"preferred_trip_lengths": ["5"], "elite_cities": ["OMA", "DSM"], "prefer_operate": False}
+    with TestClient(app) as client:
+        with db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO jobs(id,filename,context,status,progress,results_json,airline,profile_json,source_json) VALUES(?,?,?,?,?,?,?,?,?)",
+                (job_id, "ATL320 AUG.pdf", "delta", "complete", 100, "[]", "delta", "{}", json.dumps(source)),
+            )
+        response = client.post(f"/api/jobs/{job_id}/rescore", data={"profile_json": json.dumps(profile)})
+        with db() as conn:
+            conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+
+    assert response.status_code == 200
+    results = {result["pairing"]: result for result in response.json()["results"]}
+    assert response.json()["results"][0]["pairing"] == "5005"
+    assert "Matches your preferred 5-day trip length" in results["5005"]["reasons"]
+    assert results["5005"]["trip_length_match"] is True
+    assert results["3003"]["trip_length_match"] is False
+    assert all("preferred 3-day" not in reason for result in results.values() for reason in result["reasons"])
