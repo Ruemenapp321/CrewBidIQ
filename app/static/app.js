@@ -192,20 +192,15 @@ function openDiagnostic(pairingId) {
   $('diagnosticModal').classList.remove('hidden'); $('diagnosticCategory').focus();
 }
 function closeDiagnostic() { diagnosticPairingId = null; $('diagnosticModal').classList.add('hidden'); }
-async function downloadDiagnostic() {
+function downloadDiagnostic() {
   if (!latestJob || !diagnosticPairingId) return;
-  const button = $('downloadDiagnosticBtn'), data = new FormData();
-  data.append('pairing_id', diagnosticPairingId); data.append('category', $('diagnosticCategory').value); data.append('notes', $('diagnosticNotes').value.trim());
-  button.disabled = true; button.textContent = 'Creating…'; clearError();
-  try {
-    const response = await fetch(`/api/jobs/${latestJob}/diagnostic.json`, { method: 'POST', body: data });
-    if (!response.ok) { let message = 'Could not create diagnostic file'; try { message = (await response.json()).detail || message; } catch (_) {} throw new Error(message); }
-    const blob = await response.blob(), disposition = response.headers.get('content-disposition') || '';
-    const name = disposition.match(/filename="?([^";]+)"?/i)?.[1] || `crewbidiq-diagnostic-${diagnosticPairingId}.json`;
-    const url = URL.createObjectURL(blob), anchor = document.createElement('a'); anchor.href = url; anchor.download = name; document.body.appendChild(anchor); anchor.click(); anchor.remove(); setTimeout(() => URL.revokeObjectURL(url), 1500);
-    closeDiagnostic(); setJob(true, 'Diagnostic ready', 100, 'Attach the downloaded JSON file in Codex or send it to support.');
-  } catch (error) { showError(error.message || 'Could not create diagnostic file'); }
-  finally { button.disabled = false; button.textContent = 'Create diagnostic file'; }
+  clearError();
+  const form = document.createElement('form');
+  form.method = 'POST'; form.action = `/api/jobs/${latestJob}/diagnostic.json`; form.target = '_blank'; form.hidden = true;
+  const fields = { pairing_id: diagnosticPairingId, category: $('diagnosticCategory').value, notes: $('diagnosticNotes').value.trim() };
+  Object.entries(fields).forEach(([name, value]) => { const input = document.createElement('input'); input.type = 'hidden'; input.name = name; input.value = value; form.appendChild(input); });
+  document.body.appendChild(form); form.submit(); form.remove();
+  closeDiagnostic(); setJob(true, 'Diagnostic download started', 100, 'Check your browser downloads for the JSON problem report.');
 }
 function toggleGuide(show) { $('guide').classList.toggle('hidden', !show); if (show) $('guide').scrollIntoView({ behavior: 'smooth' }); }
 $('guideBtn').addEventListener('click', () => toggleGuide(true)); $('closeGuideBtn').addEventListener('click', () => toggleGuide(false));

@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -144,3 +145,10 @@ def test_diagnostic_download_is_bounded_and_includes_ranking_preferences():
     assert set(bundle["neighboring_source_context"]) == {"previous", "selected", "next"}
     assert len(bundle["parser_candidates"]) == 2
     assert "complete bid package" in bundle["privacy"]
+
+
+def test_diagnostic_ui_uses_native_browser_download():
+    script = (Path(__file__).parents[1] / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "form.target = '_blank'" in script
+    assert "form.submit()" in script
+    assert "URL.createObjectURL(blob)" not in script
