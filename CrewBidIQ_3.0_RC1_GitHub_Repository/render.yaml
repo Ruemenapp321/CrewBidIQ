@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: crewbidiq
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
