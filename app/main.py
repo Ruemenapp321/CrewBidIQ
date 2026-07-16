@@ -60,13 +60,14 @@ def init_db() -> None:
                 airline TEXT,
                 profile_json TEXT,
                 uploads_json TEXT,
+                source_json TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
         columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
-        for name in ("airline", "profile_json", "uploads_json"):
+        for name in ("airline", "profile_json", "uploads_json", "source_json"):
             if name not in columns:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} TEXT")
 
@@ -105,7 +106,7 @@ INDEX_HTML = r"""
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#071525">
   <title>CrewBidIQ</title>
-  <link rel="stylesheet" href="/static/app.css?v=0401">
+  <link rel="stylesheet" href="/static/app.css?v=0402">
 </head>
 <body>
 <div class="app-shell">
@@ -153,7 +154,7 @@ INDEX_HTML = r"""
       </section>
 
       <section class="surface" id="preferences">
-        <div class="surface-title"><div><span class="section-number">2</span><h2>Your preferences</h2></div><button id="saveProfileBtn" class="text-button">Save on this device</button></div>
+        <div class="surface-title"><div><span class="section-number">2</span><h2>Your preferences</h2></div><div class="preference-actions"><button id="saveProfileBtn" class="text-button">Save on this device</button><button id="runPreferencesBtn" class="primary" disabled>Run preferences</button></div></div>
         <div class="preference-grid">
           <label>Highest-priority layovers<input id="eliteCities" placeholder="SAN, HNL, BOS"></label>
           <label>Preferred layovers<input id="secondaryCities" placeholder="SEA, PDX, MIA"></label>
@@ -221,7 +222,7 @@ INDEX_HTML = r"""
     </nav>
   </div>
 </div>
-<script src="/static/app.js?v=0401"></script>
+<script src="/static/app.js?v=0402"></script>
 <script>document.getElementById('mobileGuideBtn').addEventListener('click',()=>document.getElementById('guideBtn').click());</script>
 </body></html>
 """
@@ -685,7 +686,8 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
             results = [score_pairing(pairing, profile) for pairing in pairings]
             item_label = "pairings"
         results.sort(key=lambda item: item["score"], reverse=True)
-        update_job(job_id, status="complete", progress=100, message=f"Complete: {len(results)} {item_label} ranked", results_json=json.dumps(results))
+        source = {"kind": "southwest", "pairings": pairings, "lines": lines} if airline == "southwest" else {"kind": "pairings", "pairings": pairings}
+        update_job(job_id, status="complete", progress=100, message=f"Complete: {len(results)} {item_label} ranked", results_json=json.dumps(results), source_json=json.dumps(source), profile_json=json.dumps(profile))
     except Exception as exc:
         log.exception("Job %s failed", job_id)
         update_job(job_id, status="failed", progress=100, error=str(exc), message="Analysis failed")
@@ -779,6 +781,29 @@ def job_status(job_id: str):
     if row["status"] == "complete":
         payload["results"] = json.loads(row["results_json"] or "[]")
     return payload
+
+
+@app.post("/api/jobs/{job_id}/rescore")
+def rescore_job(job_id: str, profile_json: str = Form(...)):
+    row = get_job(job_id)
+    if not row or row["status"] != "complete":
+        raise HTTPException(404, "Completed analysis not found")
+    try:
+        profile = json.loads(profile_json)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "Invalid preference profile") from exc
+    source = json.loads(row["source_json"] or "null")
+    if not source:
+        raise HTTPException(409, "This analysis was created before preference reruns were available. Upload the bid package one more time.")
+    pairings = source.get("pairings") or []
+    if source.get("kind") == "southwest":
+        scored_pairings = {pairing["id"]: score_pairing(pairing, profile) for pairing in pairings}
+        results = [score_southwest_line(line, scored_pairings) for line in source.get("lines") or []]
+    else:
+        results = [score_pairing(pairing, profile) for pairing in pairings]
+    results.sort(key=lambda item: item["score"], reverse=True)
+    update_job(job_id, results_json=json.dumps(results), profile_json=json.dumps(profile), message=f"Preferences updated: {len(results)} recommendations reranked")
+    return {"job_id": job_id, "status": "complete", "results": results, "message": f"Reranked {len(results)} recommendations without parsing the bid package again"}
 
 
 @app.get("/api/jobs/{job_id}/report.pdf")
