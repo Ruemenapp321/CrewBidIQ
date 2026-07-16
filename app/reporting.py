@@ -43,7 +43,10 @@ def build_bid_report(results: list[dict[str, Any]], profile: dict[str, Any], air
 
     for index, item in enumerate(results[:25], 1):
         story += [PageBreak(), Paragraph(f"{item.get('display_label','Trip')} {item.get('pairing')}", styles["Heading1"]), Paragraph(LABELS.get(item.get("match_level", "fair"), "★★ Fair"), styles["Heading2"])]
-        rows = [["Credit", _text(item.get("credit"))], ["TAFB", _text(item.get("tafb"))], ["Layovers", ", ".join(x.get("city", "") for x in item.get("layovers", [])) or "None"], ["Legs by duty day", " • ".join(map(str, item.get("duty_legs", []))) or "—"], ["Redeyes", _text(item.get("redeye"))], ["Why it matched", "; ".join(item.get("reasons", [])) or "No weighted signals"]]
+        equipment = ", ".join(item.get("equipment_codes", [])) or "—"
+        if item.get("equipment_mapping_status") == "raw_unmapped" and equipment != "—":
+            equipment += " (AA codes; mapping pending)"
+        rows = [["Credit", _text(item.get("credit"))], ["TAFB", _text(item.get("tafb"))], ["Layovers", ", ".join(x.get("city", "") for x in item.get("layovers", [])) or "None"], ["Equipment", equipment], ["Legs by duty day", " • ".join(map(str, item.get("duty_legs", []))) or "—"], ["Redeyes", _text(item.get("redeye"))], ["Why it matched", "; ".join(item.get("reasons", [])) or "No weighted signals"]]
         table = Table(rows, colWidths=[1.35*inch, 5.05*inch])
         table.setStyle(TableStyle([("GRID", (0,0), (-1,-1), .25, colors.HexColor("#dbe4ef")), ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#f3f6fa")), ("VALIGN", (0,0), (-1,-1), "TOP"), ("FONT", (0,0), (-1,-1), "Helvetica", 8), ("PADDING", (0,0), (-1,-1), 5)]))
         story += [table, Spacer(1, 12), Paragraph("Original airline display", styles["Heading2"]), Preformatted(item.get("original_display") or "Not available", styles["Raw"])]

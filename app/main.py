@@ -106,7 +106,7 @@ INDEX_HTML = r"""
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#071525">
   <title>CrewBidIQ</title>
-  <link rel="stylesheet" href="/static/app.css?v=0402">
+  <link rel="stylesheet" href="/static/app.css?v=0403">
 </head>
 <body>
 <div class="app-shell">
@@ -222,7 +222,7 @@ INDEX_HTML = r"""
     </nav>
   </div>
 </div>
-<script src="/static/app.js?v=0402"></script>
+<script src="/static/app.js?v=0403"></script>
 <script>document.getElementById('mobileGuideBtn').addEventListener('click',()=>document.getElementById('guideBtn').click());</script>
 </body></html>
 """
@@ -401,7 +401,10 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
             score -= float(w.get("penalty") or 18); reasons.append(f"{city} is an overnight you prefer to avoid")
 
     parsed_equipment = [leg.get("aircraft") for leg in pairing.get("legs", []) if leg.get("aircraft")]
-    aircraft_hits = sorted(set([x for x in aircraft if x and (x in upper or x in parsed_equipment)]))
+    if pairing.get("equipment_mapping_status") == "raw_unmapped":
+        aircraft_hits = []
+    else:
+        aircraft_hits = sorted(set([x for x in aircraft if x and (x in upper or x in parsed_equipment)]))
     score += len(aircraft_hits) * float(w.get("aircraft") or 20)
     if aircraft_hits:
         reasons.append("Includes preferred aircraft: " + ", ".join(aircraft_hits))
@@ -513,6 +516,8 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
         "cities": cities,
         "touched_cities": touched_cities,
         "preferred_aircraft": aircraft_hits,
+        "equipment_codes": pairing.get("equipment_codes", parsed_equipment),
+        "equipment_mapping_status": pairing.get("equipment_mapping_status"),
         "redeye": redeye,
         "deadheads": deadheads,
         "transfers": transfers,
@@ -532,8 +537,13 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
         "soft_credit": " ".join(re.findall(r"\b(?:\d{1,3})?(?:EDP|HOL|SIT)\b", upper)) or None,
         "item_type": "pairing",
         "match_level": level,
-        "display_label": "Rotation" if pairing.get("parser", "").startswith("delta") else "Pairing",
+        "display_label": "Rotation" if pairing.get("parser", "").startswith("delta") else ("Sequence" if pairing.get("parser", "").startswith("american") else "Pairing"),
         "original_display": block,
+        "operations": pairing.get("operations"),
+        "positions": pairing.get("positions", []),
+        "fleet": pairing.get("fleet"),
+        "satellite": pairing.get("satellite"),
+        "operation_qualifiers": pairing.get("operation_qualifiers", []),
     }
 
 
