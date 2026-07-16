@@ -25,6 +25,28 @@ def _cell(value: Any, style: ParagraphStyle) -> Paragraph:
     return Paragraph(escape(_text(value)), style)
 
 
+def _pay_rows(item: dict[str, Any], airline: str) -> list[list[Any]]:
+    if airline == "southwest":
+        label = "Line TFP" if item.get("item_type") == "line" else "Pairing TFP"
+        value = item.get("line_tfp") if item.get("item_type") == "line" else item.get("pairing_tfp")
+        return [
+            [label, value],
+            ["Carry-out TFP", item.get("carry_out_tfp")],
+            ["TFP per duty period", item.get("tfp_per_duty_period")],
+            ["TFP per day away", item.get("tfp_per_day_away")],
+        ]
+    if airline == "delta":
+        rows = [["Trip Credit", item.get("trip_credit") or item.get("credit")], ["Additional Pay", item.get("additional_pay")]]
+        components = item.get("pay_components") or {}
+        rows.extend([[label, components[label]] for label in ("EDP", "HOL", "SIT") if label in components])
+        rows.append(["Total Pay", item.get("total_pay")])
+        unknown = item.get("unknown_pay_components") or {}
+        if unknown:
+            rows.append(["Unmapped source pay", ", ".join(f"{label} {value}" for label, value in unknown.items())])
+        return rows
+    return [["Credit", item.get("credit")]]
+
+
 def build_bid_report(results: list[dict[str, Any]], profile: dict[str, Any], airline: str, filename: str) -> bytes:
     out = io.BytesIO()
     styles = getSampleStyleSheet()
@@ -53,12 +75,14 @@ def build_bid_report(results: list[dict[str, Any]], profile: dict[str, Any], air
         item_terminology = get_airline_terminology(item.get("airline") or airline)
         story += [PageBreak(), Paragraph(f"{item.get('display_label', item_terminology.singular)} {item.get('pairing')}", styles["Heading1"]), Paragraph(LABELS.get(item.get("match_level", "fair"), "★★ Fair"), styles["Heading2"])]
         equipment = ", ".join(item.get("aircraft_display_names") or item.get("equipment_codes", [])) or "—"
-        row_values = [["Credit", item.get("credit")], ["TAFB", item.get("tafb")], ["Layovers", ", ".join(x.get("city", "") for x in item.get("layovers", [])) or "None"], ["Equipment", equipment], ["Legs by duty day", " • ".join(map(str, item.get("duty_legs", []))) or "—"], ["Redeyes", item.get("redeye")], ["Why it matched", "; ".join(item.get("reasons", [])) or "No weighted signals"]]
+        item_airline = item.get("airline") or airline
+        row_values = _pay_rows(item, item_airline) + [["TAFB", item.get("tafb")], ["Layovers", ", ".join(x.get("city", "") for x in item.get("layovers", [])) or "None"], ["Equipment", equipment], ["Legs by duty day", " • ".join(map(str, item.get("duty_legs", []))) or "—"], ["Redeyes", item.get("redeye")], ["Why it matched", "; ".join(item.get("reasons", [])) or "No weighted signals"]]
         rows = [[_cell(label, styles["Small"]), _cell(value, styles["Small"])] for label, value in row_values]
         table = Table(rows, colWidths=[1.35*inch, 5.05*inch])
         table.setStyle(TableStyle([("GRID", (0,0), (-1,-1), .25, colors.HexColor("#dbe4ef")), ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#f3f6fa")), ("VALIGN", (0,0), (-1,-1), "TOP"), ("FONT", (0,0), (-1,-1), "Helvetica", 8), ("PADDING", (0,0), (-1,-1), 5)]))
         story += [table, Spacer(1, 12), Paragraph(item_terminology.view_original, styles["Heading2"]), Preformatted(item.get("original_display") or "Not available", styles["Raw"])]
 
-    story += [PageBreak(), Paragraph("Definitions", styles["Heading1"]), Paragraph(f"Layover: an overnight or contractual rest location, not every airport operated through. Duty legs: working flight segments within each duty period. TAFB: total time away from base. Redeye: overnight flying identified from structured leg times when available. Match ratings summarize how closely each {terminology.singular.lower()} follows the preferences supplied for this analysis.", styles["BodyText"])]
+    pay_definition = "Southwest TFP means Trips for Pay; Line TFP, carry-out TFP, and efficiency remain distinct. " if airline == "southwest" else ("Delta Total Pay is Trip Credit plus confidently parsed EDP, HOL, and SIT; absent components are not assumed to be zero. " if airline == "delta" else "")
+    story += [PageBreak(), Paragraph("Definitions", styles["Heading1"]), Paragraph(f"{pay_definition}Layover: an overnight or contractual rest location, not every airport operated through. Duty legs: working flight segments within each duty period. TAFB: total time away from base. Redeye: overnight flying identified from structured leg times when available. Match ratings summarize how closely each {terminology.singular.lower()} follows the preferences supplied for this analysis.", styles["BodyText"])]
     doc.build(story)
     return out.getvalue()

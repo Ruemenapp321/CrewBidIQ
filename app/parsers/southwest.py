@@ -1,6 +1,7 @@
 from __future__ import annotations
 import re
 from .base import Leg, Layover, Pairing
+from app.pay import southwest_pairing_pay_fields
 
 HEADER = re.compile(
     r"(?m)^([A-Z0-9]{4})\s+([A-Z0-9 ]+?)\s+PILOTS\s+REPORT AT\s+([0-9]{1,2}:[0-9]{2})\s+EFFECTIVE\s+([^\n]+)$"
@@ -67,7 +68,7 @@ def parse(text: str) -> list[dict]:
         reports = REPORT.findall(block)
         release = legs[-1].arrival_time if legs else None
         confidence = .96 if legs and summary else (.78 if legs else .45)
-        results.append(Pairing(
+        result = Pairing(
             pairing_id=header.group(1),
             raw=block,
             legs=legs,
@@ -79,5 +80,9 @@ def parse(text: str) -> list[dict]:
             effective=header.group(4).strip(),
             parser="southwest_pairing_text",
             confidence=confidence,
-        ).to_dict())
+        ).to_dict()
+        duty_periods = len({leg.day or "1" for leg in legs if not leg.deadhead})
+        result.update(southwest_pairing_pay_fields(summary.group(1) if summary else None, result["tafb"], duty_periods))
+        result["airline"] = "southwest"
+        results.append(result)
     return results

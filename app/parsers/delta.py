@@ -2,6 +2,7 @@
 from __future__ import annotations
 import re
 from .base import Leg, Layover, Pairing
+from app.pay import parse_delta_pay
 
 HEADER = re.compile(r"(?m)^\s*#([A-Z]?\d{3,5})\b")
 LEG = re.compile(
@@ -57,11 +58,14 @@ def parse(text: str) -> list[dict]:
         ]
         c, t, ci, eff = CREDIT.search(block), TAFB.search(block), CHECKIN.search(block), EFFECTIVE.search(block)
         confidence = .95 if legs else .6
-        results.append(Pairing(
+        result = Pairing(
             pairing_id=pairing_id, raw=block, legs=legs, layovers=layovers,
             credit=c.group(1) if c else None, tafb=t.group(1) if t else None,
             checkin=ci.group(1) if ci else None,
             effective=eff.group(1).strip() if eff else None,
             parser="delta_master_pairing", confidence=confidence,
-        ).to_dict())
+        ).to_dict()
+        result.update(parse_delta_pay(block, result["credit"]))
+        result["airline"] = "delta"
+        results.append(result)
     return results

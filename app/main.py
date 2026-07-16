@@ -26,6 +26,8 @@ from fastapi.staticfiles import StaticFiles
 from app.airlines import airline_terminology_payload, get_airline_terminology
 from app.airports import coterminal_group_for_airport, coterminal_payload, expand_airports
 from app.labs import labs_enabled, router as labs_router
+from app.navblue import build_navblue_layers
+from app.pay import pay_minutes_per_duty_day, pay_priority_value, tfp_per_day_away, tfp_ratio
 from app.parsers import select_parser
 from app.reporting import build_bid_report
 
@@ -33,7 +35,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR / "data"))
 UPLOAD_DIR = DATA_DIR / "uploads"
 DB_PATH = DATA_DIR / "pairingiq.db"
-PARSER_CACHE_VERSION = "2026-07-16.1"
+PARSER_CACHE_VERSION = "2026-07-16.2"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -173,7 +175,7 @@ INDEX_HTML = r"""
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#071525">
   <title>CrewBidIQ</title>
-  <link rel="stylesheet" href="/static/app.css?v=0420">
+  <link rel="stylesheet" href="/static/app.css?v=0421">
 </head>
 <body data-classic-page="__CLASSIC_PAGE__">
 <div class="app-shell">
@@ -234,6 +236,7 @@ INDEX_HTML = r"""
           <label>Latest release<input id="latestRelease" type="time"></label>
           <label>Base / co-terminal group<input id="baseAirport" placeholder="ATL or NYC"></label>
           <label id="bidFleetField" class="hidden">American bid fleet<input id="bidFleets" placeholder="320, 737"></label>
+          <label id="payPriorityField" class="hidden">Pay ranking priority<select id="payPriority"></select></label>
           <label>Preferred start airports<input id="preferredStartAirports" placeholder="JFK, LGA"></label>
           <label>Avoid start airports<input id="avoidStartAirports" placeholder="EWR"></label>
         </div>
@@ -283,7 +286,7 @@ INDEX_HTML = r"""
         </div>
         <div class="snapshot" id="snapshot">
           <div><span>Top match</span><strong id="snapshotMatch">—</strong></div>
-          <div><span>Credit</span><strong id="snapshotCredit">—</strong></div>
+          <div><span id="snapshotPayLabel">Credit</span><strong id="snapshotCredit">—</strong></div>
           <div><span>Trip length</span><strong id="snapshotLength">—</strong></div>
           <div><span>Recovery</span><strong id="snapshotRecovery">—</strong></div>
         </div>
@@ -375,7 +378,9 @@ INDEX_HTML = r"""
             <h4>Snapshot and core metrics</h4>
             <ul class="guide-list">
               <li><strong>Top match:</strong> rating of the first recommendation.</li>
-              <li><strong>Credit:</strong> airline-provided trip or sequence credit when available.</li>
+              <li><strong>Southwest TFP:</strong> Trips for Pay is shown as Pairing TFP or Line TFP. Carry-out TFP and TFP efficiency remain separate.</li>
+              <li><strong>Delta Total Pay:</strong> Trip Credit plus confidently parsed EDP, HOL, and SIT. Missing or unsupported components are never assumed to be zero.</li>
+              <li><strong>Other-airline credit:</strong> airline-provided trip or sequence credit when available. Total Pay appears only after that airline's pay rules are defined.</li>
               <li><strong>TAFB:</strong> total time away from base.</li>
               <li><strong>Trip length:</strong> number of parsed duty periods.</li>
               <li><strong>Recovery:</strong> a quick description of workload around detected redeye flying.</li>
@@ -394,10 +399,11 @@ INDEX_HTML = r"""
           </article>
 
           <article class="guide-card">
-            <h4>Conflicts, soft credit, and report</h4>
+            <h4>Conflicts, airline pay, and report</h4>
             <ul class="guide-list">
               <li><strong>Conflicts:</strong> lists required-day, preferred-day, and holiday overlaps. Time and workload mismatches appear under Why it matched.</li>
-              <li><strong>Soft credit:</strong> shows airline-specific pay signals when supported. Delta may show EDP, HOL, and SIT; unsupported airline rules display N/A.</li>
+              <li><strong>Pay ranking priority:</strong> optionally ranks otherwise eligible trips by an airline-supported pay or efficiency measure. Required days off still take priority.</li>
+              <li><strong>Delta Additional Pay:</strong> itemizes only EDP, HOL, and SIT values that were actually found in the source pairing.</li>
               <li><strong>PDF report:</strong> creates a printable package containing your preferences, top recommendations, detail pages, original airline formatting, and definitions.</li>
             </ul>
           </article>
@@ -420,7 +426,7 @@ INDEX_HTML = r"""
     __MOBILE_NAV__
   </div>
 </div>
-<script src="/static/app.js?v=0420"></script>
+<script src="/static/app.js?v=0421"></script>
 <script>document.getElementById('mobileGuideBtn').addEventListener('click',()=>document.getElementById('guideBtn').click());</script>
 </body></html>
 """
@@ -701,7 +707,11 @@ def detect_time_values(block: str) -> list[int]:
 def airline_for_pairing(pairing: dict[str, Any]) -> str:
     parser_id = str(pairing.get("parser") or "")
     return pairing.get("airline") or (
-        "delta" if parser_id.startswith("delta") else ("american" if parser_id.startswith("american") else "generic")
+        "delta" if parser_id.startswith("delta") else (
+            "american" if parser_id.startswith("american") else (
+                "southwest" if parser_id.startswith("southwest") else "generic"
+            )
+        )
     )
 
 
@@ -771,7 +781,22 @@ def build_bid_synopsis(pairings: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def sort_results(results: list[dict[str, Any]]) -> None:
-    results.sort(key=lambda item: (item.get("data_quality") != "incomplete", item.get("score", 0)), reverse=True)
+    def key(item: dict[str, Any]) -> tuple[Any, ...]:
+        complete = item.get("data_quality") != "incomplete"
+        hard_conflict = any(
+            str(value).startswith("Required off:") for value in item.get("calendar_conflicts", [])
+        )
+        pay_preference = bool(item.get("pay_priority"))
+        pay_value = item.get("pay_priority_value")
+        return (
+            complete,
+            not hard_conflict,
+            pay_preference and pay_value is not None,
+            pay_value if pay_preference and pay_value is not None else float("-inf"),
+            item.get("score", 0),
+        )
+
+    results.sort(key=key, reverse=True)
 
 
 def match_level(score: float, conflicts: list[str]) -> str:
@@ -939,7 +964,7 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
 
     level = match_level(score, calendar_conflicts)
     terminology = get_airline_terminology(airline)
-    return {
+    result = {
         "pairing": pairing["id"],
         "score": round(score, 1),
         "dates": dates,
@@ -968,7 +993,6 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
         "duty_legs": duty_counts,
         "first_day_legs": duty_counts[0] if duty_counts else 0,
         "last_day_legs": duty_counts[-1] if duty_counts else 0,
-        "soft_credit": " ".join(re.findall(r"\b(?:\d{1,3})?(?:EDP|HOL|SIT)\b", upper)) or None,
         "item_type": "pairing",
         "match_level": level,
         "display_label": terminology.singular,
@@ -985,6 +1009,44 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
         "total_flight_segments": pairing.get("total_flight_segments", len(pairing.get("legs", []))),
         "aircraft_display_names": pairing.get("aircraft_display_names", []),
     }
+    if airline == "southwest":
+        result.update({
+            "raw_trip_credit_label": pairing.get("raw_trip_credit_label"),
+            "pairing_tfp": pairing.get("pairing_tfp"),
+            "tfp_per_duty_period": pairing.get("tfp_per_duty_period"),
+            "tfp_per_day_away": pairing.get("tfp_per_day_away"),
+        })
+    elif airline == "delta":
+        result.update({
+            "trip_credit": pairing.get("trip_credit") or pairing.get("credit"),
+            "pay_components": pairing.get("pay_components"),
+            "additional_pay": pairing.get("additional_pay"),
+            "total_pay": pairing.get("total_pay"),
+            "raw_total_pay": pairing.get("raw_total_pay"),
+            "unknown_pay_components": pairing.get("unknown_pay_components"),
+            "credit_per_duty_day": pay_minutes_per_duty_day(pairing.get("trip_credit") or pairing.get("credit"), len(duty_counts)),
+            "total_pay_per_duty_day": pay_minutes_per_duty_day(pairing.get("total_pay"), len(duty_counts)),
+        })
+
+    preference = str(profile.get("pay_priority") or "")
+    result["pay_priority"] = preference or None
+    result["pay_priority_value"] = pay_priority_value(result, preference)
+    if preference and result["pay_priority_value"] is not None:
+        labels = {
+            "pairing_tfp": "Pairing TFP",
+            "monthly_tfp": "Monthly TFP",
+            "tfp_per_duty_period": "TFP per duty period",
+            "tfp_per_day_away": "TFP efficiency",
+            "trip_credit": "Trip Credit",
+            "total_pay": "Total Pay",
+            "additional_pay": "Additional Pay",
+            "credit_per_duty_day": "Credit per duty day",
+            "total_pay_per_duty_day": "Total pay per duty day",
+        }
+        result["pay_explanation"] = f"{labels.get(preference, preference)}: {result.get(preference)}"
+    else:
+        result["pay_explanation"] = None
+    return result
 
 
 def extract_archive_text(zip_path: Path, target_dir: Path, job_id: str, label: str) -> str:
@@ -1011,21 +1073,47 @@ def extract_archive_text(zip_path: Path, target_dir: Path, job_id: str, label: s
 def parse_southwest_lines(text: str, pairing_ids: set[str]) -> list[dict[str, Any]]:
     lines: list[dict[str, Any]] = []
     normalized = text.replace("\r", "\n")
-    # Common line identifiers: LINE 123, L123, or a leading numeric/alphanumeric token.
-    headers = list(re.finditer(r"(?im)^\s*(?:LINE\s*#?\s*)?([A-Z]{0,2}\d{1,5})\b[^\n]*$", normalized))
+    aliases: dict[str, str] = {}
+    for pairing_id in pairing_ids:
+        normalized_id = pairing_id.upper()
+        aliases[normalized_id] = normalized_id
+        if normalized_id.startswith("X") and len(normalized_id) > 1:
+            aliases[normalized_id[1:]] = normalized_id
+
+    # Southwest LAXFOL rows begin with: Line 1    TFP 90.18 ...
+    headers = list(re.finditer(r"(?im)^\s*LINE\s*#?\s*([A-Z0-9-]+)\s+TFP\s+([0-9]+\.[0-9]+)[^\n]*$", normalized))
     for i, match in enumerate(headers):
         end = headers[i + 1].start() if i + 1 < len(headers) else len(normalized)
         block = normalized[match.start():end]
         refs = []
-        for token in re.findall(r"\b[A-Z0-9]{4,6}\b", block.upper()):
-            if token in pairing_ids and token not in refs:
-                refs.append(token)
+        for token in re.findall(r"\b[A-Z0-9]{3,6}\b", block.upper()):
+            canonical = aliases.get(token)
+            if canonical and canonical not in refs:
+                refs.append(canonical)
         if refs:
-            lines.append({"id": match.group(1).upper(), "pairing_ids": refs, "block": block})
+            tafb = re.search(r"\bTAFB\s+([0-9]+:[0-9]{2})", block, re.IGNORECASE)
+            duty_periods = re.search(r"\bNo\.\s*DPs\s+(\d+)", block, re.IGNORECASE)
+            carry_out = re.search(r"\bC/O\s+TFP\s+([0-9]+\.[0-9]+)", block, re.IGNORECASE)
+            monthly_tfp = match.group(2)
+            dp_count = int(duty_periods.group(1)) if duty_periods else None
+            tafb_value = tafb.group(1) if tafb else None
+            lines.append({
+                "id": match.group(1).upper(),
+                "pairing_ids": refs,
+                "block": block,
+                "raw_trip_credit_label": "TFP",
+                "monthly_tfp": monthly_tfp,
+                "line_tfp": monthly_tfp,
+                "carry_out_tfp": carry_out.group(1) if carry_out else None,
+                "duty_period_count": dp_count,
+                "tafb": tafb_value,
+                "tfp_per_duty_period": tfp_ratio(monthly_tfp, dp_count),
+                "tfp_per_day_away": tfp_per_day_away(monthly_tfp, tafb_value),
+            })
     if not lines:
         # Fallback: one record per row containing recognizable pairing IDs.
         for row_no, row in enumerate(normalized.splitlines(), 1):
-            refs = [token for token in re.findall(r"\b[A-Z0-9]{4,6}\b", row.upper()) if token in pairing_ids]
+            refs = [aliases[token] for token in re.findall(r"\b[A-Z0-9]{3,6}\b", row.upper()) if token in aliases]
             refs = list(dict.fromkeys(refs))
             if refs:
                 first = re.match(r"\s*([A-Z0-9-]+)", row)
@@ -1037,7 +1125,7 @@ def parse_southwest_lines(text: str, pairing_ids: set[str]) -> list[dict[str, An
     return list(unique.values())
 
 
-def score_southwest_line(line: dict[str, Any], pairing_scores: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def score_southwest_line(line: dict[str, Any], pairing_scores: dict[str, dict[str, Any]], profile: dict[str, Any] | None = None) -> dict[str, Any]:
     members = [pairing_scores[p] for p in line["pairing_ids"] if p in pairing_scores]
     if not members:
         raise RuntimeError(f"No pairing details found for Southwest line {line['id']}")
@@ -1051,12 +1139,11 @@ def score_southwest_line(line: dict[str, Any], pairing_scores: dict[str, dict[st
     reasons = []
     for item in members:
         reasons.extend(item.get("reasons", []))
-    credits = [item.get("credit") for item in members if item.get("credit")]
     score = round(sum(x["score"] for x in members) / len(members), 1)
     conflicts = sorted(set(c for x in members for c in x.get("calendar_conflicts", [])))
     touched = list(dict.fromkeys(c for item in members for c in item.get("touched_cities", [])))
     duty_legs = [count for item in members for count in item.get("duty_legs", [])]
-    return {
+    result = {
         "pairing": line["id"], "item_type": "line", "score": score,
         "dates": [], "cities": cities, "touched_cities": touched, "preferred_aircraft": sorted(set(a for item in members for a in item.get("preferred_aircraft", []))),
         "redeye": "flagged" if any(x.get("redeye") != "none" for x in members) else "none",
@@ -1064,11 +1151,26 @@ def score_southwest_line(line: dict[str, Any], pairing_scores: dict[str, dict[st
         "calendar_conflicts": conflicts,
         "reasons": [f"Contains pairings: {', '.join(line['pairing_ids'])}"] + list(dict.fromkeys(reasons))[:12],
         "parser": "southwest_lines", "parser_confidence": min(x.get("parser_confidence", 0) for x in members),
-        "credit": " + ".join(credits) if credits else None, "tafb": None, "checkin": None, "release": None,
-        "layovers": layovers, "legs": [leg for item in members for leg in item.get("legs", [])], "soft_credit": None, "pairing_ids": line["pairing_ids"],
+        "credit": line.get("monthly_tfp"), "tafb": line.get("tafb"), "checkin": None, "release": None,
+        "raw_trip_credit_label": line.get("raw_trip_credit_label"),
+        "monthly_tfp": line.get("monthly_tfp"), "line_tfp": line.get("line_tfp"),
+        "carry_out_tfp": line.get("carry_out_tfp"),
+        "tfp_per_duty_period": line.get("tfp_per_duty_period"),
+        "tfp_per_day_away": line.get("tfp_per_day_away"),
+        "layovers": layovers, "legs": [leg for item in members for leg in item.get("legs", [])], "pairing_ids": line["pairing_ids"],
         "duty_legs": duty_legs, "first_day_legs": duty_legs[0] if duty_legs else 0, "last_day_legs": duty_legs[-1] if duty_legs else 0,
         "match_level": match_level(score, conflicts), "display_label": get_airline_terminology("southwest").singular, "original_display": line.get("block", ""),
+        "airline": "southwest", "data_quality": "complete",
     }
+    preference = str((profile or {}).get("pay_priority") or "")
+    result["pay_priority"] = preference or None
+    result["pay_priority_value"] = pay_priority_value(result, preference)
+    labels = {"monthly_tfp": "Monthly TFP", "tfp_per_duty_period": "TFP per duty period", "tfp_per_day_away": "TFP efficiency"}
+    result["pay_explanation"] = (
+        f"{labels.get(preference, preference)}: {result.get(preference)}"
+        if preference and result["pay_priority_value"] is not None else None
+    )
+    return result
 
 
 def validate_uploaded_path(path: Path, expected: str) -> None:
@@ -1129,7 +1231,7 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
             lines = parse_southwest_lines(lines_text, set(scored_pairings))
             if not lines:
                 raise RuntimeError("No Southwest lines could be matched to the pairing IDs. Confirm that the correct Pairings and Lines ZIP files were uploaded.")
-            results = [score_southwest_line(line, scored_pairings) for line in lines]
+            results = [score_southwest_line(line, scored_pairings, profile) for line in lines]
             item_label = "lines"
         else:
             cache_key = parser_cache_key(paths[0], airline)
@@ -1290,7 +1392,7 @@ def rescore_job(job_id: str, profile_json: str = Form(...)):
         raise HTTPException(409, "The parsed bid-package cache is unavailable. Upload this bid package one more time.")
     if source.get("kind") == "southwest":
         scored_pairings = {pairing["id"]: score_pairing(pairing, profile) for pairing in pairings}
-        results = [score_southwest_line(line, scored_pairings) for line in source.get("lines") or []]
+        results = [score_southwest_line(line, scored_pairings, profile) for line in source.get("lines") or []]
     else:
         eligible_pairings = filter_pairings_for_profile(pairings, profile)
         if profile.get("bid_fleets") and not eligible_pairings:
@@ -1300,6 +1402,19 @@ def rescore_job(job_id: str, profile_json: str = Form(...)):
     update_job(job_id, results_json=json.dumps(results), profile_json=json.dumps(profile), message=f"Preferences updated: {len(results)} recommendations reranked")
     synopsis = source.get("synopsis") or build_bid_synopsis(pairings)
     return {"job_id": job_id, "status": "complete", "results": results, "synopsis": synopsis, "message": f"Reranked {len(results)} recommendations without parsing the bid package again"}
+
+
+@app.post("/api/jobs/{job_id}/navblue-plan")
+def navblue_plan(job_id: str, profile: dict[str, Any]):
+    if not labs_enabled():
+        raise HTTPException(404, "CrewBidIQ Labs is not enabled")
+    row = get_job(job_id)
+    if not row or row["status"] != "complete":
+        raise HTTPException(404, "Completed analysis not found")
+    results = json.loads(row["results_json"] or "[]")
+    stored_profile = json.loads(row["profile_json"] or "{}")
+    merged_profile = {**stored_profile, **(profile or {})}
+    return build_navblue_layers(merged_profile, results, row["filename"] or "")
 
 
 @app.post("/api/jobs/{job_id}/diagnostic.json")

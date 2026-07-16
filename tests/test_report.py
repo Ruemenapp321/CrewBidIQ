@@ -3,7 +3,7 @@ import json
 from fastapi.testclient import TestClient
 
 from app.main import app, db
-from app.reporting import build_bid_report
+from app.reporting import _pay_rows, build_bid_report
 
 
 def test_professional_report_contains_pdf_and_multiple_pages():
@@ -31,3 +31,12 @@ def test_legacy_csv_url_returns_pdf_for_cached_clients():
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/pdf"
     assert response.content.startswith(b"%PDF-")
+
+
+def test_report_uses_airline_specific_pay_labels_and_delta_breakdown():
+    southwest = _pay_rows({"item_type": "line", "line_tfp": "90.18", "carry_out_tfp": "8.30", "tfp_per_duty_period": "6.94"}, "southwest")
+    delta = _pay_rows({"trip_credit": "21:24", "additional_pay": "1:08", "pay_components": {"EDP": "0:57", "SIT": "0:11"}, "total_pay": "22:32"}, "delta")
+    assert [row[0] for row in southwest] == ["Line TFP", "Carry-out TFP", "TFP per duty period", "TFP per day away"]
+    assert all(row[0] != "Credit" for row in southwest)
+    assert [row[0] for row in delta] == ["Trip Credit", "Additional Pay", "EDP", "SIT", "Total Pay"]
+    assert delta[-1][1] == "22:32"

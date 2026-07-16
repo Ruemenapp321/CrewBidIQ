@@ -1,0 +1,142 @@
+from __future__ import annotations
+
+import calendar
+import re
+from datetime import datetime
+from typing import Any
+
+
+def _list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    values = value if isinstance(value, list) else re.split(r"[,\n]", str(value))
+    return [str(item).strip().upper() for item in values if str(item).strip()]
+
+
+def _bid_year(filename: str) -> int:
+    match = re.search(r"\b(20\d{2})\b", filename or "")
+    return int(match.group(1)) if match else datetime.now().year
+
+
+def _navblue_date(value: str, filename: str) -> str:
+    parts = [part for part in re.split(r"[-/]", value) if part]
+    if len(parts) == 3 and len(parts[0]) == 4:
+        year, month, day = map(int, parts)
+    elif len(parts) >= 2:
+        month, day = map(int, parts[-2:])
+        year = _bid_year(filename)
+    else:
+        return value
+    if not 1 <= month <= 12:
+        return value
+    return f"{calendar.month_name[month]} {day}, {year}"
+
+
+def _time(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)) or str(value).isdigit():
+        minutes = int(value)
+        return f"{minutes // 60:02d}:{minutes % 60:02d}"
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", str(value).strip())
+    return f"{int(match.group(1)):02d}:{match.group(2)}" if match else None
+
+
+def _matching_layovers(results: list[dict[str, Any]], city: str) -> int:
+    return sum(city in {str(value).upper() for value in result.get("cities", [])} for result in results)
+
+
+def _request(text: str, reason: str, matches: int | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {"request": text, "reason": reason}
+    if matches is not None:
+        payload["matching_trip_count"] = matches
+    return payload
+
+
+def build_navblue_layers(
+    profile: dict[str, Any],
+    results: list[dict[str, Any]],
+    filename: str = "",
+) -> dict[str, Any]:
+    """Build a pilot-reviewable NavBlue PBS request order from CrewBidIQ preferences."""
+    layers: list[dict[str, Any]] = []
+    hard_requests = [_request("Start Pairings", "Begin the pairing bid group.", len(results))]
+    for value in _list(profile.get("required_days_off")):
+        day = _navblue_date(value, filename)
+        hard_requests.append(_request(f"Prefer Off Date {day}", f"Protect required day off {day}."))
+    layers.append({"number": 1, "title": "Protect non-negotiables", "requests": hard_requests})
+
+    avoid_requests: list[dict[str, Any]] = []
+    for city in _list(profile.get("penalty_cities")):
+        avoid_requests.append(_request(
+            f"Avoid Pairings If Layover In {city}",
+            f"Avoid the {city} overnight preference.",
+            _matching_layovers(results, city),
+        ))
+    earliest = _time(profile.get("earliest_report") or profile.get("earliest_report_minutes"))
+    latest = _time(profile.get("latest_release") or profile.get("latest_release_minutes"))
+    if earliest:
+        avoid_requests.append(_request(
+            f"Avoid Pairings If Pairing Check-In Time Before < {earliest}",
+            f"Avoid reports earlier than {earliest}.",
+        ))
+    if latest:
+        avoid_requests.append(_request(
+            f"Avoid Pairings If Pairing Check-Out Time After > {latest}",
+            f"Avoid releases later than {latest}.",
+        ))
+    if avoid_requests:
+        layers.append({"number": len(layers) + 1, "title": "Remove poor fits", "requests": avoid_requests})
+
+    priority_requests: list[dict[str, Any]] = []
+    for city in _list(profile.get("elite_cities")):
+        priority_requests.append(_request(
+            f"Award Pairings If Layover In {city}",
+            f"Place highest-priority {city} overnights first.",
+            _matching_layovers(results, city),
+        ))
+    if priority_requests:
+        layers.append({"number": len(layers) + 1, "title": "Award highest priorities", "requests": priority_requests})
+
+    shape_requests: list[dict[str, Any]] = []
+    lengths = sorted({int(value) for value in _list(profile.get("preferred_trip_lengths")) if value.isdigit()})
+    if len(lengths) == 1:
+        length = lengths[0]
+        matches = sum(len(result.get("duty_legs", [])) == length for result in results)
+        shape_requests.append(_request(
+            f"Award Pairings If Pairing Length = {length} Days",
+            f"Favor the preferred {length}-day pairing length.",
+            matches,
+        ))
+    elif lengths:
+        low, high = min(lengths), max(lengths)
+        matches = sum(low <= len(result.get("duty_legs", [])) <= high for result in results)
+        shape_requests.append(_request(
+            f"Award Pairings If Pairing Length Between {low} Days And {high} Days",
+            f"Favor preferred pairing lengths from {low} through {high} days.",
+            matches,
+        ))
+    for city in _list(profile.get("secondary_cities")):
+        shape_requests.append(_request(
+            f"Award Pairings If Layover In {city}",
+            f"Favor preferred {city} overnights after the highest priorities.",
+            _matching_layovers(results, city),
+        ))
+    if shape_requests:
+        layers.append({"number": len(layers) + 1, "title": "Shape the remaining awards", "requests": shape_requests})
+
+    layers.append({
+        "number": len(layers) + 1,
+        "title": "Keep a broad fallback",
+        "requests": [_request("Award Pairings", "Allow the remaining legal pairing pool after the preferences above.", len(results))],
+    })
+
+    warnings = [
+        "Confirm each request is available in your airline's NavBlue configuration before submitting.",
+        "CrewBidIQ does not submit these requests to NavBlue; this is a pilot-reviewed draft.",
+    ]
+    if profile.get("max_legs_per_day") not in (None, ""):
+        warnings.append("Maximum legs per duty day needs airline-specific NavBlue keyword confirmation and was not emitted automatically.")
+    if profile.get("allow_productive_redeye") is False or profile.get("avoid_final_redeye"):
+        warnings.append("Redeye handling needs airline-specific NavBlue keyword confirmation and was not emitted automatically.")
+    return {"layers": layers, "warnings": warnings, "request_count": sum(len(layer["requests"]) for layer in layers)}
