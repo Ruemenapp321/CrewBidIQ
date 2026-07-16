@@ -151,6 +151,44 @@ def _duty_values(line: str) -> dict[str, str | None]:
     return parsed
 
 
+def _clock_minutes(value: str | None) -> int | None:
+    token = str(value or "").strip()
+    if not re.fullmatch(r"\d{4}", token):
+        return None
+    hours, minutes = int(token[:2]), int(token[2:])
+    if hours > 23 or minutes > 59:
+        return None
+    return hours * 60 + minutes
+
+
+def _annotate_duty_calendar_days(duty_periods: list[dict[str, Any]]) -> tuple[int | None, int | None]:
+    """Infer report/release day offsets from AA D/A markers and local clocks."""
+    first_report_day: int | None = None
+    final_release_day: int | None = None
+    for duty in duty_periods:
+        legs = duty.get("legs") or []
+        if not legs:
+            continue
+        first_leg, last_leg = legs[0], legs[-1]
+        report_day = int(first_leg["departure_day"])
+        report_minutes = _clock_minutes(duty.get("report_local"))
+        departure_minutes = _clock_minutes(first_leg.get("departure_time"))
+        if report_minutes is not None and departure_minutes is not None and report_minutes > departure_minutes:
+            report_day -= 1
+
+        release_day = int(last_leg["arrival_day"])
+        release_minutes = _clock_minutes(duty.get("release_local"))
+        arrival_minutes = _clock_minutes(last_leg.get("arrival_time"))
+        if release_minutes is not None and arrival_minutes is not None and release_minutes < arrival_minutes:
+            release_day += 1
+
+        duty["report_day"] = report_day
+        duty["release_day"] = release_day
+        first_report_day = report_day if first_report_day is None else min(first_report_day, report_day)
+        final_release_day = release_day if final_release_day is None else max(final_release_day, release_day)
+    return first_report_day, final_release_day
+
+
 def _build_sequence(current: dict[str, Any], month: int | None, year: int | None) -> dict[str, Any]:
     lines: list[str] = current["lines"]
     legs: list[Leg] = []
@@ -260,6 +298,19 @@ def _build_sequence(current: dict[str, Any], month: int | None, year: int | None
                 pending_layover.update(transport)
 
     dates = _calendar_dates(lines, month, year)
+    first_report_day, final_release_day = _annotate_duty_calendar_days(duty_periods)
+    leg_days = [
+        day
+        for leg in leg_details
+        for day in (int(leg["departure_day"]), int(leg["arrival_day"]))
+    ]
+    span_start_candidates = leg_days + ([first_report_day] if first_report_day is not None else [])
+    span_end_candidates = leg_days + ([final_release_day] if final_release_day is not None else [])
+    calendar_span_days = (
+        max(span_end_candidates) - min(span_start_candidates) + 1
+        if span_start_candidates and span_end_candidates else len(duty_periods)
+    )
+    sequence_days = max(calendar_span_days, 1) if legs else 0
     positions, qualifiers, position_text = _positions(current["position_text"])
     raw = "\n".join(current.get("raw_lines") or lines).strip()
     total_pay = format_pay_minutes(parse_clock_minutes(raw_total_pay))
@@ -309,7 +360,23 @@ def _build_sequence(current: dict[str, Any], month: int | None, year: int | None
             "duty_reports": reports,
             "duty_releases": releases,
             "duty_periods": duty_periods,
+            "sequence_days": sequence_days,
+            "duty_period_count": len(duty_periods),
+            "overnight_count": len(layovers),
+            "calendar_span_days": calendar_span_days,
+            "first_report": reports[0]["local"] if reports else None,
+            "first_report_day": first_report_day,
+            "final_release": releases[-1]["local"] if releases else None,
+            "final_release_day": final_release_day,
             "total_flight_segments": len(leg_details),
+            "normalization_diagnostics": {
+                "raw_sequence_id": current["id"],
+                "parsed_sequence_days": sequence_days,
+                "duty_period_count": len(duty_periods),
+                "first_report": reports[0]["local"] if reports else None,
+                "final_release": releases[-1]["local"] if releases else None,
+                "length_basis": "report_to_release_calendar_span",
+            },
         }
     )
     return pairing

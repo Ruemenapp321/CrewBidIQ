@@ -827,6 +827,9 @@ def pairing_duty_count(pairing: dict[str, Any]) -> int:
 
 def pairing_trip_length(pairing: dict[str, Any]) -> int:
     """Return elapsed trip days, which may exceed the number of flying duties."""
+    normalized_length = pairing.get("sequence_days") or pairing.get("trip_days")
+    if str(normalized_length or "").isdigit() and int(normalized_length) > 0:
+        return int(normalized_length)
     duty_labels: list[str] = []
     for leg in pairing.get("legs", []) or []:
         label = str(leg.get("day") or "1").strip().upper()
@@ -1115,6 +1118,12 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
         "display_label": terminology.singular,
         "original_display": block,
         "operations": pairing.get("operations"),
+        "sequence_days": pairing.get("sequence_days"),
+        "duty_period_count": pairing.get("duty_period_count", len(duty_counts)),
+        "overnight_count": pairing.get("overnight_count", len(pairing.get("layovers", []))),
+        "calendar_span_days": pairing.get("calendar_span_days"),
+        "first_report": pairing.get("first_report") or pairing.get("checkin"),
+        "final_release": pairing.get("final_release") or pairing.get("release"),
         "operating_dates": pairing.get("operating_dates") or dates,
         "positions": pairing.get("positions", []),
         "fleet": pairing.get("fleet"),
