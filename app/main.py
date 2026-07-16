@@ -109,7 +109,7 @@ INDEX_HTML = r"""
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#071525">
   <title>CrewBidIQ</title>
-  <link rel="stylesheet" href="/static/app.css?v=0416">
+  <link rel="stylesheet" href="/static/app.css?v=0417">
 </head>
 <body>
 <div class="app-shell">
@@ -146,11 +146,12 @@ INDEX_HTML = r"""
       <section class="surface upload-surface">
         <div class="surface-title"><div><span class="section-number">1</span><h2>Upload bid package</h2></div><p>PDF for most airlines. Southwest accepts one ZIP or two TXT files.</p></div>
         <div class="upload-layout">
-          <label class="select-field">Airline<select id="airlineChoice"><option value="delta">Delta Air Lines</option><option value="southwest">Southwest Airlines</option><option value="american">American Airlines</option><option value="generic">Other airline / generic PDF</option></select></label>
-          <div id="pdfUploads" class="drop-zone"><div class="upload-icon">⇧</div><strong>Choose bid-package PDF</strong><span id="pdfFileName">No file selected</span><label class="file-picker" for="pdfFile">Browse files</label><input id="pdfFile" class="native-file-input" type="file" accept=".pdf,application/pdf"></div>
-          <div id="southwestUploads" class="drop-zone hidden"><div class="upload-icon">⇧</div><strong>Southwest bid package</strong><span id="southwestZipName">Upload the airline ZIP, or individual TXT files</span><label class="file-picker" for="southwestZip">Choose ZIP</label><input id="southwestZip" class="native-file-input" type="file" accept=".zip,application/zip"><div class="or">OR</div><div class="sw-files"><label>Pairings TXT<input id="southwestPairingsFile" type="file" accept=".txt,text/plain"></label><label>Lines TXT<input id="southwestLinesFile" type="file" accept=".txt,text/plain"></label><label>Seniority TXT<input id="southwestSeniorityFile" type="file" accept=".txt,text/plain"></label><label>Cover TXT<input id="southwestCoverFile" type="file" accept=".txt,text/plain"></label></div></div>
+          <div class="airline-step"><div class="upload-step-heading"><span>1</span><div><strong>Select your airline</strong><small>This determines which parser CrewBidIQ uses.</small></div></div><label class="select-field">Airline<select id="airlineChoice" required><option value="" selected disabled>Select an airline</option><option value="delta">Delta Air Lines</option><option value="southwest">Southwest Airlines</option><option value="american">American Airlines</option><option value="generic">Other airline / generic PDF</option></select></label></div>
+          <div id="uploadLocked" class="drop-zone upload-locked"><span class="locked-step">2</span><strong>Select an airline to unlock upload</strong><span>This prevents the wrong airline parser from reading your package.</span></div>
+          <div id="pdfUploads" class="drop-zone hidden"><span class="drop-step">2 · Upload package</span><div class="upload-icon">⇧</div><strong>Choose bid-package PDF</strong><span id="pdfFileName">No file selected</span><label class="file-picker" for="pdfFile">Browse files</label><input id="pdfFile" class="native-file-input" type="file" accept=".pdf,application/pdf"></div>
+          <div id="southwestUploads" class="drop-zone hidden"><span class="drop-step">2 · Upload package</span><div class="upload-icon">⇧</div><strong>Southwest bid package</strong><span id="southwestZipName" data-empty-text="Upload the airline ZIP, or individual TXT files">Upload the airline ZIP, or individual TXT files</span><label class="file-picker" for="southwestZip">Choose ZIP</label><input id="southwestZip" class="native-file-input" type="file" accept=".zip,application/zip"><div class="or">OR</div><div class="sw-files"><label>Pairings TXT<input id="southwestPairingsFile" type="file" accept=".txt,text/plain"></label><label>Lines TXT<input id="southwestLinesFile" type="file" accept=".txt,text/plain"></label><label>Seniority TXT<input id="southwestSeniorityFile" type="file" accept=".txt,text/plain"></label><label>Cover TXT<input id="southwestCoverFile" type="file" accept=".txt,text/plain"></label></div></div>
         </div>
-        <div class="primary-actions"><button id="analyzeBtn" class="primary">Analyze bid package</button><button id="demoBtn" class="secondary">View sample results</button></div>
+        <div class="primary-actions"><button id="analyzeBtn" class="primary" disabled>Analyze bid package</button><button id="demoBtn" class="secondary">View sample results</button></div>
         <div id="jobPanel" class="job-panel hidden"><div class="job-row"><strong id="jobStatus">Preparing…</strong><span id="jobPercent">0%</span></div><div class="progress"><div id="progressFill"></div></div><div id="jobMessage" class="muted"></div></div>
         <div id="errorBox" class="error hidden"></div>
       </section>
@@ -194,7 +195,7 @@ INDEX_HTML = r"""
           </div>
         </details>
         <input id="smallCities" type="hidden"><input id="maxConsecutiveWorkDays" type="hidden"><input id="minConsecutiveDaysOff" type="hidden"><input id="avoidReserve" type="hidden"><input id="preferOperate" type="hidden">
-        <div class="hidden-weight-fields"><input id="wElite" type="hidden" value="28"><input id="wSecondary" type="hidden" value="12"><input id="wSmall" type="hidden" value="6"><input id="wPenalty" type="hidden" value="18"><input id="wAircraft" type="hidden" value="20"><input id="wPure" type="hidden" value="65"><input id="wTransfer" type="hidden" value="32"><input id="wDeadhead" type="hidden" value="18"><input id="wStartPreferred" type="hidden" value="18"><input id="wStartAvoid" type="hidden" value="35"><input id="wRequiredConflict" type="hidden" value="500"><input id="wPreferredConflict" type="hidden" value="35"><input id="wHolidayConflict" type="hidden" value="60"><input id="wEarlyReport" type="hidden" value="20"><input id="wLateRelease" type="hidden" value="20"></div>
+        <div class="hidden-weight-fields"><input id="wElite" type="hidden" value="150"><input id="wSecondary" type="hidden" value="12"><input id="wSmall" type="hidden" value="6"><input id="wPenalty" type="hidden" value="18"><input id="wAircraft" type="hidden" value="20"><input id="wPure" type="hidden" value="65"><input id="wTransfer" type="hidden" value="32"><input id="wDeadhead" type="hidden" value="18"><input id="wStartPreferred" type="hidden" value="18"><input id="wStartAvoid" type="hidden" value="35"><input id="wRequiredConflict" type="hidden" value="500"><input id="wPreferredConflict" type="hidden" value="35"><input id="wHolidayConflict" type="hidden" value="60"><input id="wEarlyReport" type="hidden" value="20"><input id="wLateRelease" type="hidden" value="20"></div>
       </section>
 
       <section id="synopsisPanel" class="surface synopsis-panel hidden">
@@ -246,12 +247,12 @@ INDEX_HTML = r"""
         </div>
 
         <h3>Preference guide</h3>
-        <p>Comma-separated fields accept entries such as <strong>SAN, HNL, BOS</strong>. Dates can use simple month/day entries such as <strong>8/11, 8/18</strong>; CrewBidIQ uses the bid package year. Full YYYY-MM-DD dates remain supported. Most empty list and workload fields add no restriction. If left blank, CrewBidIQ uses 06:00 for earliest report, 22:00 for latest release, one allowed deadhead, and zero allowed airport transfers.</p>
+        <p>Comma-separated fields accept entries such as <strong>SAN, HNL, BOS</strong>. Dates can use simple month/day entries such as <strong>8/11, 8/18</strong>; CrewBidIQ uses the bid package year. Full YYYY-MM-DD dates remain supported. Empty report and release times add no restriction. If left blank, CrewBidIQ uses one allowed deadhead and zero allowed airport transfers.</p>
         <div class="guide-grid">
           <article class="guide-card">
             <h4>Layovers and trip shape</h4>
             <ul class="guide-list">
-              <li><strong>Highest-priority layovers:</strong> gives the strongest positive preference to sequences that overnight in those cities.</li>
+              <li><strong>Highest-priority layovers:</strong> gives a dominant positive preference to sequences that overnight in those cities. A required-day conflict can still place one lower.</li>
               <li><strong>Preferred layovers:</strong> gives a smaller positive preference to desirable overnight cities.</li>
               <li><strong>Avoid layovers:</strong> lowers sequences that overnight in those cities. Airports merely touched while operating are not treated as layovers.</li>
               <li><strong>Preferred trip lengths:</strong> favors the listed number of duty days, such as 2, 3, or 4.</li>
@@ -354,7 +355,7 @@ INDEX_HTML = r"""
     </nav>
   </div>
 </div>
-<script src="/static/app.js?v=0416"></script>
+<script src="/static/app.js?v=0417"></script>
 <script>document.getElementById('mobileGuideBtn').addEventListener('click',()=>document.getElementById('guideBtn').click());</script>
 </body></html>
 """
@@ -708,7 +709,7 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
 
     for city in cities:
         if city in elite:
-            score += float(w.get("elite") or 28); reasons.append(f"{city} is a highest-priority overnight")
+            score += float(w.get("elite") or 150); reasons.append(f"{city} is a highest-priority overnight")
         elif city in secondary:
             score += float(w.get("secondary") or 12); reasons.append(f"{city} is a preferred overnight")
         elif city in small:
@@ -765,12 +766,12 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
 
     times = detect_time_values(block)
     if times:
-        earliest_report = profile.get("earliest_report_minutes", 360)
-        latest_release = profile.get("latest_release_minutes", 1320)
-        if min(times) < earliest_report:
+        earliest_report = profile.get("earliest_report_minutes")
+        latest_release = profile.get("latest_release_minutes")
+        if earliest_report is not None and min(times) < int(earliest_report):
             score -= float(w.get("early_report") or 20)
             reasons.append("Reports earlier than your preferred start time")
-        if max(times) > latest_release:
+        if latest_release is not None and max(times) > int(latest_release):
             score -= float(w.get("late_release") or 20)
             reasons.append("Releases later than your preferred end time")
 

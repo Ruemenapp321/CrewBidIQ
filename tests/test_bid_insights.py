@@ -94,6 +94,29 @@ def test_days_off_accept_month_day_without_year_and_preserve_full_year_rules():
     assert result["calendar_conflicts"] == ["Required off: 2026-08-11"]
 
 
+def test_highest_priority_hawaii_layover_outranks_a_no_signal_sequence():
+    hawaii = pairing("7396", start="LAX")
+    hawaii["block"] = "#7396 REDEYE 2300 0200"
+    hawaii["layovers"] = [{"city": "LIH", "duration": "22:24"}]
+    hawaii["legs"][0]["arrival"] = "LIH"
+    hawaii["legs"][1]["departure"] = "LIH"
+    no_match = pairing("7399", start="LAX")
+    no_match["layovers"] = [{"city": "JFK", "duration": "22:24"}]
+    profile = {
+        "elite_cities": ["HNL", "OGG", "LIH"],
+        "prefer_operate": False,
+        "allow_productive_redeye": False,
+        "earliest_report_minutes": None,
+        "latest_release_minutes": None,
+    }
+    results = [score_pairing(no_match, profile), score_pairing(hawaii, profile)]
+    sort_results(results)
+    assert results[0]["pairing"] == "7396"
+    assert results[0]["cities"] == ["LIH"]
+    assert results[0]["match_level"] == "excellent"
+    assert any("highest-priority overnight" in reason for reason in results[0]["reasons"])
+
+
 def test_diagnostic_download_is_bounded_and_includes_ranking_preferences():
     job_id = "diagnostic-bid-insights"
     selected = pairing("4461")

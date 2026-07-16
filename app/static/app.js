@@ -18,7 +18,7 @@ function profile() {
     preferred_aircraft: csv($('preferredAircraft').value), preferred_trip_lengths: csv($('preferredTripLengths').value), max_deadheads: num('maxDeadheads'), max_transfers: num('maxTransfers'),
     max_legs_per_day: num('maxLegsPerDay'), max_first_day_legs: num('maxFirstDayLegs'), max_last_day_legs: num('maxLastDayLegs'), min_layover_hours: num('minLayoverHours'), max_legs_after_redeye: num('maxLegsAfterRedeye'),
     required_days_off: csv($('requiredDaysOff').value), preferred_days_off: csv($('preferredDaysOff').value), holiday_dates: csv($('holidayDates').value), preferred_weekdays: csv($('preferredWeekdays').value),
-    earliest_report_minutes: mins($('earliestReport').value, 360), latest_release_minutes: mins($('latestRelease').value, 1320), prefer_weekends_off: $('preferWeekendsOff').checked,
+    earliest_report_minutes: mins($('earliestReport').value, null), latest_release_minutes: mins($('latestRelease').value, null), prefer_weekends_off: $('preferWeekendsOff').checked,
     avoid_holidays: $('avoidHolidays').checked, work_holidays: $('workHolidays').checked, allow_productive_redeye: $('allowMidRotationRedeye').checked, allow_redeye_start: $('allowRedeyeStart').checked,
     avoid_final_redeye: $('avoidFinalRedeye').checked, avoid_reserve: false, prefer_operate: false,
     weights: { elite: num('wElite'), secondary: num('wSecondary'), small: num('wSmall'), penalty: num('wPenalty'), aircraft: num('wAircraft'), pure: num('wPure'), transfer: num('wTransfer'), deadhead: num('wDeadhead'), start_preferred: num('wStartPreferred'), start_avoid: num('wStartAvoid'), required_conflict: num('wRequiredConflict'), preferred_conflict: num('wPreferredConflict'), holiday_conflict: num('wHolidayConflict'), early_report: num('wEarlyReport'), late_release: num('wLateRelease') }
@@ -30,21 +30,39 @@ function showError(message) { $('errorBox').textContent = message; $('errorBox')
 function clearError() { $('errorBox').classList.add('hidden'); }
 function terminology() { const configured = airlineTerminology[$('airlineChoice').value] || airlineTerminology.generic; return { single: configured.singular, plural: configured.plural, title: configured.recommended, details: configured.details, viewOriginal: configured.view_original, analyzed: configured.analyzed }; }
 async function loadAirlineTerminology() { try { const response = await fetch('/api/airlines/terminology', { headers: { Accept: 'application/json' } }); if (response.ok) airlineTerminology = await response.json(); } catch (_) {} updateAirlineUI(); }
-function updateAirlineUI() { const airline = $('airlineChoice').value, southwest = airline === 'southwest'; $('pdfUploads').classList.toggle('hidden', southwest); $('southwestUploads').classList.toggle('hidden', !southwest); $('bidFleetField').classList.toggle('hidden', airline !== 'american'); $('resultsTitle').textContent = terminology().title; }
-function syncChosenFile(inputId, labelId) { const input = $(inputId), label = $(labelId); if (!input || !label) return false; const file = input.files && input.files[0]; label.textContent = file && file.name ? file.name : 'No file selected'; label.classList.toggle('has-file', Boolean(file)); return Boolean(file); }
-function bindChosenFile(inputId, labelId) { const input = $(inputId); if (!input) return; const sync = () => { syncChosenFile(inputId, labelId); setTimeout(() => syncChosenFile(inputId, labelId), 0); setTimeout(() => syncChosenFile(inputId, labelId), 250); }; input.addEventListener('change', sync); input.addEventListener('input', sync); window.addEventListener('pageshow', sync); }
+function uploadIsReady() {
+  const airline = $('airlineChoice').value;
+  if (!airline) return false;
+  if (airline === 'southwest') return Boolean($('southwestZip').files[0] || ($('southwestPairingsFile').files[0] && $('southwestLinesFile').files[0]));
+  return Boolean($('pdfFile').files[0]);
+}
+function updateAnalyzeAvailability() {
+  const button = $('analyzeBtn');
+  if (activeJob && button.textContent === 'Resume analysis') { button.disabled = false; return; }
+  if (button.textContent === 'Uploading…') return;
+  button.disabled = !uploadIsReady();
+}
+function clearUploadSelections() {
+  ['pdfFile', 'southwestZip', 'southwestPairingsFile', 'southwestLinesFile', 'southwestSeniorityFile', 'southwestCoverFile'].forEach(id => { if ($(id)) $(id).value = ''; });
+  syncChosenFile('pdfFile', 'pdfFileName'); syncChosenFile('southwestZip', 'southwestZipName');
+}
+function updateAirlineUI() { const airline = $('airlineChoice').value, chosen = Boolean(airline), southwest = airline === 'southwest'; $('uploadLocked').classList.toggle('hidden', chosen); $('pdfUploads').classList.toggle('hidden', !chosen || southwest); $('southwestUploads').classList.toggle('hidden', !chosen || !southwest); $('bidFleetField').classList.toggle('hidden', airline !== 'american'); $('resultsTitle').textContent = terminology().title; updateAnalyzeAvailability(); }
+function syncChosenFile(inputId, labelId) { const input = $(inputId), label = $(labelId); if (!input || !label) return false; const file = input.files && input.files[0]; label.textContent = file && file.name ? file.name : (label.dataset.emptyText || 'No file selected'); label.classList.toggle('has-file', Boolean(file)); return Boolean(file); }
+function bindChosenFile(inputId, labelId) { const input = $(inputId); if (!input) return; const sync = () => { syncChosenFile(inputId, labelId); updateAnalyzeAvailability(); setTimeout(() => { syncChosenFile(inputId, labelId); updateAnalyzeAvailability(); }, 0); setTimeout(() => { syncChosenFile(inputId, labelId); updateAnalyzeAvailability(); }, 250); }; input.addEventListener('change', sync); input.addEventListener('input', sync); window.addEventListener('pageshow', sync); }
 
 document.documentElement.dataset.theme = 'dark';
 localStorage.removeItem('crewbidiqTheme');
-$('airlineChoice').addEventListener('change', updateAirlineUI);
+$('airlineChoice').addEventListener('change', () => { clearUploadSelections(); clearError(); updateAirlineUI(); });
 updateAirlineUI(); loadAirlineTerminology(); applySaved();
 bindChosenFile('pdfFile', 'pdfFileName'); bindChosenFile('southwestZip', 'southwestZipName');
+['southwestPairingsFile', 'southwestLinesFile', 'southwestSeniorityFile', 'southwestCoverFile'].forEach(id => { $(id).addEventListener('change', updateAnalyzeAvailability); $(id).addEventListener('input', updateAnalyzeAvailability); });
 
 $('analyzeBtn').addEventListener('click', async () => {
   clearError();
   if (activeJob && $('analyzeBtn').textContent === 'Resume analysis') { pollFailures = 0; pollTimer = setInterval(pollJob, 1500); await pollJob(); return; }
   syncChosenFile('pdfFile', 'pdfFileName'); syncChosenFile('southwestZip', 'southwestZipName');
   const airline = $('airlineChoice').value, data = new FormData();
+  if (!airline) return showError('Select an airline before choosing a bid package.');
   data.append('airline', airline); data.append('context', airline); data.append('profile_json', JSON.stringify(profile()));
   if (airline === 'southwest') {
     const z = $('southwestZip').files[0], p = $('southwestPairingsFile').files[0], l = $('southwestLinesFile').files[0], s = $('southwestSeniorityFile').files[0], c = $('southwestCoverFile').files[0];
@@ -57,7 +75,7 @@ $('analyzeBtn').addEventListener('click', async () => {
     const text = await response.text(); let body = {}; try { body = text ? JSON.parse(text) : {}; } catch (_) { throw new Error(`Upload failed (${response.status}). The server returned an invalid response.`); }
     if (!response.ok) throw new Error(body.detail || body.error || `Upload failed (${response.status})`); if (!body.job_id) throw new Error('Upload completed, but no analysis job was created.');
     activeJob = body.job_id; localStorage.setItem('crewbidiqActiveJob', activeJob); pollFailures = 0; clearInterval(pollTimer); pollTimer = setInterval(pollJob, 1500); await pollJob();
-  } catch (error) { showError(error.message || 'Upload failed'); setJob(false); button.disabled = false; button.textContent = 'Analyze bid package'; }
+  } catch (error) { showError(error.message || 'Upload failed'); setJob(false); button.textContent = 'Analyze bid package'; updateAnalyzeAvailability(); }
 });
 
 async function pollJob() {
@@ -65,8 +83,8 @@ async function pollJob() {
   try {
     const response = await fetch(`/api/jobs/${activeJob}`, { headers: { Accept: 'application/json' } }); const body = await response.json(); if (!response.ok) throw new Error(body.detail || 'Could not read job status');
     pollFailures = 0; setJob(true, body.status, body.progress, body.message || '');
-    if (body.status === 'complete') { clearInterval(pollTimer); localStorage.removeItem('crewbidiqActiveJob'); latestJob = activeJob; localStorage.setItem('crewbidiqLatestJob', latestJob); $('analyzeBtn').disabled = false; $('analyzeBtn').textContent = 'Analyze bid package'; $('runPreferencesBtn').disabled = false; allResults = body.results || []; bidSynopsis = body.synopsis || null; renderSynopsis(); render(); $('csvLink').href = `/api/jobs/${latestJob}/report.pdf`; $('csvLink').classList.remove('disabled'); }
-    else if (body.status === 'failed') { clearInterval(pollTimer); localStorage.removeItem('crewbidiqActiveJob'); activeJob = null; $('analyzeBtn').disabled = false; $('analyzeBtn').textContent = 'Analyze bid package'; showError(body.error || 'Analysis failed'); }
+    if (body.status === 'complete') { clearInterval(pollTimer); localStorage.removeItem('crewbidiqActiveJob'); latestJob = activeJob; localStorage.setItem('crewbidiqLatestJob', latestJob); $('analyzeBtn').textContent = 'Analyze bid package'; updateAnalyzeAvailability(); $('runPreferencesBtn').disabled = false; allResults = body.results || []; bidSynopsis = body.synopsis || null; renderSynopsis(); render(); $('csvLink').href = `/api/jobs/${latestJob}/report.pdf`; $('csvLink').classList.remove('disabled'); }
+    else if (body.status === 'failed') { clearInterval(pollTimer); localStorage.removeItem('crewbidiqActiveJob'); activeJob = null; $('analyzeBtn').textContent = 'Analyze bid package'; updateAnalyzeAvailability(); showError(body.error || 'Analysis failed'); }
   } catch (error) { pollFailures += 1; setJob(true, 'Reconnecting', 1, 'Your upload is safe. Reconnecting to the analysis…'); if (pollFailures >= 8) { clearInterval(pollTimer); $('analyzeBtn').disabled = false; $('analyzeBtn').textContent = 'Resume analysis'; showError('The connection is taking longer than expected. Tap Resume analysis to try again.'); } }
 }
 

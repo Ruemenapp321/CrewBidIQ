@@ -7,6 +7,16 @@ from fastapi.testclient import TestClient
 from app.main import app
 
 
+def test_upload_starts_locked_until_an_airline_is_selected():
+    with TestClient(app) as client:
+        response = client.get("/")
+    assert response.status_code == 200
+    assert '<option value="" selected disabled>Select an airline</option>' in response.text
+    assert 'id="uploadLocked"' in response.text
+    assert 'id="pdfUploads" class="drop-zone hidden"' in response.text
+    assert 'id="analyzeBtn" class="primary" disabled' in response.text
+
+
 def test_pdf_upload_creates_job():
     import fitz
     doc = fitz.open()
