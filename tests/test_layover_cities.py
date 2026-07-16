@@ -1,4 +1,4 @@
-from app.main import detect_layover_cities, score_pairing
+from app.main import detect_layover_cities, match_level, score_pairing
 
 
 def sample_pairing():
@@ -45,3 +45,12 @@ def test_layover_inference_uses_end_of_nonfinal_duty_only():
     pairing = sample_pairing()
     pairing["layovers"] = []
     assert detect_layover_cities(pairing) == ["BOS"]
+
+
+def test_match_levels_are_absolute_and_required_conflicts_are_low():
+    assert match_level(65, []) == "excellent"
+    assert match_level(35, []) == "strong"
+    assert match_level(12, []) == "good"
+    assert match_level(2, []) == "fair"
+    assert match_level(-1, []) == "low"
+    assert match_level(100, ["Required off: 2026-08-10"]) == "low"

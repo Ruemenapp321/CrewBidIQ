@@ -39,3 +39,25 @@ def test_southwest_compact_zip_names_are_accepted():
         )
     assert response.status_code == 200
     assert response.json().get("job_id")
+
+
+def test_rejects_file_with_pdf_extension_but_invalid_signature():
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/jobs",
+            data={"airline": "delta", "context": "delta", "profile_json": json.dumps({})},
+            files={"file": ("not-really.pdf", b"plain text", "application/pdf")},
+        )
+    assert response.status_code == 400
+    assert "valid PDF" in response.json()["detail"]
+
+
+def test_rejects_damaged_zip():
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/jobs",
+            data={"airline": "southwest", "context": "southwest", "profile_json": json.dumps({})},
+            files={"file": ("package.zip", b"PK-not-a-zip", "application/zip")},
+        )
+    assert response.status_code == 400
+    assert "valid ZIP" in response.json()["detail"]

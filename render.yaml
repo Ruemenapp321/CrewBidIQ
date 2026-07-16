@@ -5,6 +5,12 @@ services:
     plan: starter
     dockerfilePath: ./Dockerfile
     healthCheckPath: /api/health
+    disk:
+      name: crewbidiq-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
+      - key: DATA_DIR
+        value: /var/data
