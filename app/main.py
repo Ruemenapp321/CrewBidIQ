@@ -1,8 +1,6 @@
 
 from __future__ import annotations
 
-import csv
-import io
 import json
 import logging
 import re
@@ -12,18 +10,20 @@ import time
 import uuid
 import zipfile
 import shutil
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import fitz
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from app.parsers import select_parser
+from app.reporting import build_bid_report
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR / "data"))
 UPLOAD_DIR = DATA_DIR / "uploads"
 DB_PATH = DATA_DIR / "pairingiq.db"
 
@@ -57,16 +57,32 @@ def init_db() -> None:
                 message TEXT,
                 error TEXT,
                 results_json TEXT,
+                airline TEXT,
+                profile_json TEXT,
+                uploads_json TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+        for name in ("airline", "profile_json", "uploads_json"):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} TEXT")
 
 
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    with db() as conn:
+        pending = conn.execute("SELECT * FROM jobs WHERE status IN ('queued','processing')").fetchall()
+    for row in pending:
+        paths = [Path(p) for p in json.loads(row["uploads_json"] or "[]")]
+        if paths and all(path.exists() for path in paths) and row["airline"]:
+            profile = json.loads(row["profile_json"] or "{}")
+            threading.Thread(target=process_job, args=(row["id"], paths, profile, row["airline"]), daemon=True).start()
+        else:
+            update_job(row["id"], status="failed", progress=100, error="Analysis was interrupted before it completed. Please upload the package again.", message="Analysis interrupted")
 
 
 def update_job(job_id: str, **fields: Any) -> None:
@@ -177,7 +193,7 @@ INDEX_HTML = r"""
       <section class="results-section" id="resultsPanel">
         <div class="results-header">
           <div><span class="kicker">YOUR RESULTS</span><h2 id="resultsTitle">Recommended rotations</h2><p id="summary">Load sample results or analyze a bid package.</p></div>
-          <div class="results-actions"><select id="resultLimit"><option value="25">Top 25</option><option value="50">Top 50</option><option value="100">Top 100</option><option value="all">All</option></select><a id="csvLink" class="secondary button disabled" href="#">CSV</a></div>
+          <div class="results-actions"><select id="resultLimit"><option value="25">Top 25</option><option value="50">Top 50</option><option value="100">Top 100</option><option value="all">All</option></select><a id="csvLink" class="secondary button disabled" href="#">PDF report</a></div>
         </div>
         <div class="snapshot" id="snapshot">
           <div><span>Top match</span><strong id="snapshotMatch">—</strong></div>
@@ -337,6 +353,20 @@ def detect_time_values(block: str) -> list[int]:
     return values
 
 
+def match_level(score: float, conflicts: list[str]) -> str:
+    if conflicts and any(value.startswith("Required off:") for value in conflicts):
+        return "low"
+    if score >= 60:
+        return "excellent"
+    if score >= 30:
+        return "strong"
+    if score >= 10:
+        return "good"
+    if score >= 0:
+        return "fair"
+    return "low"
+
+
 def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
     block = pairing["block"]
     upper = block.upper()
@@ -361,37 +391,37 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
 
     for city in cities:
         if city in elite:
-            score += float(w.get("elite", 28)); reasons.append(f"{city}: elite")
+            score += float(w.get("elite") or 28); reasons.append(f"{city} is a highest-priority overnight")
         elif city in secondary:
-            score += float(w.get("secondary", 12)); reasons.append(f"{city}: secondary")
+            score += float(w.get("secondary") or 12); reasons.append(f"{city} is a preferred overnight")
         elif city in small:
-            score += float(w.get("small", 6)); reasons.append(f"{city}: interesting")
+            score += float(w.get("small") or 6); reasons.append(f"{city} matches your interesting-city list")
         if city in penalty:
-            score -= float(w.get("penalty", 18)); reasons.append(f"{city}: penalty")
+            score -= float(w.get("penalty") or 18); reasons.append(f"{city} is an overnight you prefer to avoid")
 
     parsed_equipment = [leg.get("aircraft") for leg in pairing.get("legs", []) if leg.get("aircraft")]
     aircraft_hits = sorted(set([x for x in aircraft if x and (x in upper or x in parsed_equipment)]))
-    score += len(aircraft_hits) * float(w.get("aircraft", 20))
+    score += len(aircraft_hits) * float(w.get("aircraft") or 20)
     if aircraft_hits:
-        reasons.append(f"{len(aircraft_hits)} preferred-aircraft signal(s)")
+        reasons.append("Includes preferred aircraft: " + ", ".join(aircraft_hits))
 
     deadheads = sum(1 for leg in pairing.get("legs", []) if leg.get("deadhead")) if pairing.get("legs") else len(re.findall(r"\bDH\b", upper))
-    max_dh = int(profile.get("max_deadheads", 1))
+    max_dh = int(profile.get("max_deadheads") if profile.get("max_deadheads") is not None else 1)
     if deadheads == 0 and profile.get("prefer_operate", True):
         score += 10; reasons.append("all-operated signal")
     elif deadheads > max_dh:
-        cost = (deadheads - max_dh) * float(w.get("deadhead", 18))
-        score -= cost; reasons.append(f"{deadheads} deadheads")
+        cost = (deadheads - max_dh) * float(w.get("deadhead") or 18)
+        score -= cost; reasons.append(f"Has {deadheads} deadheads, above your limit of {max_dh}")
 
     transfer_pairs = [
         ("SFO", "SJC"), ("JFK", "LGA"), ("JFK", "EWR"),
         ("LGA", "EWR"), ("DCA", "IAD"), ("DCA", "BWI"),
     ]
     transfers = [f"{a}→{b}" for a, b in transfer_pairs if a in touched_cities and b in touched_cities]
-    max_transfers = int(profile.get("max_transfers", 0))
+    max_transfers = int(profile.get("max_transfers") if profile.get("max_transfers") is not None else 0)
     if len(transfers) > max_transfers:
-        score -= (len(transfers) - max_transfers) * float(w.get("transfer", 32))
-        reasons.append("airport-transfer signal")
+        score -= (len(transfers) - max_transfers) * float(w.get("transfer") or 32)
+        reasons.append("Requires an airport transfer")
 
     redeye = "none"
     if "REDEYE" in upper:
@@ -412,13 +442,13 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
     holiday_hits = sorted(date_set & holiday_dates)
 
     if req_hits:
-        score -= len(req_hits) * float(w.get("required_conflict", 500))
+        score -= len(req_hits) * float(w.get("required_conflict") or 500)
         calendar_conflicts.append("Required off: " + ", ".join(req_hits))
     if pref_hits:
-        score -= len(pref_hits) * float(w.get("preferred_conflict", 35))
+        score -= len(pref_hits) * float(w.get("preferred_conflict") or 35)
         calendar_conflicts.append("Preferred off: " + ", ".join(pref_hits))
     if holiday_hits and profile.get("avoid_holidays", False):
-        score -= len(holiday_hits) * float(w.get("holiday_conflict", 60))
+        score -= len(holiday_hits) * float(w.get("holiday_conflict") or 60)
         calendar_conflicts.append("Holiday: " + ", ".join(holiday_hits))
 
     times = detect_time_values(block)
@@ -426,15 +456,15 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
         earliest_report = profile.get("earliest_report_minutes", 360)
         latest_release = profile.get("latest_release_minutes", 1320)
         if min(times) < earliest_report:
-            score -= float(w.get("early_report", 20))
-            reasons.append("early-time signal")
+            score -= float(w.get("early_report") or 20)
+            reasons.append("Reports earlier than your preferred start time")
         if max(times) > latest_release:
-            score -= float(w.get("late_release", 20))
-            reasons.append("late-time signal")
+            score -= float(w.get("late_release") or 20)
+            reasons.append("Releases later than your preferred end time")
 
     elite_non_base = [c for c in cities if c in elite and c != base]
     if base and len(elite_non_base) == 1 and len(cities) <= 5:
-        score += float(w.get("pure", 65))
+        score += float(w.get("pure") or 65)
         reasons.append("simple base-to-preferred-city pattern")
 
     if profile.get("avoid_reserve", True) and re.search(r"\b(RES|RSV|STBY|STANDBY)\b", upper):
@@ -451,6 +481,30 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
             duty_counts.append(0)
         duty_counts[duty_labels.index(day)] += 1
 
+    preferred_lengths = {int(x) for x in list_field(profile.get("preferred_trip_lengths")) if x.isdigit()}
+    if duty_counts and len(duty_counts) in preferred_lengths:
+        score += 18
+        reasons.append(f"Matches your preferred {len(duty_counts)}-day trip length")
+    limits = (("max_legs_per_day", max(duty_counts, default=0), "maximum legs in a duty day"), ("max_first_day_legs", duty_counts[0] if duty_counts else 0, "first-day legs"), ("max_last_day_legs", duty_counts[-1] if duty_counts else 0, "last-day legs"))
+    for key, actual, label in limits:
+        limit = profile.get(key)
+        if limit is not None and actual > int(limit):
+            score -= 20 * (actual - int(limit))
+            reasons.append(f"Has {actual} {label}, above your limit of {limit}")
+    min_layover = profile.get("min_layover_hours")
+    if min_layover is not None:
+        short = []
+        for layover in pairing.get("layovers", []) or []:
+            duration = str(layover.get("duration") or "").replace(".", ":")
+            if re.fullmatch(r"\d{1,2}:\d{2}", duration):
+                hours, minutes = map(int, duration.split(":"))
+                if hours + minutes / 60 < float(min_layover):
+                    short.append(layover.get("city"))
+        if short:
+            score -= 25 * len(short)
+            reasons.append("Shorter-than-preferred overnight in " + ", ".join(str(x) for x in short))
+
+    level = match_level(score, calendar_conflicts)
     return {
         "pairing": pairing["id"],
         "score": round(score, 1),
@@ -476,6 +530,9 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
         "last_day_legs": duty_counts[-1] if duty_counts else 0,
         "soft_credit": " ".join(re.findall(r"\b(?:\d{1,3})?(?:EDP|HOL|SIT)\b", upper)) or None,
         "item_type": "pairing",
+        "match_level": level,
+        "display_label": "Rotation" if pairing.get("parser", "").startswith("delta") else "Pairing",
+        "original_display": block,
     }
 
 
@@ -544,17 +601,44 @@ def score_southwest_line(line: dict[str, Any], pairing_scores: dict[str, dict[st
     for item in members:
         reasons.extend(item.get("reasons", []))
     credits = [item.get("credit") for item in members if item.get("credit")]
+    score = round(sum(x["score"] for x in members) / len(members), 1)
+    conflicts = sorted(set(c for x in members for c in x.get("calendar_conflicts", [])))
+    touched = list(dict.fromkeys(c for item in members for c in item.get("touched_cities", [])))
+    duty_legs = [count for item in members for count in item.get("duty_legs", [])]
     return {
-        "pairing": line["id"], "item_type": "line", "score": round(sum(x["score"] for x in members) / len(members), 1),
-        "dates": [], "cities": cities, "preferred_aircraft": sorted(set(a for item in members for a in item.get("preferred_aircraft", []))),
+        "pairing": line["id"], "item_type": "line", "score": score,
+        "dates": [], "cities": cities, "touched_cities": touched, "preferred_aircraft": sorted(set(a for item in members for a in item.get("preferred_aircraft", []))),
         "redeye": "flagged" if any(x.get("redeye") != "none" for x in members) else "none",
         "deadheads": sum(x.get("deadheads", 0) for x in members), "transfers": sorted(set(t for x in members for t in x.get("transfers", []))),
-        "calendar_conflicts": sorted(set(c for x in members for c in x.get("calendar_conflicts", []))),
+        "calendar_conflicts": conflicts,
         "reasons": [f"Contains pairings: {', '.join(line['pairing_ids'])}"] + list(dict.fromkeys(reasons))[:12],
         "parser": "southwest_lines", "parser_confidence": min(x.get("parser_confidence", 0) for x in members),
         "credit": " + ".join(credits) if credits else None, "tafb": None, "checkin": None, "release": None,
-        "layovers": layovers, "legs": [], "soft_credit": None, "pairing_ids": line["pairing_ids"],
+        "layovers": layovers, "legs": [leg for item in members for leg in item.get("legs", [])], "soft_credit": None, "pairing_ids": line["pairing_ids"],
+        "duty_legs": duty_legs, "first_day_legs": duty_legs[0] if duty_legs else 0, "last_day_legs": duty_legs[-1] if duty_legs else 0,
+        "match_level": match_level(score, conflicts), "display_label": "Line", "original_display": line.get("block", ""),
     }
+
+
+def validate_uploaded_path(path: Path, expected: str) -> None:
+    if path.stat().st_size == 0:
+        raise HTTPException(400, "The selected file is empty.")
+    signature = path.read_bytes()[:8]
+    if expected == ".pdf" and not signature.startswith(b"%PDF-"):
+        raise HTTPException(400, "The selected file is not a valid PDF.")
+    if expected == ".zip":
+        if not zipfile.is_zipfile(path):
+            raise HTTPException(400, "The selected file is not a valid ZIP archive.")
+        with zipfile.ZipFile(path) as archive:
+            members = [m for m in archive.infolist() if not m.is_dir()]
+            if len(members) > 100:
+                raise HTTPException(400, "The ZIP contains too many files.")
+            if any(".." in Path(m.filename).parts or Path(m.filename).is_absolute() for m in members):
+                raise HTTPException(400, "The ZIP contains an unsafe filename.")
+            if sum(m.file_size for m in members) > 250 * 1024 * 1024:
+                raise HTTPException(413, "The expanded ZIP exceeds 250 MB.")
+            if archive.testzip() is not None:
+                raise HTTPException(400, "The ZIP archive is damaged.")
 
 
 def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline: str) -> None:
@@ -652,21 +736,29 @@ async def create_job(
 
     job_id = uuid.uuid4().hex
     paths: list[Path] = []
-    for index, upload in enumerate(uploads):
-        suffix = Path(upload.filename or "").suffix.lower()
-        path = UPLOAD_DIR / f"{job_id}_{index}{suffix}"
-        total = 0
-        with path.open("wb") as out:
-            while chunk := await upload.read(1024 * 1024):
-                total += len(chunk)
-                if total > 100 * 1024 * 1024:
-                    path.unlink(missing_ok=True)
-                    raise HTTPException(413, "A file exceeds 100 MB")
-                out.write(chunk)
-        paths.append(path)
+    try:
+        for index, upload in enumerate(uploads):
+            suffix = Path(upload.filename or "").suffix.lower()
+            path = UPLOAD_DIR / f"{job_id}_{index}{suffix}"
+            total = 0
+            with path.open("wb") as out:
+                while chunk := await upload.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > 100 * 1024 * 1024:
+                        raise HTTPException(413, "A file exceeds 100 MB")
+                    out.write(chunk)
+            validate_uploaded_path(path, suffix)
+            paths.append(path)
+    except Exception:
+        for path in paths:
+            path.unlink(missing_ok=True)
+        candidate = locals().get("path")
+        if isinstance(candidate, Path):
+            candidate.unlink(missing_ok=True)
+        raise
     filenames = " + ".join(x.filename or "upload" for x in uploads)
     with db() as conn:
-        conn.execute("INSERT INTO jobs(id,filename,context,status,progress,message) VALUES(?,?,?,?,?,?)", (job_id, filenames, context, "queued", 1, "Upload received"))
+        conn.execute("INSERT INTO jobs(id,filename,context,status,progress,message,airline,profile_json,uploads_json) VALUES(?,?,?,?,?,?,?,?,?)", (job_id, filenames, context, "queued", 1, "Upload received", airline, json.dumps(profile), json.dumps([str(path) for path in paths])))
     background_tasks.add_task(process_job, job_id, paths, profile, airline)
     return {"job_id": job_id, "status": "queued"}
 
@@ -689,27 +781,11 @@ def job_status(job_id: str):
     return payload
 
 
-@app.get("/api/jobs/{job_id}/csv")
-def job_csv(job_id: str):
+@app.get("/api/jobs/{job_id}/report.pdf")
+def job_report(job_id: str):
     row = get_job(job_id)
     if not row or row["status"] != "complete":
         raise HTTPException(404, "Completed analysis not found")
     results = json.loads(row["results_json"] or "[]")
-    out = io.StringIO()
-    writer = csv.writer(out)
-    writer.writerow([
-        "Rank", "Pairing", "Score", "Dates", "Cities", "Preferred Aircraft",
-        "Redeye", "Deadheads", "Transfers", "Calendar Conflicts", "Reasons",
-    ])
-    for i, item in enumerate(results, 1):
-        writer.writerow([
-            i, item["pairing"], item["score"], " ".join(item["dates"]),
-            " ".join(item["cities"]), " ".join(item["preferred_aircraft"]),
-            item["redeye"], item["deadheads"], " ".join(item["transfers"]),
-            "; ".join(item["calendar_conflicts"]), "; ".join(item["reasons"]),
-        ])
-    return StreamingResponse(
-        iter([out.getvalue()]),
-        media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="pairingiq_{job_id}.csv"'},
-    )
+    pdf = build_bid_report(results, json.loads(row["profile_json"] or "{}"), row["airline"] or row["context"] or "airline", row["filename"])
+    return Response(pdf, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="crewbidiq_{job_id}.pdf"'})

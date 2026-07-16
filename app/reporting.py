@@ -1,0 +1,53 @@
+from __future__ import annotations
+
+import io
+from typing import Any
+
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.platypus import PageBreak, Paragraph, Preformatted, SimpleDocTemplate, Spacer, Table, TableStyle
+
+
+LABELS = {"excellent": "★★★★★ Excellent", "strong": "★★★★ Strong", "good": "★★★ Good", "fair": "★★ Fair", "low": "★ Low"}
+
+
+def _text(value: Any) -> str:
+    return str(value if value not in (None, "") else "—")
+
+
+def build_bid_report(results: list[dict[str, Any]], profile: dict[str, Any], airline: str, filename: str) -> bytes:
+    out = io.BytesIO()
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="Cover", parent=styles["Title"], fontSize=30, leading=36, textColor=colors.HexColor("#087cff"), alignment=TA_CENTER, spaceAfter=18))
+    styles.add(ParagraphStyle(name="Small", parent=styles["BodyText"], fontSize=8, leading=10, textColor=colors.HexColor("#52657a")))
+    styles.add(ParagraphStyle(name="Raw", fontName="Courier", fontSize=6.5, leading=8, backColor=colors.HexColor("#f3f6fa"), borderPadding=8))
+    doc = SimpleDocTemplate(out, pagesize=letter, rightMargin=.55*inch, leftMargin=.55*inch, topMargin=.55*inch, bottomMargin=.55*inch, title="CrewBidIQ Bid Analysis")
+    story: list[Any] = [Spacer(1, 1.5*inch), Paragraph("CrewBidIQ", styles["Cover"]), Paragraph("Monthly Bid Analysis", styles["Title"]), Spacer(1, .25*inch), Paragraph(f"{airline.title()} • {_text(filename)}", styles["Heading2"]), Spacer(1, 2*inch), Paragraph("Find the trips that fit your life.", styles["Heading2"]), PageBreak()]
+
+    story += [Paragraph("Your preferences", styles["Heading1"])]
+    pref_rows = [[key.replace("_", " ").title(), ", ".join(map(str, value)) if isinstance(value, list) else _text(value)] for key, value in profile.items() if key != "weights" and value not in (None, "", [], False)]
+    if pref_rows:
+        table = Table(pref_rows, colWidths=[2.15*inch, 4.2*inch])
+        table.setStyle(TableStyle([("GRID", (0,0), (-1,-1), .25, colors.HexColor("#dbe4ef")), ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#f3f6fa")), ("VALIGN", (0,0), (-1,-1), "TOP"), ("FONT", (0,0), (-1,-1), "Helvetica", 8), ("PADDING", (0,0), (-1,-1), 5)]))
+        story.append(table)
+    else:
+        story.append(Paragraph("No preferences were supplied.", styles["BodyText"]))
+
+    story += [PageBreak(), Paragraph("Top recommendations", styles["Heading1"])]
+    for index, item in enumerate(results[:10], 1):
+        rating = LABELS.get(item.get("match_level", "fair"), "★★ Fair")
+        story += [Paragraph(f"{index}. {item.get('display_label','Trip')} {item.get('pairing')} — {rating}", styles["Heading2"]), Paragraph("; ".join(item.get("reasons") or ["No strong preference signals were detected."]), styles["BodyText"]), Spacer(1, 8)]
+
+    for index, item in enumerate(results[:25], 1):
+        story += [PageBreak(), Paragraph(f"{item.get('display_label','Trip')} {item.get('pairing')}", styles["Heading1"]), Paragraph(LABELS.get(item.get("match_level", "fair"), "★★ Fair"), styles["Heading2"])]
+        rows = [["Credit", _text(item.get("credit"))], ["TAFB", _text(item.get("tafb"))], ["Layovers", ", ".join(x.get("city", "") for x in item.get("layovers", [])) or "None"], ["Legs by duty day", " • ".join(map(str, item.get("duty_legs", []))) or "—"], ["Redeyes", _text(item.get("redeye"))], ["Why it matched", "; ".join(item.get("reasons", [])) or "No weighted signals"]]
+        table = Table(rows, colWidths=[1.35*inch, 5.05*inch])
+        table.setStyle(TableStyle([("GRID", (0,0), (-1,-1), .25, colors.HexColor("#dbe4ef")), ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#f3f6fa")), ("VALIGN", (0,0), (-1,-1), "TOP"), ("FONT", (0,0), (-1,-1), "Helvetica", 8), ("PADDING", (0,0), (-1,-1), 5)]))
+        story += [table, Spacer(1, 12), Paragraph("Original airline display", styles["Heading2"]), Preformatted(item.get("original_display") or "Not available", styles["Raw"])]
+
+    story += [PageBreak(), Paragraph("Definitions", styles["Heading1"]), Paragraph("Layover: an overnight or contractual rest location, not every airport operated through. Duty legs: working flight segments within each duty period. TAFB: total time away from base. Redeye: overnight flying identified from structured leg times when available. Match ratings summarize how closely each trip follows the preferences supplied for this analysis.", styles["BodyText"])]
+    doc.build(story)
+    return out.getvalue()
