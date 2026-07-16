@@ -762,6 +762,7 @@ def build_bid_synopsis(pairings: list[dict[str, Any]]) -> dict[str, Any]:
         "incomplete": total - complete,
         "redeye": {"count": redeyes, "percent": round(redeyes / total * 100, 1) if total else 0.0},
         "deadhead": {"count": deadheads, "percent": round(deadheads / total * 100, 1) if total else 0.0},
+        "overnight_city_count": len(layovers),
         "trip_lengths": _breakdown(lengths, total, "days"),
         "start_airports": _breakdown(starts, total, "airport"),
         "layover_cities": _breakdown(layovers, total, "city")[:10],

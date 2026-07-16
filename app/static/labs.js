@@ -138,7 +138,7 @@ function previewPage() {
       <article><span>Total trips</span><strong>${escapeHtml(synopsis.total || 0)}</strong><small>Parsed from this package</small></article>
       <article><span>Contain redeyes</span><strong>${escapeHtml(synopsis.redeye?.percent || 0)}%</strong><small>${escapeHtml(synopsis.redeye?.count || 0)} trips</small></article>
       <article><span>Contain deadheads</span><strong>${escapeHtml(synopsis.deadhead?.percent || 0)}%</strong><small>${escapeHtml(synopsis.deadhead?.count || 0)} trips</small></article>
-      <article><span>Incomplete data</span><strong>${escapeHtml(synopsis.incomplete || 0)}</strong><small>Kept out of top ranks</small></article>
+      <article><span>Overnight cities</span><strong>${escapeHtml(synopsis.overnight_city_count || 0)}</strong><small>Distinct layover destinations</small></article>
     </section>
     <section class="labs-preview-grid">
       <article class="surface"><h2>Trip lengths</h2>${compactBreakdown(synopsis.trip_lengths, 'days', '-day')}</article>
