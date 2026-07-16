@@ -1,18 +1,20 @@
 from app.parsers import american
-from app.main import score_pairing
+from app.main import detect_airports, detect_layover_cities
 
 
-SAMPLE = """LAX - LOS ANGELES
+SAMPLE = """<<<CREWBIDIQ_PAGE:8>>>
+LAX - LOS ANGELES
 AUGUST 2026
 DAY  --DEPARTURE--  ---ARRIVAL---  GRND/ REST/
 DP D/A EQ FLT# STA DLCL/DHBT ML STA ALCL/AHBT BLOCK SYNTH TPAY DUTY TAFB FDP CALENDAR 08/01-08/30
 LAX 777
-SEQ 520 2 OPS POSN CA FO MO TU WE TH FR SA SU
+SEQ 520  2 OPS POSN CA FO MO TU WE TH FR SA SU
 RPT 0927/0927
 1 1/1 92 1595D LAX 0957/0957 PHX 1129/1129 AA 1.32 1.41X -- -- 5 -- -- -- --
 1 1/1 83 404 PHX 1310/1310 L MIA 2043/1743 4.33 -- -- -- -- -- -- --
 RLS 2113/1813 4.33 1.32 6.05 8.46 8.16 -- -- -- -- -- -- --
 MIA MIAMI AIRPORT MARRIOTT 305-649-5000 11.42 -- -- -- -- -- -- --
+SHUTTLE SUPER SHUTTLE 305-555-0100
 RPT 0855/0555 -- 12 -- -- -- -- --
 2 2/2 83 3172 MIA 0955/0655 L PHX 1141/1141 4.46 2.30X
 2 2/2 26 3119D PHX 1411/1411 LAX 1534/1534 AA 1.23
@@ -28,6 +30,19 @@ RPT 0810/1510
 2 4/4 82 72 SYD 0910/1610 L LAX 0635/0635 13.55
 RLS 0705/0705 13.55 0.00 13.55 15.25 14.55
 TTL 29.05 0.00 29.05 56.40
+"""
+
+
+FLEET_SAMPLE = """<<<CREWBIDIQ_PAGE:25>>>
+AUGUST 2026
+DAY --DEPARTURE-- ---ARRIVAL--- GRND/ REST/
+DP D/A EQ FLT# STA DLCL/DHBT ML STA ALCL/AHBT BLOCK SYNTH TPAY DUTY TAFB FDP CALENDAR 08/01-08/30
+LAX 787
+SEQ 660 1 OPS POSN FO MO TU WE TH FR SA SU
+RPT 2200/2200
+1 1/2 78 136 LAX 2300/2300 D LHR 1715/0915 10.15 -- -- -- -- -- -- 9 -- -- -- --
+RLS 1745/0945 10.15 0.00 10.15 11.45 11.15
+TTL 10.15 0.00 10.15 11.45
 """
 
 
@@ -48,11 +63,22 @@ def test_parses_duties_deadheads_layovers_totals_and_dates():
     assert row["legs"][0]["deadhead"] is True
     assert row["legs"][0]["raw_flight"] == "1595D"
     assert row["legs"][0]["departure_home_time"] == "0957"
-    assert row["layovers"] == [{"city": "MIA", "duration": "11.42", "hotel": "MIAMI AIRPORT MARRIOTT"}]
+    assert row["layovers"] == [{"city": "MIA", "duration": "11.42", "hotel": "MIAMI AIRPORT MARRIOTT", "hotel_phone": "305-649-5000", "transportation_provider": "SHUTTLE SUPER SHUTTLE", "transportation_phone": "305-555-0100"}]
     assert row["credit"] == "12.14"
     assert row["tafb"] == "30.37"
     assert row["equipment_codes"] == ["92", "83", "26"]
     assert row["equipment_mapping_status"] == "raw_unmapped"
+    assert row["source_pdf_page"] == 8
+    assert row["source_terminology"] == "sequence"
+    assert row["fleet_section"] == "LAX 777"
+    assert row["total_flight_segments"] == 4
+    assert [duty["leg_count"] for duty in row["duty_periods"]] == [2, 2]
+    assert row["duty_periods"][0]["report_local"] == "0927"
+    assert row["duty_periods"][0]["report_home_base"] == "0927"
+    assert row["duty_periods"][0]["release_local"] == "2113"
+    assert row["duty_periods"][0]["release_home_base"] == "1813"
+    assert row["duty_periods"][0]["trip_pay"] == "6.05"
+    assert "SEQ 520  2 OPS" in row["block"]
 
 
 def test_parses_relief_position_qualifier_and_date_line_days():
@@ -65,8 +91,23 @@ def test_parses_relief_position_qualifier_and_date_line_days():
     assert row["start_dates"] == ["2026-08-15"]
 
 
-def test_unmapped_aa_equipment_codes_are_not_scored_as_preferences():
+def test_layovers_are_distinct_from_all_operating_cities():
     row = american.parse(SAMPLE)[0]
-    result = score_pairing(row, {"preferred_aircraft": ["92"], "weights": {"aircraft": 100}})
-    assert result["preferred_aircraft"] == []
-    assert result["equipment_codes"] == ["92", "83", "26"]
+    assert detect_layover_cities(row) == ["MIA"]
+    assert detect_airports(row["block"], row) == ["LAX", "PHX", "MIA"]
+
+
+def test_tracks_fleet_changes_and_long_haul_source_page():
+    row = american.parse(FLEET_SAMPLE)[0]
+    assert row["id"] == "660"
+    assert row["base"] == "LAX"
+    assert row["fleet"] == "787"
+    assert row["fleet_section"] == "LAX 787"
+    assert row["source_pdf_page"] == 25
+    assert row["legs"][0]["departure_day"] == 1
+    assert row["legs"][0]["arrival_day"] == 2
+
+
+def test_intro_pages_do_not_create_false_sequences():
+    intro = """AMERICAN AIRLINES\nAUGUST 2026\nSEQUENCE CONSTRUCTION NOTES\nPOSN CA FO\nSYNTH TPAY TAFB\n"""
+    assert american.parse(intro) == []
