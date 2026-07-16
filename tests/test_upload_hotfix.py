@@ -71,3 +71,39 @@ def test_rejects_damaged_zip():
         )
     assert response.status_code == 400
     assert "valid ZIP" in response.json()["detail"]
+
+
+def test_rejects_unsupported_file_type_with_specific_message():
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/jobs",
+            data={"airline": "american", "context": "labs", "profile_json": json.dumps({})},
+            files={"file": ("AA-package.txt", b"SEQ 7399", "text/plain")},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "This airline requires one PDF bid package."
+
+
+def test_rejects_password_protected_pdf_with_specific_message():
+    import fitz
+
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "PAIRING 1234")
+    payload = document.tobytes(
+        encryption=fitz.PDF_ENCRYPT_AES_256,
+        owner_pw="owner-password",
+        user_pw="pilot-password",
+    )
+    document.close()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/jobs",
+            data={"airline": "delta", "context": "labs", "profile_json": json.dumps({})},
+            files={"file": ("locked.pdf", payload, "application/pdf")},
+        )
+
+    assert response.status_code == 400
+    assert "Password-protected PDFs are not supported" in response.json()["detail"]

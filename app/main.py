@@ -36,6 +36,8 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR / "data"))
 UPLOAD_DIR = DATA_DIR / "uploads"
 DB_PATH = DATA_DIR / "pairingiq.db"
 PARSER_CACHE_VERSION = "2026-07-16.2"
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+MAX_PARSE_SECONDS = int(os.environ.get("MAX_PARSE_SECONDS", "600"))
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -175,7 +177,7 @@ INDEX_HTML = r"""
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#071525">
   <title>CrewBidIQ</title>
-  <link rel="stylesheet" href="/static/app.css?v=0421">
+  <link rel="stylesheet" href="/static/app.css?v=0422">
 </head>
 <body data-classic-page="__CLASSIC_PAGE__">
 <div class="app-shell">
@@ -426,7 +428,7 @@ INDEX_HTML = r"""
     __MOBILE_NAV__
   </div>
 </div>
-<script src="/static/app.js?v=0421"></script>
+<script src="/static/app.js?v=0422"></script>
 <script>document.getElementById('mobileGuideBtn').addEventListener('click',()=>document.getElementById('guideBtn').click());</script>
 </body></html>
 """
@@ -501,22 +503,38 @@ def airline_coterminals() -> dict[str, dict[str, list[str]]]:
     return coterminal_payload()
 
 
-def extract_text(path: Path, suffix: str, job_id: str, *, sort_pdf_text: bool = True) -> str:
+def extract_text(
+    path: Path,
+    suffix: str,
+    job_id: str,
+    *,
+    sort_pdf_text: bool = True,
+    deadline: float | None = None,
+) -> str:
     if suffix == ".pdf":
         doc = fitz.open(path)
-        parts = []
+        parts: list[str] = []
+        has_readable_text = False
         last_progress_update = time.monotonic()
-        for i, page in enumerate(doc):
-            parts.append(f"<<<CREWBIDIQ_PAGE:{i + 1}>>>\n" + page.get_text("text", sort=sort_pdf_text))
-            now = time.monotonic()
-            if now - last_progress_update >= 0.75 or i + 1 == len(doc):
-                update_job(
-                    job_id,
-                    progress=15 + int((i + 1) / max(len(doc), 1) * 45),
-                    message=f"Extracting PDF page {i + 1} of {len(doc)}",
-                )
-                last_progress_update = now
-        doc.close()
+        try:
+            for i, page in enumerate(doc):
+                if deadline is not None and time.monotonic() > deadline:
+                    raise TimeoutError("Parsing exceeded the configured time limit")
+                page_text = page.get_text("text", sort=sort_pdf_text)
+                has_readable_text = has_readable_text or bool(page_text.strip())
+                parts.append(f"<<<CREWBIDIQ_PAGE:{i + 1}>>>\n" + page_text)
+                now = time.monotonic()
+                if now - last_progress_update >= 0.75 or i + 1 == len(doc):
+                    update_job(
+                        job_id,
+                        progress=15 + int((i + 1) / max(len(doc), 1) * 45),
+                        message=f"Extracting PDF page {i + 1} of {len(doc)}",
+                    )
+                    last_progress_update = now
+        finally:
+            doc.close()
+        if not has_readable_text:
+            raise RuntimeError("The PDF contains no readable text. Upload a text-based airline bid package rather than a scanned image.")
         return "\n".join(parts)
 
     raw = path.read_text(encoding="utf-8", errors="ignore")
@@ -572,14 +590,18 @@ def consolidate_pairings(pairings: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 def parse_pairings(text: str, job_id: str, parser_choice: str = "auto") -> tuple[list[dict[str, Any]], str]:
     update_job(job_id, progress=65, message="Detecting airline format")
-    module, parser_name = select_parser(text, parser_choice)
+    try:
+        module, parser_name = select_parser(text, parser_choice)
+    except ValueError as exc:
+        raise RuntimeError("Airline detection failed. Select the airline manually and try again.") from exc
+    update_job(job_id, progress=67, message=f"Identifying trip records with the {parser_name} parser")
     pairings = consolidate_pairings(module.parse(text))
     if not pairings:
         raise RuntimeError(
             f"No pairing identifiers detected with the {parser_name} parser. "
             "Try another parser selection or provide a sample package for a custom adapter."
         )
-    update_job(job_id, progress=70, message=f"Using {parser_name} parser; found {len(pairings)} pairings")
+    update_job(job_id, progress=70, message=f"Parsing details for {len(pairings)} identified trip records")
     return pairings, parser_name
 
 def list_field(value: Any) -> list[str]:
@@ -1176,9 +1198,22 @@ def score_southwest_line(line: dict[str, Any], pairing_scores: dict[str, dict[st
 def validate_uploaded_path(path: Path, expected: str) -> None:
     if path.stat().st_size == 0:
         raise HTTPException(400, "The selected file is empty.")
-    signature = path.read_bytes()[:8]
+    with path.open("rb") as uploaded:
+        signature = uploaded.read(8)
     if expected == ".pdf" and not signature.startswith(b"%PDF-"):
         raise HTTPException(400, "The selected file is not a valid PDF.")
+    if expected == ".pdf":
+        try:
+            document = fitz.open(path)
+        except Exception as exc:
+            raise HTTPException(400, "The PDF is corrupted or unreadable. Choose a fresh copy of the airline package.") from exc
+        try:
+            if document.needs_pass:
+                raise HTTPException(400, "Password-protected PDFs are not supported. Upload an unlocked copy.")
+            if document.page_count < 1:
+                raise HTTPException(400, "The PDF does not contain any pages.")
+        finally:
+            document.close()
     if expected == ".zip":
         if not zipfile.is_zipfile(path):
             raise HTTPException(400, "The selected file is not a valid ZIP archive.")
@@ -1198,17 +1233,25 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
     work_dir = UPLOAD_DIR / f"{job_id}_work"
     cache_key: str | None = None
     cache_hit = False
+    deadline = time.monotonic() + MAX_PARSE_SECONDS
     try:
-        update_job(job_id, status="processing", progress=5, message="Opening uploaded file(s)")
+        update_job(job_id, status="processing", progress=5, message="Detecting airline and package type")
         if airline == "southwest":
             if len(paths) == 1 and paths[0].suffix.lower() == ".zip":
                 with zipfile.ZipFile(paths[0]) as archive:
                     members = [m for m in archive.infolist() if not m.is_dir() and ".." not in Path(m.filename).parts]
                     pairing_chunks, line_chunks = [], []
                     for i, member in enumerate(members, 1):
+                        if time.monotonic() > deadline:
+                            raise TimeoutError("Parsing exceeded the configured time limit")
                         name = Path(member.filename).name.lower()
                         if Path(name).suffix.lower() not in {".txt", ".csv", ".html", ".htm"}:
                             continue
+                        update_job(
+                            job_id,
+                            progress=10 + int(i / max(len(members), 1) * 45),
+                            message=f"Reading Southwest file {i} of {len(members)}",
+                        )
                         raw = archive.read(member).decode("utf-8", errors="ignore")
                         stem = Path(name).stem.upper()
                         # Southwest airline packages commonly use compact names such as
@@ -1223,8 +1266,8 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
                     pairings_text = "\n\n".join(pairing_chunks)
                     lines_text = "\n\n".join(line_chunks)
             else:
-                pairings_text = extract_text(paths[0], paths[0].suffix.lower(), job_id)
-                lines_text = extract_text(paths[1], paths[1].suffix.lower(), job_id)
+                pairings_text = extract_text(paths[0], paths[0].suffix.lower(), job_id, deadline=deadline)
+                lines_text = extract_text(paths[1], paths[1].suffix.lower(), job_id, deadline=deadline)
             pairings, parser_name = parse_pairings(pairings_text, job_id, "southwest")
             update_job(job_id, progress=72, message=f"Matching {len(pairings)} pairings to offered lines")
             scored_pairings = {p["id"]: score_pairing(p, profile) for p in pairings}
@@ -1250,13 +1293,18 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
                     paths[0].suffix.lower(),
                     job_id,
                     sort_pdf_text=airline != "american",
+                    deadline=deadline,
                 )
                 pairings, parser_name = parse_pairings(
                     text,
                     job_id,
-                    airline if airline in {"delta", "american"} else "auto",
+                    airline if airline in {"delta", "american", "generic"} else "auto",
                 )
                 store_cached_pairings(cache_key, airline, parser_name, pairings)
+            if airline == "auto" and pairings:
+                detected_airline = airline_for_pairing(pairings[0])
+                airline = detected_airline
+                update_job(job_id, airline=airline, message=f"Detected {airline.title()} bid package")
             eligible_pairings = filter_pairings_for_profile(pairings, profile)
             if profile.get("bid_fleets") and not eligible_pairings:
                 raise RuntimeError("No pairings matched the selected bid fleet. Check the fleet code and run the package again.")
@@ -1266,7 +1314,7 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
         sort_results(results)
         synopsis = build_bid_synopsis(pairings)
         source = (
-            {"kind": "southwest", "pairings": pairings, "lines": lines, "synopsis": synopsis}
+            {"kind": "southwest", "pairings": pairings, "lines": lines, "parser_name": parser_name, "synopsis": synopsis}
             if airline == "southwest"
             else {
                 "kind": "pairings",
@@ -1279,7 +1327,12 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
         update_job(job_id, status="complete", progress=100, message=f"Complete: {len(results)} {item_label} ranked", results_json=json.dumps(results), source_json=json.dumps(source), profile_json=json.dumps(profile))
     except Exception as exc:
         log.exception("Job %s failed", job_id)
-        update_job(job_id, status="failed", progress=100, error=str(exc), message="Analysis failed")
+        error = (
+            "Parsing timed out before the package was complete. Try again or upload a smaller airline package."
+            if isinstance(exc, TimeoutError)
+            else str(exc)
+        )
+        update_job(job_id, status="failed", progress=100, error=error, message="Analysis failed")
     finally:
         for path in paths:
             path.unlink(missing_ok=True)
@@ -1316,7 +1369,7 @@ async def create_job(
             uploads = [pairings_file, lines_file, *optional_uploads]
         else:
             raise HTTPException(400, "Upload one Southwest ZIP, or at least the Pairings and Lines text files.")
-    elif airline in {"delta", "american", "generic"}:
+    elif airline in {"delta", "american", "generic", "auto"}:
         if not file:
             raise HTTPException(400, "Choose a bid-package PDF.")
         if Path(file.filename or "").suffix.lower() != ".pdf":
@@ -1335,8 +1388,8 @@ async def create_job(
             with path.open("wb") as out:
                 while chunk := await upload.read(1024 * 1024):
                     total += len(chunk)
-                    if total > 100 * 1024 * 1024:
-                        raise HTTPException(413, "A file exceeds 100 MB")
+                    if total > MAX_UPLOAD_BYTES:
+                        raise HTTPException(413, "The selected file exceeds the 100 MB upload limit.")
                     out.write(chunk)
             validate_uploaded_path(path, suffix)
             paths.append(path)
@@ -1351,7 +1404,73 @@ async def create_job(
     with db() as conn:
         conn.execute("INSERT INTO jobs(id,filename,context,status,progress,message,airline,profile_json,uploads_json) VALUES(?,?,?,?,?,?,?,?,?)", (job_id, filenames, context, "queued", 1, "Upload received", airline, json.dumps(profile), json.dumps([str(path) for path in paths])))
     background_tasks.add_task(process_job, job_id, paths, profile, airline)
-    return {"job_id": job_id, "status": "queued"}
+    return {"job_id": job_id, "status": "queued", "filename": filenames, "airline": airline, "maximum_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024)}
+
+
+def infer_bid_month(filename: str) -> str | None:
+    months = {
+        "JAN": "January", "FEB": "February", "MAR": "March", "APR": "April",
+        "MAY": "May", "JUN": "June", "JUL": "July", "AUG": "August",
+        "SEP": "September", "OCT": "October", "NOV": "November", "DEC": "December",
+    }
+    upper = str(filename or "").upper()
+    token = next((abbr for abbr in months if re.search(rf"(?:^|[^A-Z]){abbr}(?:[^A-Z]|$)", upper)), None)
+    year = re.search(r"\b(20\d{2})\b", upper)
+    if not token:
+        return year.group(1) if year else None
+    return f"{months[token]}{f' {year.group(1)}' if year else ''}"
+
+
+def job_progress_payload(row: sqlite3.Row) -> dict[str, Any]:
+    status = str(row["status"] or "")
+    message = str(row["message"] or "")
+    lowered = message.lower()
+    if status == "complete":
+        stage, label = "ready", "Ready"
+    elif status == "failed":
+        stage, label = "failed", "Failed"
+    elif "extracting pdf" in lowered or "reading southwest" in lowered:
+        stage, label = "extracting_text", "Extracting text"
+    elif "identifying trip records" in lowered or "reusing the parsed" in lowered:
+        stage, label = "identifying_records", "Identifying trip records"
+    elif "parsing details" in lowered or "matching" in lowered:
+        stage, label = "parsing_details", "Parsing details"
+    elif "scoring" in lowered:
+        stage, label = "building_recommendations", "Building recommendation data"
+    else:
+        stage, label = "detecting_package", "Detecting airline and package type"
+
+    detail: dict[str, int] = {}
+    page = re.search(r"page\s+(\d+)\s+of\s+(\d+)", message, re.IGNORECASE)
+    files = re.search(r"file\s+(\d+)\s+of\s+(\d+)", message, re.IGNORECASE)
+    if page:
+        detail = {"pages_processed": int(page.group(1)), "pages_total": int(page.group(2))}
+    elif files:
+        detail = {"files_processed": int(files.group(1)), "files_total": int(files.group(2))}
+
+    created = datetime.fromisoformat(str(row["created_at"]).replace(" ", "T"))
+    end_value = row["updated_at"] if status in {"complete", "failed"} else datetime.utcnow().isoformat(timespec="seconds")
+    ended = datetime.fromisoformat(str(end_value).replace(" ", "T"))
+    return {"stage": stage, "stage_label": label, "elapsed_seconds": max(0, int((ended - created).total_seconds())), **detail}
+
+
+def job_package_metadata(row: sqlite3.Row, results: list[dict[str, Any]], source: dict[str, Any]) -> dict[str, Any]:
+    synopsis = source.get("synopsis") or {}
+    starts = synopsis.get("start_airports") or []
+    fleets = [str(item.get("fleet")) for item in (synopsis.get("fleets") or []) if item.get("fleet")]
+    is_southwest = source.get("kind") == "southwest" or row["airline"] == "southwest"
+    return {
+        "filename": row["filename"],
+        "airline": row["airline"],
+        "base": starts[0].get("airport") if starts else None,
+        "fleet_category": ", ".join(fleets) if fleets else None,
+        "fleets": fleets,
+        "bid_month": infer_bid_month(row["filename"] or ""),
+        "parsed_count": len(results),
+        "record_label": "lines" if is_southwest else get_airline_terminology(row["airline"] or "generic").plural.lower(),
+        "package_type": source.get("parser_name") or source.get("kind"),
+        "last_parsed_at": row["updated_at"] if row["status"] == "complete" else None,
+    }
 
 
 @app.get("/api/jobs/{job_id}")
@@ -1367,11 +1486,15 @@ def job_status(job_id: str):
         "progress": row["progress"],
         "message": row["message"],
         "error": row["error"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        **job_progress_payload(row),
     }
     if row["status"] == "complete":
         payload["results"] = json.loads(row["results_json"] or "[]")
         source = json.loads(row["source_json"] or "{}")
         payload["synopsis"] = source.get("synopsis") or build_bid_synopsis(source_pairings(source))
+        payload["package"] = job_package_metadata(row, payload["results"], source)
     return payload
 
 

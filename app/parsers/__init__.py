@@ -21,4 +21,6 @@ def select_parser(text: str, requested: str = "auto"):
     ]
     candidates.sort(key=lambda x: x[2], reverse=True)
     name, module, _score = candidates[0]
+    if _score < .2:
+        raise ValueError("Airline detection was uncertain")
     return module, name
