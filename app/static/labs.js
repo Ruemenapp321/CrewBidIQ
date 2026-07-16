@@ -8,6 +8,9 @@ let sessionLoading = true;
 let navbluePlan = null;
 let navbluePlanJob = null;
 let navbluePlanError = '';
+let labsUploadBusy = false;
+let labsUploadController = null;
+let labsUploadError = '';
 
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, character => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -19,7 +22,7 @@ function readJson(key, fallback = null) {
 }
 
 function airlineName(value) {
-  return ({ delta: 'Delta Air Lines', american: 'American Airlines', southwest: 'Southwest Airlines', generic: 'Other airline' })[value] || value || 'Airline unavailable';
+  return ({ auto: 'Auto-detecting', delta: 'Delta Air Lines', american: 'American Airlines', southwest: 'Southwest Airlines', generic: 'Other airline' })[value] || value || 'Airline unavailable';
 }
 
 function payGoalLabel() {
@@ -46,6 +49,12 @@ function inferredBidMonth(filename = '') {
   return token ? `${names[token]}${year ? ` ${year}` : ''}` : (year || 'Bid month unavailable');
 }
 
+function formatParsedTime(value) {
+  if (!value) return 'Not parsed yet';
+  const parsed = new Date(value.endsWith('Z') ? value : `${value}Z`);
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+}
+
 function currentJobId() {
   return localStorage.getItem(activeJobKey) || localStorage.getItem(latestJobKey);
 }
@@ -62,15 +71,68 @@ function packageCard() {
     return `<section class="surface package-status loading"><div class="status-light"></div><div><span>Shared bid package</span><strong>Checking this browser session...</strong><small>Classic and Labs use the same analysis.</small></div></section>`;
   }
   if (!sessionJob) {
-    return `<section class="surface no-package"><div><span class="kicker">SHARED SESSION</span><h2>No bid package loaded</h2><p>Analyze a package in Classic once. Labs will use the same parsed trips in this browser session.</p></div><a class="primary button" href="/#upload">Upload in Classic</a></section>`;
+    return `<section class="surface no-package"><div><span class="kicker">SHARED SESSION</span><h2>No bid package loaded</h2><p>Upload here in Labs or use a package already analyzed in Classic. Both experiences share one parsed package.</p></div><a class="primary button" href="#labsUpload">Upload Bid Package</a></section>`;
   }
   const complete = sessionJob.status === 'complete';
-  const status = complete ? 'Ready for Labs' : (sessionJob.status === 'failed' ? 'Analysis needs attention' : 'Classic analysis in progress');
+  const metadata = sessionJob.package || {};
+  const status = complete ? 'Ready for Labs' : (sessionJob.status === 'failed' ? 'Analysis needs attention' : 'Analysis in progress');
   return `<section class="surface package-status ${escapeHtml(sessionJob.status)}">
     <div class="status-light"></div>
-    <div class="package-status-main"><span>Current bid package</span><strong>${escapeHtml(sessionJob.filename || 'Uploaded package')}</strong><small>${escapeHtml(airlineName(sessionJob.airline))} · ${escapeHtml(inferredBidMonth(sessionJob.filename))}</small></div>
-    <div class="package-status-state"><span>${escapeHtml(status)}</span><strong>${escapeHtml(sessionJob.progress ?? 0)}%</strong></div>
+    <div class="package-status-main"><span>Current bid package</span><strong>${escapeHtml(metadata.filename || sessionJob.filename || 'Uploaded package')}</strong><small>${escapeHtml(airlineName(metadata.airline || sessionJob.airline))} · ${escapeHtml(metadata.bid_month || inferredBidMonth(sessionJob.filename))}</small><div class="package-meta-grid"><small><b>Base</b>${escapeHtml(metadata.base || 'Not detected')}</small><small><b>Fleet / category</b>${escapeHtml(metadata.fleet_category || 'Not detected')}</small><small><b>Parsed</b>${complete ? `${escapeHtml(metadata.parsed_count ?? sessionJob.results?.length ?? 0)} ${escapeHtml(metadata.record_label || 'records')}` : 'Processing'}</small><small><b>Last parsed</b>${escapeHtml(formatParsedTime(metadata.last_parsed_at))}</small></div></div>
+    <div class="package-status-state"><span>${escapeHtml(status)}</span><strong>${escapeHtml(sessionJob.progress ?? 0)}%</strong><div class="package-status-actions">${complete ? '<a class="text-button button" href="/labs/recommendations">Use Current Package</a>' : ''}<a class="text-button button" href="#labsUpload">Replace Bid Package</a></div></div>
   </section>`;
+}
+
+const processingStages = [
+  ['uploading', 'Uploading file'],
+  ['detecting_package', 'Detecting airline and package type'],
+  ['extracting_text', 'Extracting text'],
+  ['identifying_records', 'Identifying trip records'],
+  ['parsing_details', 'Parsing details'],
+  ['building_recommendations', 'Building recommendation data'],
+  ['ready', 'Ready']
+];
+
+function uploadProgressPanel() {
+  if (!labsUploadBusy && !sessionJob) return '';
+  const stage = labsUploadBusy ? 'uploading' : (sessionJob?.stage || (sessionJob?.status === 'complete' ? 'ready' : 'detecting_package'));
+  const activeIndex = processingStages.findIndex(([value]) => value === stage);
+  const percent = labsUploadBusy ? null : sessionJob?.progress;
+  const pageDetail = sessionJob?.pages_total ? `Page ${sessionJob.pages_processed} of ${sessionJob.pages_total}` : '';
+  const fileDetail = sessionJob?.files_total ? `File ${sessionJob.files_processed} of ${sessionJob.files_total}` : '';
+  const packageName = airlineName(sessionJob?.airline);
+  return `<div class="labs-processing ${stage === 'failed' ? 'failed' : ''}">
+    <div class="labs-processing-heading"><div><span>${stage === 'failed' ? 'Analysis failed' : `Processing ${escapeHtml(packageName)} bid package`}</span><strong>${escapeHtml(sessionJob?.stage_label || (labsUploadBusy ? 'Uploading file' : sessionJob?.message || 'Preparing package'))}</strong><small>${escapeHtml(pageDetail || fileDetail || sessionJob?.message || 'Your progress is saved if you move to another Labs page.')}</small></div><div><strong>${percent == null ? '—' : `${escapeHtml(percent)}%`}</strong><small>${escapeHtml(sessionJob?.elapsed_seconds || 0)}s elapsed</small></div></div>
+    <div class="progress"><i style="width:${Math.max(0, Math.min(Number(percent) || (labsUploadBusy ? 4 : 0), 100))}%"></i></div>
+    <ol class="labs-stage-list">${processingStages.map(([value, label], index) => `<li class="${index < activeIndex ? 'done' : (index === activeIndex ? 'active' : '')}"><span>${index + 1}</span>${escapeHtml(label)}</li>`).join('')}</ol>
+    ${stage === 'failed' ? `<div class="labs-upload-error"><strong>${escapeHtml(sessionJob?.error || 'The server could not analyze this package.')}</strong><p>Try again, select the airline manually, upload Southwest files individually, or return to Classic.</p></div>` : ''}
+  </div>`;
+}
+
+function uploadPanel() {
+  return `<section id="labsUpload" class="surface labs-upload-panel">
+    <div class="surface-title"><div><span class="labs-step">⇧</span><div><h2>${sessionJob ? 'Replace Bid Package' : 'Upload Bid Package'}</h2><p>Uses the same 100 MB streaming upload and background parser as Classic.</p></div></div><span class="beta-badge">Shared</span></div>
+    <div class="labs-upload-grid">
+      <label>Airline<select id="labsAirline"><option value="auto">Auto-detect PDF or ZIP</option><option value="delta">Delta Air Lines</option><option value="american">American Airlines</option><option value="southwest">Southwest Airlines</option><option value="generic">Other airline / generic PDF</option></select></label>
+      <div class="labs-file-control"><span>Bid package</span><label class="labs-file-target" for="labsPackageFile"><strong>Choose PDF or ZIP</strong><small id="labsPackageFilename">Files app, iCloud Drive, or this device</small></label><input id="labsPackageFile" class="native-file-input" type="file" accept=".pdf,.zip,application/pdf,application/zip"></div>
+    </div>
+    <div id="labsSouthwestFiles" class="labs-southwest-files hidden"><div><strong>Or upload individual Southwest text files</strong><small>Pairings and Lines are required. Cover and Seniority are optional.</small></div><div class="sw-files"><label>Pairings TXT<span id="labsPairingsFilename">Choose file</span><input id="labsPairingsFile" class="native-file-input" type="file" accept=".txt,text/plain"></label><label>Lines TXT<span id="labsLinesFilename">Choose file</span><input id="labsLinesFile" class="native-file-input" type="file" accept=".txt,text/plain"></label><label>Seniority TXT<span id="labsSeniorityFilename">Optional</span><input id="labsSeniorityFile" class="native-file-input" type="file" accept=".txt,text/plain"></label><label>Cover TXT<span id="labsCoverFilename">Optional</span><input id="labsCoverFile" class="native-file-input" type="file" accept=".txt,text/plain"></label></div></div>
+    <div id="labsUploadError" class="error ${labsUploadError ? '' : 'hidden'}">${escapeHtml(labsUploadError)}</div>
+    <div class="labs-upload-actions"><button id="labsAnalyzePackage" class="primary" type="button" ${labsUploadBusy ? 'disabled' : ''}>${labsUploadBusy ? 'Uploading…' : 'Analyze in Labs'}</button><button id="labsCancelUpload" class="text-button ${labsUploadBusy ? '' : 'hidden'}" type="button">Cancel upload</button><small>Maximum 100 MB. Uploaded source files are removed after parsing.</small></div>
+    ${uploadProgressPanel()}
+    <div id="labsReplacePrompt" class="labs-replace-prompt hidden"><div><span class="kicker">REPLACE CURRENT PACKAGE</span><h3>Replace the current bid package?</h3><p>Current recommendations and unfinished Labs analyses will be recalculated. Records from the two packages will never be mixed.</p><div><button id="labsConfirmReplace" class="primary" type="button">Replace</button><button id="labsCancelReplace" class="text-button" type="button">Cancel</button></div></div></div>
+  </section>`;
+}
+
+function postParseActions() {
+  if (sessionJob?.status !== 'complete') return '';
+  const southwest = sessionJob.airline === 'southwest';
+  const actions = southwest ? [
+    ['/labs/recommendations', 'Rank My Lines'], ['/labs/build', 'Set Line Preferences'], ['/labs/southwest#schedule', 'Add Current Schedule'], ['/labs/southwest#conflicts', 'Optimize Conflicts']
+  ] : [
+    ['/labs/build', 'Describe the Trip You Want'], ['/labs/recommendations', 'Refine Recommendations'], ['/labs/plan', 'Build My Month'], ['/labs/plan', 'What to Enter in NAVBLUE/PBS']
+  ];
+  return `<section class="labs-post-parse"><div><span class="kicker">PACKAGE READY</span><h2>Continue with your bid</h2></div><div>${actions.map(([href, label], index) => `<a class="${index === 0 ? 'primary' : 'secondary'} button" href="${href}">${escapeHtml(label)}</a>`).join('')}</div></section>`;
 }
 
 function landingPage() {
@@ -78,6 +140,8 @@ function landingPage() {
   return `${pageHeader('CREWBIDIQ LABS', 'Experimental bidding tools', 'Explore a guided path from your parsed bid package to a clear, pilot-ready bid plan.')}
     <section class="labs-beta-notice"><span>Beta</span><p>Labs features are experimental. Review any proposed bid plan before using it with your airline bidding system.</p></section>
     ${packageCard()}
+    ${uploadPanel()}
+    ${postParseActions()}
     <section class="labs-action-grid">
       <a href="/labs/build" class="labs-action-card primary-action"><span>01</span><h2>Build My Bid</h2><p>Turn days off, trip shape, layovers, and workload into a guided bid strategy.</p><strong>Start guided builder</strong></a>
       <a href="/labs/recommendations" class="labs-action-card"><span>02</span><h2>Refine Trip Recommendations</h2><p>Review the strongest options from the Classic analysis with less noise.</p><strong>Open recommendations</strong></a>
@@ -92,6 +156,7 @@ function builderPage() {
   const value = (key, profileKey = key) => draft[key] ?? (Array.isArray(classic[profileKey]) ? classic[profileKey].join(', ') : classic[profileKey]) ?? '';
   return `${pageHeader('GUIDED BID BUILDER', 'Build around the life you want', 'Set the few priorities that should shape your bid. Labs saves this draft on this device.')}
     ${packageCard()}
+    ${uploadPanel()}
     <section class="surface labs-builder">
       <div class="surface-title"><div><span class="labs-step">1</span><div><h2>Define your month</h2><p>Start with what matters most. You can refine the details later.</p></div></div><span id="draftStatus" class="draft-status">Draft on this device</span></div>
       <div class="labs-form-grid">
@@ -111,7 +176,7 @@ function builderPage() {
 }
 
 function emptyFeature(message) {
-  return `<section class="surface labs-feature-empty"><h2>${escapeHtml(message)}</h2><p>Labs needs the completed Classic analysis so it can work from the same parsed bid package.</p><a class="primary button" href="/#upload">Upload in Classic</a></section>`;
+  return `<section class="surface labs-feature-empty"><h2>${escapeHtml(message)}</h2><p>Labs needs a completed analysis before this tool can use the shared parsed package.</p><a class="primary button" href="/labs#labsUpload">Upload Bid Package</a></section>`;
 }
 
 function matchLabel(item) {
@@ -136,6 +201,8 @@ function recommendationsPage() {
   const results = sessionJob?.results || [];
   return `${pageHeader('REFINED RECOMMENDATIONS', 'See the trips worth your attention', 'A quieter review of the strongest recommendations from your current Classic preferences.')}
     ${packageCard()}
+    ${uploadPanel()}
+    ${postParseActions()}
     ${!ready ? emptyFeature('Complete a Classic analysis first') : `<section class="surface labs-recommendations-panel"><div class="surface-title"><div><div><h2>Priority review</h2><p>${escapeHtml(results.length)} analyzed trips · showing the first ${Math.min(results.length, 8)}</p></div></div><a class="text-button button" href="/results">Open full Classic results</a></div><div class="labs-recommendation-list">${recommendationCards(results)}</div></section>`}
     <div class="labs-page-actions"><a class="secondary button" href="/labs/build">Adjust bid priorities</a><a class="primary button" href="/labs/plan">Build proposed plan</a></div>`;
 }
@@ -197,12 +264,134 @@ function planPage() {
     <div class="labs-page-actions"><a class="secondary button" href="/labs/recommendations">Review supporting pairings</a><a class="text-button button" href="/">Return to Classic</a></div>`;
 }
 
+function southwestPage() {
+  const ready = sessionJob?.status === 'complete' && sessionJob.airline === 'southwest';
+  return `${pageHeader('SOUTHWEST LABS', 'Build a line strategy around your life', 'Upload a Southwest package here, rank lines with TFP-aware preferences, and prepare conflict analysis.')}
+    ${packageCard()}
+    ${uploadPanel()}
+    ${postParseActions()}
+    ${ready ? `<section class="labs-action-grid"><a id="schedule" href="/labs/build" class="labs-action-card primary-action"><span>01</span><h2>Set Line Preferences</h2><p>Define TFP, days off, workload, and overnight priorities.</p><strong>Open preferences</strong></a><a id="conflicts" href="/labs/recommendations" class="labs-action-card"><span>02</span><h2>Optimize Conflicts</h2><p>Review line recommendations against your current schedule and protected dates.</p><strong>Review lines</strong></a></section>` : `<section class="surface labs-feature-empty"><h2>Upload a Southwest package to begin</h2><p>Use one airline ZIP or the individual Pairings and Lines TXT files above.</p></section>`}`;
+}
+
 function render() {
-  const pages = { landing: landingPage, build: builderPage, recommendations: recommendationsPage, preview: previewPage, plan: planPage };
+  const pages = { landing: landingPage, build: builderPage, recommendations: recommendationsPage, preview: previewPage, plan: planPage, southwest: southwestPage };
   labsContent.innerHTML = (pages[labsPage] || landingPage)();
   const route = labsPage === 'landing' ? '/labs' : `/labs/${labsPage}`;
   document.querySelectorAll('[data-labs-route]').forEach(link => link.classList.toggle('active', link.dataset.labsRoute === route));
   bindBuilder();
+  bindUploader();
+}
+
+function showLabsUploadError(message) {
+  labsUploadError = message || '';
+  const box = document.getElementById('labsUploadError');
+  if (!box) return;
+  box.textContent = labsUploadError;
+  box.classList.toggle('hidden', !labsUploadError);
+}
+
+function syncLabsFilename(inputId, labelId) {
+  const input = document.getElementById(inputId), label = document.getElementById(labelId);
+  if (!input || !label) return;
+  const file = input.files?.[0];
+  if (file?.name) label.textContent = file.name;
+}
+
+function setLabsUploadBusyState(busy) {
+  labsUploadBusy = busy;
+  const button = document.getElementById('labsAnalyzePackage'), cancel = document.getElementById('labsCancelUpload');
+  if (button) { button.disabled = busy; button.textContent = busy ? 'Uploading…' : 'Analyze in Labs'; }
+  if (cancel) cancel.classList.toggle('hidden', !busy);
+}
+
+function selectedLabsFiles() {
+  return {
+    packageFile: document.getElementById('labsPackageFile')?.files?.[0] || null,
+    pairingsFile: document.getElementById('labsPairingsFile')?.files?.[0] || null,
+    linesFile: document.getElementById('labsLinesFile')?.files?.[0] || null,
+    seniorityFile: document.getElementById('labsSeniorityFile')?.files?.[0] || null,
+    coverFile: document.getElementById('labsCoverFile')?.files?.[0] || null
+  };
+}
+
+async function submitLabsPackage(replaceConfirmed = false) {
+  if (labsUploadBusy) return;
+  const selector = document.getElementById('labsAirline');
+  const files = selectedLabsFiles();
+  const individualFiles = [files.pairingsFile, files.linesFile, files.seniorityFile, files.coverFile].filter(Boolean);
+  let airline = selector?.value || 'auto';
+  const extension = files.packageFile?.name?.toLowerCase().match(/\.[^.]+$/)?.[0] || '';
+  if (airline === 'auto' && extension === '.zip') airline = 'southwest';
+
+  showLabsUploadError('');
+  if (files.packageFile && individualFiles.length) return showLabsUploadError('Choose either one package file or individual Southwest TXT files, not both.');
+  if (airline === 'southwest') {
+    if (files.packageFile && extension !== '.zip') return showLabsUploadError('Southwest combined uploads must be a ZIP containing Pairings and Lines.');
+    if (!files.packageFile && !(files.pairingsFile && files.linesFile)) return showLabsUploadError('Choose a Southwest ZIP, or both the Pairings and Lines TXT files.');
+  } else {
+    if (!files.packageFile) return showLabsUploadError('Choose a bid-package PDF.');
+    if (extension !== '.pdf') return showLabsUploadError('This airline selection requires a PDF bid package.');
+  }
+  const oversized = [files.packageFile, ...individualFiles].find(file => file && file.size > 100 * 1024 * 1024);
+  if (oversized) return showLabsUploadError(`${oversized.name} exceeds the 100 MB upload limit.`);
+
+  if (sessionJob && !replaceConfirmed) {
+    document.getElementById('labsReplacePrompt')?.classList.remove('hidden');
+    return;
+  }
+
+  setLabsUploadBusyState(true);
+  const data = new FormData();
+  data.append('airline', airline);
+  data.append('context', 'labs');
+  data.append('profile_json', JSON.stringify(mergedLabsProfile()));
+  if (files.packageFile) data.append('file', files.packageFile);
+  else {
+    data.append('pairings_file', files.pairingsFile);
+    data.append('lines_file', files.linesFile);
+    if (files.seniorityFile) data.append('seniority_file', files.seniorityFile);
+    if (files.coverFile) data.append('cover_file', files.coverFile);
+  }
+  labsUploadController = new AbortController();
+  try {
+    const response = await fetch('/api/jobs', { method: 'POST', body: data, signal: labsUploadController.signal, headers: { Accept: 'application/json' } });
+    const responseText = await response.text();
+    let body = {}; try { body = responseText ? JSON.parse(responseText) : {}; } catch (_) {}
+    if (!response.ok) throw new Error(body.detail || `Upload failed (${response.status})`);
+    if (!body.job_id) throw new Error('Upload finished, but the parsing job was not created.');
+    localStorage.setItem(activeJobKey, body.job_id);
+    localStorage.removeItem(latestJobKey);
+    sessionJob = { ...body, status: 'queued', progress: 1, stage: 'detecting_package', stage_label: 'Detecting airline and package type', message: 'Upload received' };
+    sessionLoading = false;
+    navbluePlan = null; navbluePlanJob = null; navbluePlanError = '';
+    labsUploadBusy = false; labsUploadController = null; labsUploadError = '';
+    render();
+    loadSharedSession();
+  } catch (error) {
+    const cancelled = error.name === 'AbortError';
+    setLabsUploadBusyState(false);
+    labsUploadController = null;
+    showLabsUploadError(cancelled ? 'Upload canceled. The current package was not replaced.' : (error.message || 'Server error while uploading the package. Try again.'));
+  }
+}
+
+function bindUploader() {
+  const analyze = document.getElementById('labsAnalyzePackage');
+  if (!analyze) return;
+  const airline = document.getElementById('labsAirline');
+  const southwestFiles = document.getElementById('labsSouthwestFiles');
+  const toggleSouthwest = () => southwestFiles?.classList.toggle('hidden', airline.value !== 'southwest');
+  airline.addEventListener('change', toggleSouthwest);
+  toggleSouthwest();
+  const bindings = [
+    ['labsPackageFile', 'labsPackageFilename'], ['labsPairingsFile', 'labsPairingsFilename'],
+    ['labsLinesFile', 'labsLinesFilename'], ['labsSeniorityFile', 'labsSeniorityFilename'], ['labsCoverFile', 'labsCoverFilename']
+  ];
+  bindings.forEach(([inputId, labelId]) => document.getElementById(inputId)?.addEventListener('change', () => { syncLabsFilename(inputId, labelId); showLabsUploadError(''); }));
+  analyze.addEventListener('click', () => submitLabsPackage(false));
+  document.getElementById('labsConfirmReplace')?.addEventListener('click', () => { document.getElementById('labsReplacePrompt')?.classList.add('hidden'); submitLabsPackage(true); });
+  document.getElementById('labsCancelReplace')?.addEventListener('click', () => document.getElementById('labsReplacePrompt')?.classList.add('hidden'));
+  document.getElementById('labsCancelUpload')?.addEventListener('click', () => labsUploadController?.abort());
 }
 
 function bindBuilder() {

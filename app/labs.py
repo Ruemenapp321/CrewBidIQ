@@ -19,7 +19,7 @@ LABS_HTML = r"""
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#071525">
   <title>CrewBidIQ Labs</title>
-  <link rel="stylesheet" href="/static/app.css?v=0421">
+  <link rel="stylesheet" href="/static/app.css?v=0422">
 </head>
 <body class="labs-body" data-labs-page="__LABS_PAGE__">
 <div class="app-shell">
@@ -30,6 +30,7 @@ LABS_HTML = r"""
       <a href="/labs/build" class="nav-link" data-labs-route="/labs/build"><span>Build My Bid</span></a>
       <a href="/labs/recommendations" class="nav-link" data-labs-route="/labs/recommendations"><span>Recommendations</span></a>
       <a href="/labs/preview" class="nav-link" data-labs-route="/labs/preview"><span>Bid Pool Preview</span></a>
+      <a href="/labs/southwest" class="nav-link" data-labs-route="/labs/southwest"><span>Southwest Tools</span></a>
       <a href="/labs/plan" class="nav-link" data-labs-route="/labs/plan"><span>Bid Plan</span></a>
     </nav>
     <a class="labs-return" href="/">Return to Classic</a>
@@ -60,7 +61,7 @@ LABS_HTML = r"""
   </div>
 </div>
 <script>window.CREWBIDIQ_LABS_PAGE = "__LABS_PAGE__";</script>
-<script src="/static/labs.js?v=0421"></script>
+<script src="/static/labs.js?v=0422"></script>
 </body>
 </html>
 """
@@ -95,3 +96,8 @@ def labs_preview() -> HTMLResponse:
 @router.get("/labs/plan", response_class=HTMLResponse)
 def labs_plan() -> HTMLResponse:
     return labs_page("plan")
+
+
+@router.get("/labs/southwest", response_class=HTMLResponse)
+def labs_southwest() -> HTMLResponse:
+    return labs_page("southwest")
