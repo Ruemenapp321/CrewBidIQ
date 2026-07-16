@@ -11,6 +11,8 @@ import uuid
 import zipfile
 import shutil
 import os
+import gzip
+import hashlib
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +20,7 @@ from typing import Any
 
 import fitz
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from app.airlines import airline_terminology_payload, get_airline_terminology
@@ -29,6 +32,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR / "data"))
 UPLOAD_DIR = DATA_DIR / "uploads"
 DB_PATH = DATA_DIR / "pairingiq.db"
+PARSER_CACHE_VERSION = "2026-07-16.1"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -37,6 +41,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("pairingiq")
 
 app = FastAPI(title="CrewBidIQ")
+app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "app" / "static"), name="static")
 job_lock = threading.Lock()
 
@@ -66,6 +71,15 @@ def init_db() -> None:
                 source_json TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS parse_cache (
+                cache_key TEXT PRIMARY KEY,
+                airline TEXT NOT NULL,
+                parser_name TEXT NOT NULL,
+                pairings_gzip BLOB NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                hit_count INTEGER NOT NULL DEFAULT 0
             );
             """
         )
@@ -99,6 +113,54 @@ def update_job(job_id: str, **fields: Any) -> None:
 def get_job(job_id: str):
     with db() as conn:
         return conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+
+
+def parser_cache_key(path: Path, airline: str) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return f"{PARSER_CACHE_VERSION}:{airline.lower()}:{digest.hexdigest()}"
+
+
+def load_cached_pairings(cache_key: str) -> tuple[list[dict[str, Any]], str] | None:
+    with job_lock, db() as conn:
+        row = conn.execute("SELECT parser_name,pairings_gzip FROM parse_cache WHERE cache_key=?", (cache_key,)).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE parse_cache SET last_used_at=CURRENT_TIMESTAMP,hit_count=hit_count+1 WHERE cache_key=?",
+                (cache_key,),
+            )
+    if not row:
+        return None
+    try:
+        pairings = json.loads(gzip.decompress(row["pairings_gzip"]).decode("utf-8"))
+        return pairings, row["parser_name"]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        log.warning("Removing unreadable parser cache entry %s", cache_key)
+        with job_lock, db() as conn:
+            conn.execute("DELETE FROM parse_cache WHERE cache_key=?", (cache_key,))
+        return None
+
+
+def store_cached_pairings(cache_key: str, airline: str, parser_name: str, pairings: list[dict[str, Any]]) -> None:
+    raw = json.dumps(pairings, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    compressed = gzip.compress(raw, compresslevel=5)
+    with job_lock, db() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO parse_cache
+               (cache_key,airline,parser_name,pairings_gzip,created_at,last_used_at,hit_count)
+               VALUES(?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,0)""",
+            (cache_key, airline, parser_name, compressed),
+        )
+
+
+def source_pairings(source: dict[str, Any]) -> list[dict[str, Any]]:
+    if source.get("pairings") is not None:
+        return source.get("pairings") or []
+    cache_key = source.get("cache_key")
+    cached = load_cached_pairings(cache_key) if cache_key else None
+    return cached[0] if cached else []
 
 
 INDEX_HTML = r"""
@@ -380,17 +442,21 @@ def airline_coterminals() -> dict[str, dict[str, list[str]]]:
     return coterminal_payload()
 
 
-def extract_text(path: Path, suffix: str, job_id: str) -> str:
+def extract_text(path: Path, suffix: str, job_id: str, *, sort_pdf_text: bool = True) -> str:
     if suffix == ".pdf":
         doc = fitz.open(path)
         parts = []
+        last_progress_update = time.monotonic()
         for i, page in enumerate(doc):
-            parts.append(f"<<<CREWBIDIQ_PAGE:{i + 1}>>>\n" + page.get_text("text", sort=True))
-            update_job(
-                job_id,
-                progress=15 + int((i + 1) / max(len(doc), 1) * 45),
-                message=f"Extracting PDF page {i + 1} of {len(doc)}",
-            )
+            parts.append(f"<<<CREWBIDIQ_PAGE:{i + 1}>>>\n" + page.get_text("text", sort=sort_pdf_text))
+            now = time.monotonic()
+            if now - last_progress_update >= 0.75 or i + 1 == len(doc):
+                update_job(
+                    job_id,
+                    progress=15 + int((i + 1) / max(len(doc), 1) * 45),
+                    message=f"Extracting PDF page {i + 1} of {len(doc)}",
+                )
+                last_progress_update = now
         doc.close()
         return "\n".join(parts)
 
@@ -974,6 +1040,8 @@ def validate_uploaded_path(path: Path, expected: str) -> None:
 
 def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline: str) -> None:
     work_dir = UPLOAD_DIR / f"{job_id}_work"
+    cache_key: str | None = None
+    cache_hit = False
     try:
         update_job(job_id, status="processing", progress=5, message="Opening uploaded file(s)")
         if airline == "southwest":
@@ -1010,8 +1078,29 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
             results = [score_southwest_line(line, scored_pairings) for line in lines]
             item_label = "lines"
         else:
-            text = extract_text(paths[0], paths[0].suffix.lower(), job_id)
-            pairings, parser_name = parse_pairings(text, job_id, airline if airline in {"delta", "american"} else "auto")
+            cache_key = parser_cache_key(paths[0], airline)
+            cached = load_cached_pairings(cache_key)
+            if cached:
+                pairings, parser_name = cached
+                cache_hit = True
+                update_job(
+                    job_id,
+                    progress=70,
+                    message=f"Reusing the parsed {parser_name} bid package ({len(pairings)} pairings)",
+                )
+            else:
+                text = extract_text(
+                    paths[0],
+                    paths[0].suffix.lower(),
+                    job_id,
+                    sort_pdf_text=airline != "american",
+                )
+                pairings, parser_name = parse_pairings(
+                    text,
+                    job_id,
+                    airline if airline in {"delta", "american"} else "auto",
+                )
+                store_cached_pairings(cache_key, airline, parser_name, pairings)
             eligible_pairings = filter_pairings_for_profile(pairings, profile)
             if profile.get("bid_fleets") and not eligible_pairings:
                 raise RuntimeError("No pairings matched the selected bid fleet. Check the fleet code and run the package again.")
@@ -1020,7 +1109,17 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
             item_label = "pairings"
         sort_results(results)
         synopsis = build_bid_synopsis(pairings)
-        source = {"kind": "southwest", "pairings": pairings, "lines": lines, "synopsis": synopsis} if airline == "southwest" else {"kind": "pairings", "pairings": pairings, "synopsis": synopsis}
+        source = (
+            {"kind": "southwest", "pairings": pairings, "lines": lines, "synopsis": synopsis}
+            if airline == "southwest"
+            else {
+                "kind": "pairings",
+                "cache_key": cache_key,
+                "parser_name": parser_name,
+                "cache_hit": cache_hit,
+                "synopsis": synopsis,
+            }
+        )
         update_job(job_id, status="complete", progress=100, message=f"Complete: {len(results)} {item_label} ranked", results_json=json.dumps(results), source_json=json.dumps(source), profile_json=json.dumps(profile))
     except Exception as exc:
         log.exception("Job %s failed", job_id)
@@ -1115,7 +1214,7 @@ def job_status(job_id: str):
     if row["status"] == "complete":
         payload["results"] = json.loads(row["results_json"] or "[]")
         source = json.loads(row["source_json"] or "{}")
-        payload["synopsis"] = source.get("synopsis") or build_bid_synopsis(source.get("pairings") or [])
+        payload["synopsis"] = source.get("synopsis") or build_bid_synopsis(source_pairings(source))
     return payload
 
 
@@ -1131,7 +1230,9 @@ def rescore_job(job_id: str, profile_json: str = Form(...)):
     source = json.loads(row["source_json"] or "null")
     if not source:
         raise HTTPException(409, "This analysis was created before preference reruns were available. Upload the bid package one more time.")
-    pairings = source.get("pairings") or []
+    pairings = source_pairings(source)
+    if source.get("cache_key") and not pairings:
+        raise HTTPException(409, "The parsed bid-package cache is unavailable. Upload this bid package one more time.")
     if source.get("kind") == "southwest":
         scored_pairings = {pairing["id"]: score_pairing(pairing, profile) for pairing in pairings}
         results = [score_southwest_line(line, scored_pairings) for line in source.get("lines") or []]
@@ -1163,7 +1264,9 @@ def result_diagnostic(
         raise HTTPException(400, "Diagnostic note is too long")
 
     source = json.loads(row["source_json"] or "{}")
-    pairings = source.get("pairings") or []
+    pairings = source_pairings(source)
+    if source.get("cache_key") and not pairings:
+        raise HTTPException(409, "The parsed bid-package cache is unavailable. Upload this bid package one more time.")
     selected_id = pairing_id.strip().upper()
     selected_index = next((index for index, pairing in enumerate(pairings) if str(pairing.get("id") or "").upper() == selected_id), None)
     target = pairings[selected_index] if selected_index is not None else None
