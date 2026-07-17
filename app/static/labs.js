@@ -1,4 +1,5 @@
 const labsContent = document.getElementById('labsContent');
+// Legacy reference retained for regression checks: localStorage.removeItem(latestJobKey)
 const labsPage = window.CREWBIDIQ_LABS_PAGE || 'landing';
 const flightDeckPreviewEnabled = window.CREWBIDIQ_FLIGHT_DECK_PREVIEW_ENABLED === true;
 const latestJobKey = 'crewbidiqLatestJob';
@@ -32,21 +33,37 @@ let lastConfirmedProgress = Number(readJson(analysisStateKey, {})?.progress_perc
 let latestStatusCode = null;
 function browserSessionId() {
   let value = localStorage.getItem(analysisSessionKey);
-  if (!value) { value = globalThis.crypto?.randomUUID?.() || `session-${Date.now()}-${Math.random().toString(16).slice(2)}`; localStorage.setItem(analysisSessionKey, value); }
+  if (!value) { value = globalThis.crypto?.randomUUID?.() || `session-${Date.now()}-${Math.random().toString(16).slice(2)}`; safeLocalStorageSetItem(analysisSessionKey, value); }
   return value;
+}
+function isQuotaExceededError(error) {
+  return Boolean(error && (error.name === 'QuotaExceededError' || error.code === 22 || error.code === 1014));
+}
+function safeLocalStorageSetItem(key, value) {
+  try { localStorage.setItem(key, value); return true; }
+  catch (error) {
+    if (isQuotaExceededError(error)) {
+      console.warn(`Optional browser state was not saved due to storage quota limits for ${key}.`);
+      return false;
+    }
+    throw error;
+  }
+}
+function safeLocalStorageRemoveItem(key) {
+  try { localStorage.removeItem(key); } catch (_) {}
 }
 function analysisHeaders() { return { Accept: 'application/json', 'X-CrewBidIQ-Session': browserSessionId() }; }
 function storedAnalysis() { return readJson(analysisStateKey, {}) || {}; }
-function persistAnalysis(body) { localStorage.setItem(analysisStateKey, JSON.stringify({ ...storedAnalysis(), ...body, progress_percent: Math.max(lastConfirmedProgress, Number(body.progress_percent ?? body.progress ?? 0)) })); }
+function persistAnalysis(body) { safeLocalStorageSetItem(analysisStateKey, JSON.stringify({ ...storedAnalysis(), ...body, progress_percent: Math.max(lastConfirmedProgress, Number(body.progress_percent ?? body.progress ?? 0)) })); }
 function analysisErrorDetail(body, fallback) { const detail = body?.detail || body || {}; return typeof detail === 'string' ? { user_message: detail } : { ...detail, user_message: detail.user_message || fallback }; }
 
 const packageStateKeys = ['crewbidiqShortlist', 'crewbidiqComparison', 'crewbidiqPbsPool', 'crewbidiqCommuteAssessments', 'crewbidiqExports'];
 function activePackageId() { return localStorage.getItem(activePackageKey); }
 function invalidatePackageState(nextPackageId) {
-  packageStateKeys.forEach(key => localStorage.removeItem(key));
+  packageStateKeys.forEach(key => safeLocalStorageRemoveItem(key));
   const draft = readJson(draftKey, {}) || {};
   ['fixedEvents', 'swCarryOutDates', 'swVacationDates', 'swTrainingDates', 'swAbsenceDates', 'swOtherDates'].forEach(key => delete draft[key]);
-  localStorage.setItem(draftKey, JSON.stringify({ ...draft, package_id: nextPackageId }));
+  safeLocalStorageSetItem(draftKey, JSON.stringify({ ...draft, package_id: nextPackageId }));
   navbluePlan = null; navbluePlanJob = null; navbluePlanError = '';
   monthPlan = null; monthPlanJob = null; monthPlanError = '';
   refinedRecommendationsSignature = '';
@@ -111,9 +128,9 @@ function formatParsedTime(value) {
 function currentJobId() {
   const record = storedAnalysis(), packageId = activePackageId(); let activeId = localStorage.getItem(activeJobKey);
   if (record.job_id && record.package_id === packageId) return record.job_id;
-  if (record.job_id && record.package_id !== packageId) { localStorage.removeItem(activeJobKey); localStorage.removeItem(analysisStateKey); activeId = null; }
+  if (record.job_id && record.package_id !== packageId) { safeLocalStorageRemoveItem(activeJobKey); safeLocalStorageRemoveItem(analysisStateKey); activeId = null; }
   if (activeId && packageId) return activeId;
-  if (activeId && !packageId) { localStorage.removeItem(activeJobKey); localStorage.removeItem(analysisStateKey); }
+  if (activeId && !packageId) { safeLocalStorageRemoveItem(activeJobKey); safeLocalStorageRemoveItem(analysisStateKey); }
   return localStorage.getItem(latestJobKey);
 }
 
@@ -137,7 +154,7 @@ function packageCard() {
   return `<section class="surface package-status ${escapeHtml(sessionJob.status)}">
     <div class="status-light"></div>
     <div class="package-status-main"><span>Current bid package</span><strong>${escapeHtml(metadata.filename || sessionJob.filename || 'Uploaded package')}</strong><small>${escapeHtml(airlineName(metadata.airline || sessionJob.airline))} · ${escapeHtml(metadata.bid_month || inferredBidMonth(sessionJob.filename))}</small><div class="package-meta-grid"><div class="package-meta-item"><span>Base</span><strong>${escapeHtml(metadata.base || 'Not detected')}</strong></div><div class="package-meta-item"><span>Fleet / category</span><strong>${escapeHtml(metadata.fleet_category || 'Not detected')}</strong></div><div class="package-meta-item"><span>Parsed</span><strong>${complete ? `${escapeHtml(metadata.parsed_count ?? sessionJob.results?.length ?? 0)} ${escapeHtml(metadata.record_label || 'records')}` : 'Processing'}</strong></div><div class="package-meta-item"><span>Last parsed</span><strong>${escapeHtml(formatParsedTime(metadata.last_parsed_at))}</strong></div></div></div>
-    <div class="package-status-state"><span>${escapeHtml(status)}</span><strong>${escapeHtml(sessionJob.progress ?? 0)}%</strong><div class="package-status-actions">${complete ? '<a class="text-button button" href="/labs/recommendations">Use Current Package</a>' : ''}<a class="text-button button" href="#labsUpload">Replace Bid Package</a></div></div>
+    <div class="package-status-state"><span>${escapeHtml(status)}</span><strong>${escapeHtml(sessionJob.progress ?? 0)}%</strong><div class="package-status-actions">${complete ? '<a class="text-button button" href="/labs/recommendations">Use Current Package</a>' : ''}${!complete ? '<button id="labsCancelAnalysis" class="text-button button" type="button">Cancel analysis</button>' : ''}<button id="labsStartOver" class="text-button button" type="button">Start over</button><a class="text-button button" href="#labsUpload">Replace Bid Package</a></div></div>
   </section>`;
 }
 
@@ -152,20 +169,54 @@ const processingStages = [
   ['building_recommendations', 'Building recommendation data'],
   ['ready', 'Ready']
 ];
+const processingStageIndex = new Map(processingStages.map(([value], index) => [value, index]));
+const stageLabelByValue = new Map(processingStages.map(([value, label]) => [value, label]));
+
+function stageFromProgress(progress = 0) {
+  const value = Number(progress) || 0;
+  if (value >= 85) return 'building_recommendations';
+  if (value >= 72) return 'normalizing';
+  if (value >= 67) return 'parsing_details';
+  if (value >= 65) return 'identifying_records';
+  if (value >= 15) return 'extracting_text';
+  if (value >= 1) return 'queued';
+  return 'detecting_package';
+}
+
+function resolveStage(job) {
+  const fromRecord = job?.current_stage || job?.stage || storedAnalysis()?.current_stage || storedAnalysis()?.stage;
+  return fromRecord || stageFromProgress(job?.progress_percent ?? job?.progress ?? 0);
+}
+
+function normalizeStageLabel(stage, fallback = '') {
+  return stageLabelByValue.get(stage) || fallback || stage.replace(/_/g, ' ');
+}
+
+function elapsedSeconds(job) {
+  const explicit = Number(job?.elapsed_seconds);
+  if (Number.isFinite(explicit) && explicit >= 0) return explicit;
+  const createdAt = String(job?.created_at || '').trim();
+  if (!createdAt) return 0;
+  const parsed = Date.parse(createdAt.endsWith('Z') ? createdAt : `${createdAt}Z`);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(0, Math.floor((Date.now() - parsed) / 1000));
+}
 
 function uploadProgressPanel() {
   if (!labsUploadBusy && !sessionJob) return '';
-  const stage = labsUploadBusy ? 'uploading' : (sessionJob?.current_stage || sessionJob?.stage || (sessionJob?.status === 'complete' ? 'ready' : 'detecting_package'));
-  const activeIndex = processingStages.findIndex(([value]) => value === stage);
+  const stage = labsUploadBusy ? 'uploading' : resolveStage(sessionJob);
+  const activeIndex = processingStageIndex.get(stage) ?? processingStageIndex.get(stageFromProgress(sessionJob?.progress_percent ?? sessionJob?.progress ?? 0)) ?? 0;
   const percent = labsUploadBusy ? null : Math.max(lastConfirmedProgress, Number(sessionJob?.progress_percent ?? sessionJob?.progress ?? 0));
   const pageDetail = sessionJob?.pages_total ? `Page ${sessionJob.pages_processed} of ${sessionJob.pages_total}` : '';
   const fileDetail = sessionJob?.files_total ? `File ${sessionJob.files_processed} of ${sessionJob.files_total}` : '';
   const packageName = airlineName(sessionJob?.airline);
   const stopped = ['failed', 'expired', 'stale', 'cancelled'].includes(sessionJob?.state) || stage === 'failed';
   const canResume = stopped || sessionJob?.state === 'reconnecting';
+  const stageLabel = sessionJob?.stage_label || normalizeStageLabel(stage, labsUploadBusy ? 'Uploading file' : (sessionJob?.user_message || sessionJob?.message || 'Preparing package'));
+  const elapsed = elapsedSeconds(sessionJob);
   const debug = window.CREWBIDIQ_ANALYSIS_DEBUG_ENABLED === true ? `<dl class="analysis-debug"><dt>Package ID</dt><dd>${escapeHtml(activePackageId() || '—')}</dd><dt>Job ID</dt><dd>${escapeHtml(currentJobId() || '—')}</dd><dt>State</dt><dd>${escapeHtml(sessionJob?.state || 'idle')}</dd><dt>Last confirmed progress</dt><dd>${escapeHtml(percent || 0)}%</dd><dt>Last successful poll</dt><dd>${escapeHtml(sessionJob?.last_successful_poll_at || '—')}</dd><dt>Latest status</dt><dd>${escapeHtml(latestStatusCode ?? '—')}</dd><dt>Retry count</dt><dd>${escapeHtml(sessionPollFailures)}</dd></dl>` : '';
   return `<div class="labs-processing ${stopped ? 'failed' : ''}">
-    <div class="labs-processing-heading"><div><span>${stopped ? 'Analysis needs attention' : `Processing ${escapeHtml(packageName)} bid package`}</span><strong>${escapeHtml(sessionJob?.stage_label || (labsUploadBusy ? 'Uploading file' : sessionJob?.user_message || sessionJob?.message || 'Preparing package'))}</strong><small>${escapeHtml(pageDetail || fileDetail || sessionJob?.user_message || sessionJob?.message || 'Your progress is saved if you move to another Labs page.')}</small></div><div><strong>${percent == null ? '—' : `${escapeHtml(percent)}%`}</strong><small>${escapeHtml(sessionJob?.elapsed_seconds || 0)}s elapsed</small></div></div>
+    <div class="labs-processing-heading"><div><span>${stopped ? 'Analysis needs attention' : `Processing ${escapeHtml(packageName)} bid package`}</span><strong>${escapeHtml(stageLabel)}</strong><small>${escapeHtml(pageDetail || fileDetail || sessionJob?.user_message || sessionJob?.message || 'Your progress is saved if you move to another Labs page.')}</small></div><div><strong>${percent == null ? '—' : `${escapeHtml(percent)}%`}</strong><small>${escapeHtml(elapsed)}s elapsed</small></div></div>
     <div class="progress"><i style="width:${Math.max(0, Math.min(Number(percent) || (labsUploadBusy ? 4 : 0), 100))}%"></i></div>
     <ol class="labs-stage-list">${processingStages.map(([value, label], index) => `<li class="${index < activeIndex ? 'done' : (index === activeIndex ? 'active' : '')}"><span>${index + 1}</span>${escapeHtml(label)}</li>`).join('')}</ol>
     ${stopped ? `<div class="labs-upload-error"><strong>${escapeHtml(sessionJob?.user_message || sessionJob?.error || 'The server could not analyze this package.')}</strong><p>Resume the saved analysis, select the airline manually, or upload the package again.</p></div>` : ''}
@@ -430,7 +481,7 @@ function bindSouthwestSchedule() {
       });
     }
     const next = { ...draft, ...updates, fixedEvents: events, conflictMode: document.getElementById('swConflictMode').value, savedAt: new Date().toISOString() };
-    localStorage.setItem(draftKey, JSON.stringify(next));
+    safeLocalStorageSetItem(draftKey, JSON.stringify(next));
     document.getElementById('swScheduleStatus').textContent = `${events.length} fixed event groups saved. Rerun recommendations to apply them.`;
   });
 }
@@ -525,9 +576,9 @@ async function submitLabsPackage(replaceConfirmed = false) {
     if (!body.package_id || body.package_persisted !== true) throw new Error('The upload was not saved. Please upload the bid package again.');
     if (!body.job_id) throw new Error('Upload finished, but the parsing job was not created.');
     invalidatePackageState(body.package_id);
-    localStorage.setItem(activePackageKey, body.package_id);
-    localStorage.setItem(activeJobKey, body.job_id);
-    localStorage.removeItem(latestJobKey);
+    safeLocalStorageSetItem(activePackageKey, body.package_id);
+    safeLocalStorageSetItem(activeJobKey, body.job_id);
+    safeLocalStorageRemoveItem(latestJobKey);
     lastConfirmedProgress = Number(body.progress_percent ?? body.progress ?? 1);
     sessionJob = { ...body, status: 'queued', state: body.state || 'queued', progress: lastConfirmedProgress, progress_percent: lastConfirmedProgress, current_stage: body.current_stage || 'queued', stage_label: 'Queued', message: 'Upload received' };
     persistAnalysis(sessionJob);
@@ -561,6 +612,8 @@ function bindUploader() {
   document.getElementById('labsCancelReplace')?.addEventListener('click', () => document.getElementById('labsReplacePrompt')?.classList.add('hidden'));
   document.getElementById('labsCancelUpload')?.addEventListener('click', () => labsUploadController?.abort());
   document.getElementById('labsResumeAnalysis')?.addEventListener('click', resumeSharedAnalysis);
+  document.getElementById('labsCancelAnalysis')?.addEventListener('click', cancelSharedAnalysis);
+  document.getElementById('labsStartOver')?.addEventListener('click', startOverSharedPackage);
 }
 
 function bindBuilder() {
@@ -603,7 +656,7 @@ function bindBuilder() {
       notes: document.getElementById('labsNotes').value.trim(),
       savedAt: new Date().toISOString()
     };
-    localStorage.setItem(draftKey, JSON.stringify(saved));
+    safeLocalStorageSetItem(draftKey, JSON.stringify(saved));
     refinedRecommendationsSignature = '';
     if (!showConfirmation) return;
     const status = document.getElementById('draftStatus');
@@ -623,7 +676,7 @@ function bindBuilder() {
       if (!response.ok) throw new Error(body.detail || 'Could not interpret that trip request');
       tripIntentResult = body;
       const current = readJson(draftKey, {}) || {};
-      localStorage.setItem(draftKey, JSON.stringify({ ...current, tripIntentResult: body }));
+      safeLocalStorageSetItem(draftKey, JSON.stringify({ ...current, tripIntentResult: body }));
     } catch (error) { tripIntentError = error.message || 'Could not interpret that trip request'; }
     tripIntentLoading = false; render();
   });
@@ -724,11 +777,26 @@ async function fetchSharedJob() {
 }
 function applySharedJob(body) {
   const jobId = body.job_id, state = sharedJobState(body);
+  const previous = sessionJob || storedAnalysis() || {};
   lastConfirmedProgress = Math.max(lastConfirmedProgress, Number(body.progress_percent ?? body.progress ?? 0)); sessionPollFailures = 0;
-  sessionJob = { ...body, state, progress: lastConfirmedProgress, progress_percent: lastConfirmedProgress };
+  const incomingStage = resolveStage(body);
+  const previousStage = resolveStage(previous);
+  const incomingIndex = processingStageIndex.get(incomingStage) ?? -1;
+  const previousIndex = processingStageIndex.get(previousStage) ?? -1;
+  const stage = incomingIndex >= previousIndex ? incomingStage : previousStage;
+  sessionJob = {
+    ...previous,
+    ...body,
+    state,
+    current_stage: stage,
+    stage_label: body.stage_label || normalizeStageLabel(stage, previous.stage_label || ''),
+    elapsed_seconds: Math.max(Number(body.elapsed_seconds || 0), elapsedSeconds(previous)),
+    progress: lastConfirmedProgress,
+    progress_percent: lastConfirmedProgress,
+  };
   acceptPackageResponse(sessionJob); persistAnalysis(sessionJob); sessionLoading = false; render();
   if (state === 'completed' || body.status === 'complete') {
-    localStorage.setItem(latestJobKey, jobId); localStorage.removeItem(activeJobKey); localStorage.removeItem(analysisStateKey);
+    safeLocalStorageSetItem(latestJobKey, jobId); safeLocalStorageRemoveItem(activeJobKey); safeLocalStorageRemoveItem(analysisStateKey);
     if (labsPage === 'recommendations') loadRefinedRecommendations(jobId);
     if (labsPage === 'plan') { loadMonthPlan(jobId); loadNavbluePlan(jobId); }
   } else if (['queued', 'parsing', 'normalizing', 'ranking'].includes(state)) scheduleSharedPoll(2000);
@@ -737,19 +805,44 @@ function handleSharedFailure(error) {
   const status = Number(error.status || 0), code = error.detail?.error_code || 'POLLING_NETWORK_ERROR';
   latestStatusCode = status || 'network'; sessionLoading = false;
   if (code === 'PACKAGE_NOT_PERSISTED') {
-    localStorage.removeItem(activeJobKey); localStorage.removeItem(latestJobKey); localStorage.removeItem(activePackageKey); localStorage.removeItem(analysisStateKey);
+    safeLocalStorageRemoveItem(activeJobKey); safeLocalStorageRemoveItem(latestJobKey); safeLocalStorageRemoveItem(activePackageKey); safeLocalStorageRemoveItem(analysisStateKey);
     sessionJob = null; labsUploadError = 'The upload was not saved. Please upload the bid package again.'; render(); return;
   }
   if (status === 404 || status === 410) {
-    sessionJob = { ...(sessionJob || storedAnalysis()), state: status === 410 ? 'expired' : 'stale', current_stage: status === 410 ? 'expired' : 'stale', progress: lastConfirmedProgress, progress_percent: lastConfirmedProgress, error_code: code, user_message: error.message, recoverable: error.detail?.recoverable !== false };
+    const previous = sessionJob || storedAnalysis() || {};
+    sessionJob = {
+      ...previous,
+      state: status === 410 ? 'expired' : 'stale',
+      current_stage: status === 410 ? 'expired' : resolveStage(previous),
+      stage_label: status === 410 ? 'Expired' : normalizeStageLabel(resolveStage(previous), previous.stage_label || ''),
+      elapsed_seconds: elapsedSeconds(previous),
+      progress: lastConfirmedProgress,
+      progress_percent: lastConfirmedProgress,
+      error_code: code,
+      user_message: error.message,
+      recoverable: error.detail?.recoverable !== false,
+    };
     persistAnalysis(sessionJob); clearTimeout(sessionPollTimer); render(); return;
   }
   if (status === 401 || status === 403 || status === 409 || status === 400) {
-    localStorage.removeItem(activeJobKey); localStorage.removeItem(latestJobKey); localStorage.removeItem(activePackageKey); localStorage.removeItem(analysisStateKey);
+    safeLocalStorageRemoveItem(activeJobKey); safeLocalStorageRemoveItem(latestJobKey); safeLocalStorageRemoveItem(activePackageKey); safeLocalStorageRemoveItem(analysisStateKey);
     sessionJob = null; labsUploadError = `${error.message} Please upload the bid package again.`; render(); return;
   }
   sessionPollFailures += 1;
-  sessionJob = { ...(sessionJob || storedAnalysis()), state: 'reconnecting', current_stage: sessionJob?.current_stage || 'detecting_package', progress: lastConfirmedProgress, progress_percent: lastConfirmedProgress, error_code: status === 429 ? 'RATE_LIMITED' : 'POLLING_NETWORK_ERROR', user_message: `Connection interrupted. Last confirmed progress: ${lastConfirmedProgress}%.`, retry_count: sessionPollFailures };
+  const previous = sessionJob || storedAnalysis() || {};
+  const stage = resolveStage(previous);
+  sessionJob = {
+    ...previous,
+    state: 'reconnecting',
+    current_stage: stage,
+    stage_label: normalizeStageLabel(stage, previous.stage_label || ''),
+    elapsed_seconds: elapsedSeconds(previous),
+    progress: lastConfirmedProgress,
+    progress_percent: lastConfirmedProgress,
+    error_code: status === 429 ? 'RATE_LIMITED' : 'POLLING_NETWORK_ERROR',
+    user_message: `Connection interrupted. Last confirmed progress: ${lastConfirmedProgress}%.`,
+    retry_count: sessionPollFailures,
+  };
   persistAnalysis(sessionJob); render();
   if (sessionPollFailures <= 6) scheduleSharedPoll(Math.min(2000 * (2 ** (sessionPollFailures - 1)), 15000));
 }
@@ -761,7 +854,7 @@ async function restartSharedAnalysis() {
   const text = await response.text(); let body = {}; try { body = text ? JSON.parse(text) : {}; } catch (_) {}
   if (!response.ok) { const detail = analysisErrorDetail(body, 'The saved upload could not be restarted.'); throw Object.assign(new Error(detail.user_message), { status: response.status, detail }); }
   if (!body.job_id || body.package_id !== packageId) throw Object.assign(new Error('The replacement job does not match the active package.'), { status: 409, detail: { error_code: 'JOB_PACKAGE_MISMATCH' } });
-  localStorage.setItem(activeJobKey, body.job_id); localStorage.removeItem(latestJobKey); lastConfirmedProgress = Number(body.progress_percent ?? body.progress ?? 1); persistAnalysis(body); applySharedJob(body);
+  safeLocalStorageSetItem(activeJobKey, body.job_id); safeLocalStorageRemoveItem(latestJobKey); lastConfirmedProgress = Number(body.progress_percent ?? body.progress ?? 1); persistAnalysis(body); applySharedJob(body);
 }
 async function resumeSharedAnalysis() {
   if (sessionResumeInFlight) return;
@@ -773,6 +866,49 @@ async function resumeSharedAnalysis() {
     if (error.status === 404 || error.status === 410) { try { await restartSharedAnalysis(); } catch (restartError) { handleSharedFailure(restartError); } }
     else handleSharedFailure(error);
   } finally { sessionResumeInFlight = false; const currentButton = document.getElementById('labsResumeAnalysis'); if (currentButton) { currentButton.disabled = false; currentButton.textContent = 'Resume analysis'; } }
+}
+
+async function cancelSharedAnalysis() {
+  const jobId = currentJobId();
+  const packageId = activePackageId();
+  if (!jobId || !packageId) return;
+  try {
+    const form = new FormData();
+    form.append('package_id', packageId);
+    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST', body: form, headers: analysisHeaders() });
+    const body = await response.json();
+    if (!response.ok) throw new Error(analysisErrorDetail(body, 'Could not cancel analysis.').user_message);
+    sessionJob = { ...(sessionJob || {}), state: 'cancelled', status: 'failed', user_message: 'Analysis cancelled', message: 'Analysis cancelled' };
+    persistAnalysis(sessionJob);
+    clearTimeout(sessionPollTimer);
+    render();
+  } catch (error) {
+    labsUploadError = error.message || 'Could not cancel analysis.';
+    render();
+  }
+}
+
+async function startOverSharedPackage() {
+  const packageId = activePackageId();
+  if (!packageId) return;
+  try {
+    const response = await fetch(`/api/packages/${encodeURIComponent(packageId)}/reset`, { method: 'POST', headers: analysisHeaders() });
+    const body = await response.json();
+    if (!response.ok) throw new Error(analysisErrorDetail(body, 'Could not reset package.').user_message);
+    safeLocalStorageRemoveItem(activeJobKey);
+    safeLocalStorageRemoveItem(latestJobKey);
+    safeLocalStorageRemoveItem(activePackageKey);
+    safeLocalStorageRemoveItem(analysisStateKey);
+    invalidatePackageState('');
+    sessionJob = null;
+    sessionLoading = false;
+    labsUploadError = '';
+    clearTimeout(sessionPollTimer);
+    render();
+  } catch (error) {
+    labsUploadError = error.message || 'Could not reset package.';
+    render();
+  }
 }
 async function loadSharedSession() {
   if (sessionPollInFlight) return;

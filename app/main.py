@@ -68,6 +68,11 @@ app.mount("/static", StaticFiles(directory=BASE_DIR / "app" / "static"), name="s
 app.include_router(labs_router)
 job_lock = threading.Lock()
 active_job_threads: set[str] = set()
+SCORING_BATCH_SIZE = 25
+
+
+class AnalysisCancelled(Exception):
+    """Raised when a running analysis job is cooperatively cancelled."""
 
 
 ANALYSIS_ERROR_MESSAGES = {
@@ -105,13 +110,22 @@ def init_db() -> None:
                 message TEXT,
                 error TEXT,
                 results_json TEXT,
+                summaries_json TEXT,
                 airline TEXT,
                 profile_json TEXT,
                 uploads_json TEXT,
                 source_json TEXT,
+                performance_json TEXT,
                 package_id TEXT,
                 state TEXT,
                 current_stage TEXT,
+                current_stage_started_at TEXT,
+                last_progress_at TEXT,
+                records_total INTEGER NOT NULL DEFAULT 0,
+                records_processed INTEGER NOT NULL DEFAULT 0,
+                records_failed INTEGER NOT NULL DEFAULT 0,
+                current_batch INTEGER NOT NULL DEFAULT 0,
+                total_batches INTEGER NOT NULL DEFAULT 0,
                 last_successful_poll_at TEXT,
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 recoverable INTEGER NOT NULL DEFAULT 1,
@@ -153,6 +167,13 @@ def init_db() -> None:
             "airline": "TEXT", "profile_json": "TEXT", "uploads_json": "TEXT",
             "source_json": "TEXT", "package_id": "TEXT", "state": "TEXT",
             "current_stage": "TEXT", "last_successful_poll_at": "TEXT",
+            "summaries_json": "TEXT", "performance_json": "TEXT",
+            "current_stage_started_at": "TEXT", "last_progress_at": "TEXT",
+            "records_total": "INTEGER NOT NULL DEFAULT 0",
+            "records_processed": "INTEGER NOT NULL DEFAULT 0",
+            "records_failed": "INTEGER NOT NULL DEFAULT 0",
+            "current_batch": "INTEGER NOT NULL DEFAULT 0",
+            "total_batches": "INTEGER NOT NULL DEFAULT 0",
             "retry_count": "INTEGER NOT NULL DEFAULT 0", "recoverable": "INTEGER NOT NULL DEFAULT 1",
             "error_code": "TEXT", "user_message": "TEXT", "request_id": "TEXT",
             "session_id_hash": "TEXT",
@@ -195,7 +216,7 @@ def inferred_stage(message: str, status: str = "") -> str:
         return "parsing_details"
     if "normaliz" in lowered:
         return "normalizing"
-    if "scoring" in lowered or "recommendation" in lowered:
+    if "scoring" in lowered or "recommendation" in lowered or "summary" in lowered or "serializ" in lowered:
         return "building_recommendations"
     return "detecting_package"
 
@@ -243,15 +264,29 @@ def update_job(job_id: str, **fields: Any) -> None:
     if "message" in fields and "current_stage" not in fields:
         fields["current_stage"] = inferred_stage(str(fields.get("message") or ""), status)
     stage = str(fields.get("current_stage") or (current["current_stage"] if current else "") or "detecting_package")
+    if current and "current_stage" in fields and str(current["current_stage"] or "") != stage:
+        fields["current_stage_started_at"] = utc_now()
     if "state" not in fields:
         fields["state"] = state_for_stage(stage, status)
     if "message" in fields and "user_message" not in fields:
         fields["user_message"] = fields["message"]
+    if "progress" in fields or "message" in fields or "records_processed" in fields:
+        fields["last_progress_at"] = utc_now()
     fields["updated_at"] = utc_now()
     clause = ", ".join(f"{k}=?" for k in fields)
     with job_lock, db() as conn:
         conn.execute(f"UPDATE jobs SET {clause} WHERE id=?", [*fields.values(), job_id])
     analysis_log("state_updated", get_job(job_id))
+
+
+def is_job_cancelled(job_id: str) -> bool:
+    row = get_job(job_id)
+    return bool(row and job_state(row) == "cancelled")
+
+
+def check_cancelled(job_id: str) -> None:
+    if is_job_cancelled(job_id):
+        raise AnalysisCancelled(f"Analysis job {job_id} was cancelled")
 
 
 def safe_remove_package_upload(path: Path) -> None:
@@ -302,7 +337,11 @@ def startup() -> None:
     init_db()
     cleanup_expired_packages()
     with db() as conn:
-        pending = conn.execute("SELECT * FROM jobs WHERE status IN ('queued','processing')").fetchall()
+        pending = conn.execute(
+            """SELECT * FROM jobs
+               WHERE status IN ('queued','processing')
+                 AND COALESCE(state, '') NOT IN ('cancelled', 'expired')"""
+        ).fetchall()
     for row in pending:
         paths = [Path(p) for p in json.loads(row["uploads_json"] or "[]")]
         if paths and all(path.exists() for path in paths) and row["airline"]:
@@ -467,7 +506,7 @@ INDEX_HTML = r"""
           <div id="pdfUploads" class="drop-zone hidden"><span class="drop-step">2 · Upload package</span><div class="upload-icon">⇧</div><strong>Choose bid-package PDF</strong><span id="pdfFileName">No file selected</span><label class="file-picker" for="pdfFile">Browse files</label><input id="pdfFile" class="native-file-input" type="file" accept=".pdf,application/pdf"></div>
           <div id="southwestUploads" class="drop-zone hidden"><span class="drop-step">2 · Upload package</span><div class="upload-icon">⇧</div><strong>Southwest bid package</strong><span id="southwestZipName" data-empty-text="Upload the airline ZIP, or individual TXT files">Upload the airline ZIP, or individual TXT files</span><label class="file-picker" for="southwestZip">Choose ZIP</label><input id="southwestZip" class="native-file-input" type="file" accept=".zip,application/zip"><div class="or">OR</div><div class="sw-files"><label>Pairings TXT<input id="southwestPairingsFile" type="file" accept=".txt,text/plain"></label><label>Lines TXT<input id="southwestLinesFile" type="file" accept=".txt,text/plain"></label><label>Seniority TXT<input id="southwestSeniorityFile" type="file" accept=".txt,text/plain"></label><label>Cover TXT<input id="southwestCoverFile" type="file" accept=".txt,text/plain"></label></div></div>
         </div>
-        <div class="primary-actions"><button id="analyzeBtn" class="primary" disabled>Analyze bid package</button><button id="demoBtn" class="secondary">View sample results</button></div>
+        <div class="primary-actions"><button id="analyzeBtn" class="primary" disabled>Analyze bid package</button><button id="cancelAnalysisBtn" class="secondary">Cancel analysis</button><button id="startOverBtn" class="secondary">Start over</button><button id="demoBtn" class="secondary">View sample results</button></div>
         <div id="jobPanel" class="job-panel hidden"><div class="job-row"><strong id="jobStatus">Preparing…</strong><span id="jobPercent">0%</span></div><div class="progress"><div id="progressFill"></div></div><div id="jobMessage" class="muted"></div><dl id="analysisDebugPanel" class="analysis-debug hidden"><dt>Package ID</dt><dd data-debug="package">—</dd><dt>Job ID</dt><dd data-debug="job">—</dd><dt>State</dt><dd data-debug="state">idle</dd><dt>Last confirmed progress</dt><dd data-debug="progress">0%</dd><dt>Last successful poll</dt><dd data-debug="poll">—</dd><dt>Latest status</dt><dd data-debug="status">—</dd><dt>Retry count</dt><dd data-debug="retries">0</dd></dl></div>
         <div id="errorBox" class="error hidden"></div>
       </section>
@@ -795,6 +834,7 @@ def extract_text(
         last_progress_update = time.monotonic()
         try:
             for i, page in enumerate(doc):
+                check_cancelled(job_id)
                 if deadline is not None and time.monotonic() > deadline:
                     raise TimeoutError("Parsing exceeded the configured time limit")
                 page_text = page.get_text("text", sort=sort_pdf_text)
@@ -1191,6 +1231,73 @@ def build_bid_synopsis(pairings: list[dict[str, Any]]) -> dict[str, Any]:
 def sort_results(results: list[dict[str, Any]], active_package_id: str | None = None) -> None:
     """Apply the explicit two-stage recommendation output order in place."""
     results[:] = recommendation_pipeline(results, active_package_id)
+
+
+def concise_fatigue_level(result: dict[str, Any]) -> str:
+    fatigue = result.get("fatigue_index") or {}
+    return str(fatigue.get("level") or "Insufficient Data")
+
+
+def concise_hold_level(result: dict[str, Any]) -> str:
+    hold = result.get("hold_outlook") or {}
+    return str(hold.get("likelihood") or hold.get("outlook") or "Insufficient Data")
+
+
+def layover_summary(result: dict[str, Any]) -> str:
+    layovers = result.get("layovers") or []
+    if not layovers:
+        return "None"
+    summary = []
+    for layover in layovers[:3]:
+        airport = str(layover.get("airport") or layover.get("city") or "").strip().upper()
+        duration = str(layover.get("duration") or "").strip()
+        token = f"{airport} {duration}".strip() if airport else duration
+        if token:
+            summary.append(token)
+    if not summary:
+        return "None"
+    suffix = " +" if len(layovers) > len(summary) else ""
+    return ", ".join(summary) + suffix
+
+
+def recommendation_summary(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": result.get("id"),
+        "package_id": result.get("package_id"),
+        "trip_id": result.get("id"),
+        "trip_identifier": result.get("pairing"),
+        "pairing": result.get("pairing"),
+        "rank": result.get("rank"),
+        "match_class": result.get("match_class"),
+        "match_label": result.get("match_label"),
+        "match_reasons": (result.get("qualification_reasons") or result.get("matched_preferences") or result.get("reasons") or [])[:3],
+        "trip_length": result.get("trip_length"),
+        "simplified_route": result.get("simplified_route"),
+        "report_time": result.get("checkin") or result.get("first_report"),
+        "release_time": result.get("release") or result.get("final_release"),
+        "tafb": result.get("tafb"),
+        "trip_credit": result.get("trip_credit") or result.get("credit"),
+        "total_pay": result.get("total_pay"),
+        "pairing_tfp": result.get("pairing_tfp"),
+        "line_tfp": result.get("line_tfp"),
+        "monthly_tfp": result.get("monthly_tfp"),
+        "layover_summary": layover_summary(result),
+        "fatigue_level": concise_fatigue_level(result),
+        "hold_likelihood": concise_hold_level(result),
+        "eligible": result.get("eligible"),
+        "display_label": result.get("display_label"),
+        "airline": result.get("airline"),
+    }
+
+
+def recommendation_counts(results: list[dict[str, Any]]) -> dict[str, int]:
+    classes = Counter(str(result.get("match_class") or "near") for result in results)
+    return {
+        "exact": int(classes.get("exact", 0)),
+        "strong": int(classes.get("strong", 0)),
+        "partial": int(classes.get("partial", 0)),
+        "near": int(classes.get("near", 0)),
+    }
 
 
 def match_level(score: float, conflicts: list[str]) -> str:
@@ -1604,6 +1711,7 @@ def extract_archive_text(zip_path: Path, target_dir: Path, job_id: str, label: s
         if not safe_members:
             raise RuntimeError(f"The {label} ZIP does not contain any files.")
         for index, member in enumerate(safe_members, 1):
+            check_cancelled(job_id)
             suffix = Path(member.filename).suffix.lower()
             if suffix not in {".pdf", ".html", ".htm", ".txt", ".csv"}:
                 continue
@@ -1807,18 +1915,30 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
     cache_hit = False
     completed = False
     deadline = time.monotonic() + MAX_PARSE_SECONDS
+    timings: dict[str, Any] = {}
     try:
+        check_cancelled(job_id)
+        process_started = time.perf_counter()
         update_job(
             job_id, status="processing", state="parsing", current_stage="detecting_package",
             progress=max(5, int(job["progress"] or 0)), retry_count=int(job["retry_count"] or 0),
             message="Detecting airline and package type", error=None, error_code=None,
+            records_total=0, records_processed=0, records_failed=0, current_batch=0, total_batches=0,
         )
+        pairings: list[dict[str, Any]] = []
+        lines: list[dict[str, Any]] = []
+        eligible_pairings: list[dict[str, Any]] = []
+        item_label = "pairings"
+        scoring_started = time.perf_counter()
+        failed_records = 0
+        slowest_records: list[tuple[float, str]] = []
         if airline == "southwest":
             if len(paths) == 1 and paths[0].suffix.lower() == ".zip":
                 with zipfile.ZipFile(paths[0]) as archive:
                     members = [m for m in archive.infolist() if not m.is_dir() and ".." not in Path(m.filename).parts]
                     pairing_chunks, line_chunks = [], []
                     for i, member in enumerate(members, 1):
+                        check_cancelled(job_id)
                         if time.monotonic() > deadline:
                             raise TimeoutError("Parsing exceeded the configured time limit")
                         name = Path(member.filename).name.lower()
@@ -1845,6 +1965,7 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
             else:
                 pairings_text = extract_text(paths[0], paths[0].suffix.lower(), job_id, deadline=deadline)
                 lines_text = extract_text(paths[1], paths[1].suffix.lower(), job_id, deadline=deadline)
+            check_cancelled(job_id)
             pairings, parser_name = parse_pairings(pairings_text, job_id, "southwest")
             update_job(job_id, state="normalizing", current_stage="normalizing", progress=71, message="Normalizing parsed Southwest pairings")
             pairings = filter_pairings_for_profile(bind_pairings_to_package(pairings, package_id), {})
@@ -1852,15 +1973,90 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
                 raise RuntimeError("No confirmed bidable Southwest pairings were available for recommendation input.")
             update_job(job_id, progress=72, message=f"Matching {len(pairings)} pairings to offered lines")
             pairing_profile = {**profile, "_monthly_inventory_count": len(pairings)}
-            scored_pairings = {p["id"]: score_pairing(p, pairing_profile) for p in pairings}
+            scored_pairings: dict[str, dict[str, Any]] = {}
+            pairing_total = len(pairings)
+            pairing_batches = max((pairing_total + SCORING_BATCH_SIZE - 1) // SCORING_BATCH_SIZE, 1)
+            update_job(
+                job_id,
+                state="ranking",
+                current_stage="building_recommendations",
+                progress=75,
+                message=f"Scoring recommendations: 0 of {pairing_total}",
+                records_total=pairing_total,
+                records_processed=0,
+                records_failed=0,
+                current_batch=0,
+                total_batches=pairing_batches,
+            )
+            for index, pairing in enumerate(pairings, 1):
+                check_cancelled(job_id)
+                started = time.perf_counter()
+                try:
+                    scored_pairings[pairing["id"]] = score_pairing(pairing, pairing_profile)
+                except Exception:
+                    failed_records += 1
+                    log.exception("Failed scoring pairing %s in package %s", pairing.get("id"), package_id)
+                elapsed = time.perf_counter() - started
+                slowest_records.append((elapsed, str(pairing.get("id") or pairing.get("pairing") or "unknown")))
+                slowest_records.sort(reverse=True)
+                slowest_records = slowest_records[:5]
+                if index % SCORING_BATCH_SIZE == 0 or index == pairing_total:
+                    progress = 75 + int(index / max(pairing_total, 1) * 8)
+                    update_job(
+                        job_id,
+                        progress=progress,
+                        message=f"Scoring recommendations: {index} of {pairing_total}",
+                        records_total=pairing_total,
+                        records_processed=index,
+                        records_failed=failed_records,
+                        current_batch=(index + SCORING_BATCH_SIZE - 1) // SCORING_BATCH_SIZE,
+                        total_batches=pairing_batches,
+                    )
             lines = parse_southwest_lines(lines_text, set(scored_pairings))
             if not lines:
                 raise RuntimeError("No Southwest lines could be matched to the pairing IDs. Confirm that the correct Pairings and Lines ZIP files were uploaded.")
             lines = [{**line, "package_id": package_id} for line in lines]
             line_profile = {**profile, "_monthly_inventory_count": len(lines)}
-            results = [score_southwest_line(line, scored_pairings, line_profile) for line in lines]
+            results = []
+            line_total = len(lines)
+            line_batches = max((line_total + SCORING_BATCH_SIZE - 1) // SCORING_BATCH_SIZE, 1)
+            update_job(
+                job_id,
+                progress=83,
+                message=f"Scoring recommendations: 0 of {line_total}",
+                records_total=line_total,
+                records_processed=0,
+                records_failed=failed_records,
+                current_batch=0,
+                total_batches=line_batches,
+            )
+            for index, line in enumerate(lines, 1):
+                check_cancelled(job_id)
+                started = time.perf_counter()
+                try:
+                    results.append(score_southwest_line(line, scored_pairings, line_profile))
+                except Exception:
+                    failed_records += 1
+                    log.exception("Failed scoring Southwest line %s in package %s", line.get("id"), package_id)
+                elapsed = time.perf_counter() - started
+                slowest_records.append((elapsed, str(line.get("id") or "unknown")))
+                slowest_records.sort(reverse=True)
+                slowest_records = slowest_records[:5]
+                if index % SCORING_BATCH_SIZE == 0 or index == line_total:
+                    progress = 83 + int(index / max(line_total, 1) * 2)
+                    update_job(
+                        job_id,
+                        progress=progress,
+                        message=f"Scoring recommendations: {index} of {line_total}",
+                        records_total=line_total,
+                        records_processed=index,
+                        records_failed=failed_records,
+                        current_batch=(index + SCORING_BATCH_SIZE - 1) // SCORING_BATCH_SIZE,
+                        total_batches=line_batches,
+                    )
             item_label = "lines"
         else:
+            check_cancelled(job_id)
             cache_key = parser_cache_key(paths[0], airline)
             cached = load_cached_pairings(cache_key)
             if cached:
@@ -1885,6 +2081,7 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
                     airline if airline in {"delta", "american", "generic"} else "auto",
                 )
                 store_cached_pairings(cache_key, airline, parser_name, pairings)
+            check_cancelled(job_id)
             update_job(job_id, state="normalizing", current_stage="normalizing", progress=72, message=f"Normalizing {len(pairings)} parsed trip records")
             pairings = bind_pairings_to_package(pairings, package_id)
             if airline == "auto" and pairings:
@@ -1894,14 +2091,94 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
             eligible_pairings = filter_pairings_for_profile(pairings, profile)
             if profile.get("bid_fleets") and not eligible_pairings:
                 raise RuntimeError("No pairings matched the selected bid fleet. Check the fleet code and run the package again.")
-            update_job(job_id, state="ranking", current_stage="building_recommendations", progress=75, message=f"Scoring {len(eligible_pairings)} pairings")
+            total_records = len(eligible_pairings)
+            total_batches = max((total_records + SCORING_BATCH_SIZE - 1) // SCORING_BATCH_SIZE, 1)
+            update_job(
+                job_id,
+                state="ranking",
+                current_stage="building_recommendations",
+                progress=75,
+                message=f"Scoring recommendations: 0 of {total_records}",
+                records_total=total_records,
+                records_processed=0,
+                records_failed=0,
+                current_batch=0,
+                total_batches=total_batches,
+            )
             scoring_profile = {**profile, "_monthly_inventory_count": len(pairings)}
-            results = [score_pairing(pairing, scoring_profile) for pairing in eligible_pairings]
+            results = []
+            for index, pairing in enumerate(eligible_pairings, 1):
+                check_cancelled(job_id)
+                started = time.perf_counter()
+                try:
+                    results.append(score_pairing(pairing, scoring_profile))
+                except Exception:
+                    failed_records += 1
+                    log.exception("Failed scoring pairing %s in package %s", pairing.get("id"), package_id)
+                elapsed = time.perf_counter() - started
+                slowest_records.append((elapsed, str(pairing.get("id") or pairing.get("pairing") or "unknown")))
+                slowest_records.sort(reverse=True)
+                slowest_records = slowest_records[:5]
+                if index % SCORING_BATCH_SIZE == 0 or index == total_records:
+                    progress = 75 + int(index / max(total_records, 1) * 10)
+                    update_job(
+                        job_id,
+                        progress=progress,
+                        message=f"Scoring recommendations: {index} of {total_records}",
+                        records_total=total_records,
+                        records_processed=index,
+                        records_failed=failed_records,
+                        current_batch=(index + SCORING_BATCH_SIZE - 1) // SCORING_BATCH_SIZE,
+                        total_batches=total_batches,
+                    )
             item_label = "pairings"
-        update_job(job_id, state="ranking", current_stage="building_recommendations", progress=85, message=f"Building recommendation data for {len(results)} records")
+        scoring_seconds = time.perf_counter() - scoring_started
+        update_job(
+            job_id,
+            state="ranking",
+            current_stage="building_recommendations",
+            progress=85,
+            message=f"Building summaries: batch 0 of {max((len(results) + SCORING_BATCH_SIZE - 1) // SCORING_BATCH_SIZE, 1)}",
+        )
+        check_cancelled(job_id)
         sort_results(results, package_id)
+        summary_started = time.perf_counter()
+        summaries: list[dict[str, Any]] = []
+        total_results = len(results)
+        summary_batches = max((total_results + SCORING_BATCH_SIZE - 1) // SCORING_BATCH_SIZE, 1)
+        for index, result in enumerate(results, 1):
+            check_cancelled(job_id)
+            summaries.append(recommendation_summary(result))
+            if index % SCORING_BATCH_SIZE == 0 or index == total_results:
+                progress = 86 + int(index / max(total_results, 1) * 8)
+                update_job(
+                    job_id,
+                    state="ranking",
+                    current_stage="building_recommendations",
+                    progress=progress,
+                    message=f"Building summaries: batch {(index + SCORING_BATCH_SIZE - 1) // SCORING_BATCH_SIZE} of {summary_batches}",
+                    records_total=total_results,
+                    records_processed=index,
+                    records_failed=failed_records,
+                    current_batch=(index + SCORING_BATCH_SIZE - 1) // SCORING_BATCH_SIZE,
+                    total_batches=summary_batches,
+                )
+        summary_seconds = time.perf_counter() - summary_started
         package_records(results, package_id)
         synopsis = build_bid_synopsis(pairings)
+        total_scored = int(get_job(job_id)["records_processed"] or 0) if get_job(job_id) else len(results)
+        throughput = round(total_scored / scoring_seconds, 2) if scoring_seconds > 0 else 0.0
+        timings = {
+            "processing_seconds": round(time.perf_counter() - process_started, 3),
+            "scoring_seconds": round(scoring_seconds, 3),
+            "summary_construction_seconds": round(summary_seconds, 3),
+            "time_to_first_usable_results_seconds": round(time.perf_counter() - process_started, 3),
+            "records_per_second": throughput,
+            "slowest_records": [
+                {"trip_id": record_id, "seconds": round(seconds, 3)}
+                for seconds, record_id in slowest_records
+            ],
+        }
         diagnostics = {
             "active_package_id": package_id,
             "airline": airline,
@@ -1915,9 +2192,11 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
             "eligible_recommendation_count": sum(result.get("eligible") is True for result in results),
             "near_match_count": sum(result.get("eligible") is not True for result in results),
             "result_package_ids": [result.get("package_id") for result in results],
+            "records_failed": failed_records,
+            "match_counts": recommendation_counts(results),
         }
         source = (
-            {"kind": "southwest", "package_id": package_id, "pairings": pairings, "lines": lines, "parser_name": parser_name, "synopsis": synopsis, "package_diagnostics": diagnostics}
+            {"kind": "southwest", "package_id": package_id, "pairings": pairings, "lines": lines, "parser_name": parser_name, "synopsis": synopsis, "package_diagnostics": diagnostics, "timings": timings}
             if airline == "southwest"
             else {
                 "kind": "pairings",
@@ -1927,16 +2206,34 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
                 "cache_hit": cache_hit,
                 "synopsis": synopsis,
                 "package_diagnostics": diagnostics,
+                "timings": timings,
             }
         )
-        if job_state(get_job(job_id)) == "cancelled":
-            analysis_log("cancelled_job_result_discarded", get_job(job_id))
-            return
+        check_cancelled(job_id)
+        serialization_started = time.perf_counter()
+        summaries_json = json.dumps(summaries, separators=(",", ":"))
+        results_json = json.dumps(results)
+        source_json = json.dumps(source)
+        performance = {
+            **timings,
+            "summary_payload_bytes": len(summaries_json.encode("utf-8")),
+            "results_payload_bytes": len(results_json.encode("utf-8")),
+            "source_payload_bytes": len(source_json.encode("utf-8")),
+            "sqlite_payload_bytes": len(results_json.encode("utf-8")) + len(source_json.encode("utf-8")),
+            "serialization_seconds": round(time.perf_counter() - serialization_started, 3),
+        }
+        check_cancelled(job_id)
         update_job(
             job_id, status="complete", state="completed", current_stage="ready", progress=100,
             recoverable=1, error=None, error_code=None,
-            message=f"Complete: {len(results)} {item_label} ranked", results_json=json.dumps(results),
-            source_json=json.dumps(source), profile_json=json.dumps(profile),
+            message=f"Complete: {len(results)} {item_label} ranked", results_json=results_json,
+            source_json=source_json, profile_json=json.dumps(profile),
+            performance_json=json.dumps(performance, separators=(",", ":")),
+            records_total=len(results),
+            records_processed=len(results),
+            records_failed=failed_records,
+            current_batch=summary_batches,
+            total_batches=summary_batches,
         )
         completed = True
         with job_lock, db() as conn:
@@ -1944,6 +2241,19 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
                 "UPDATE packages SET persisted=0,recoverable=0,updated_at=? WHERE id=?",
                 (utc_now(), package_id),
             )
+    except AnalysisCancelled:
+        row = get_job(job_id)
+        if row and job_state(row) != "cancelled":
+            update_job(
+                job_id,
+                status="failed",
+                state="cancelled",
+                current_stage="cancelled",
+                recoverable=0,
+                message="Analysis cancelled",
+                user_message="Analysis cancelled",
+            )
+        analysis_log("analysis_cancelled", get_job(job_id))
     except Exception as exc:
         log.exception("Job %s failed", job_id)
         error_code = "JOB_TIMEOUT" if isinstance(exc, TimeoutError) else "PARSER_FAILED"
@@ -2121,7 +2431,19 @@ def job_progress_payload(row: sqlite3.Row) -> dict[str, Any]:
     created = datetime.fromisoformat(str(row["created_at"]).replace(" ", "T"))
     end_value = row["updated_at"] if status in {"complete", "failed"} else datetime.utcnow().isoformat(timespec="seconds")
     ended = datetime.fromisoformat(str(end_value).replace(" ", "T"))
-    return {"stage": stage, "stage_label": label, "elapsed_seconds": max(0, int((ended - created).total_seconds())), **detail}
+    return {
+        "stage": stage,
+        "stage_label": label,
+        "elapsed_seconds": max(0, int((ended - created).total_seconds())),
+        "current_stage_started_at": row["current_stage_started_at"],
+        "last_progress_at": row["last_progress_at"],
+        "records_total": int(row["records_total"] or 0),
+        "records_processed": int(row["records_processed"] or 0),
+        "records_failed": int(row["records_failed"] or 0),
+        "current_batch": int(row["current_batch"] or 0),
+        "total_batches": int(row["total_batches"] or 0),
+        **detail,
+    }
 
 
 def job_package_metadata(row: sqlite3.Row, results: list[dict[str, Any]], source: dict[str, Any]) -> dict[str, Any]:
@@ -2186,6 +2508,70 @@ def validate_job_access(row: sqlite3.Row, supplied_package_id: str | None, suppl
         raise analysis_error(403, "SESSION_EXPIRED", package_id=expected_package_id, job_id=row["id"])
 
 
+def _filter_and_sort_summaries(
+    summaries: list[dict[str, Any]],
+    *,
+    match_class: str | None = None,
+    sort: str = "rank",
+) -> list[dict[str, Any]]:
+    records = summaries
+    if match_class:
+        target = str(match_class).strip().lower()
+        records = [item for item in records if str(item.get("match_class") or "").lower() == target]
+    if sort == "match_class":
+        order = {"exact": 0, "strong": 1, "partial": 2, "near": 3}
+        records = sorted(records, key=lambda item: (order.get(str(item.get("match_class") or "near"), 4), int(item.get("rank") or 0)))
+    elif sort == "pay":
+        records = sorted(
+            records,
+            key=lambda item: (
+                -(float(item.get("total_pay") or 0) if str(item.get("total_pay") or "").replace(".", "", 1).isdigit() else 0.0),
+                int(item.get("rank") or 0),
+            ),
+        )
+    else:
+        records = sorted(records, key=lambda item: int(item.get("rank") or 0))
+    return records
+
+
+def paginated_recommendation_payload(
+    row: sqlite3.Row,
+    *,
+    package_id: str,
+    limit: int = 50,
+    offset: int = 0,
+    match_class: str | None = None,
+    sort: str = "rank",
+) -> dict[str, Any]:
+    if row["status"] != "complete":
+        raise HTTPException(409, "Recommendations are not ready yet")
+    if row["summaries_json"]:
+        summaries = json.loads(row["summaries_json"] or "[]")
+    else:
+        results = json.loads(row["results_json"] or "[]")
+        if row["package_id"]:
+            package_records(results, package_id)
+        summaries = [recommendation_summary(result) for result in results]
+    filtered = _filter_and_sort_summaries(summaries, match_class=match_class, sort=sort)
+    counts = recommendation_counts(filtered if match_class else summaries)
+    safe_limit = min(max(int(limit or 50), 1), 100)
+    safe_offset = max(int(offset or 0), 0)
+    page = filtered[safe_offset:safe_offset + safe_limit]
+    next_offset = safe_offset + safe_limit if safe_offset + safe_limit < len(filtered) else None
+    return {
+        "job_id": row["id"],
+        "package_id": package_id,
+        "total_count": len(filtered),
+        "counts": counts,
+        "results": page,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "next_offset": next_offset,
+        "current_sort": sort,
+        "current_filters": {"match_class": match_class} if match_class else {},
+    }
+
+
 def job_status_payload(row: sqlite3.Row) -> dict[str, Any]:
     package_id = row_package_id(row)
     state = job_state(row)
@@ -2217,6 +2603,15 @@ def job_status_payload(row: sqlite3.Row) -> dict[str, Any]:
         source = json.loads(row["source_json"] or "{}")
         if row["package_id"]:
             package_records(payload["results"], package_id)
+        payload["recommendation_page"] = paginated_recommendation_payload(
+            row,
+            package_id=package_id,
+            limit=50,
+            offset=0,
+            match_class=None,
+            sort="rank",
+        )
+        payload["performance"] = json.loads(row["performance_json"] or "{}")
         payload["synopsis"] = source.get("synopsis") or build_bid_synopsis(source_pairings(source))
         payload["package"] = job_package_metadata(row, payload["results"], source)
         if os.environ.get("PACKAGE_DEBUG_ENABLED", "false").lower() == "true":
@@ -2248,6 +2643,99 @@ def job_status(job_id: str, request: Request, package_id: str | None = None):
     row = get_job(job_id)
     analysis_log("status_polled", row)
     return job_status_payload(row)
+
+
+@app.get("/api/jobs/{job_id}/recommendations")
+def job_recommendations(
+    job_id: str,
+    request: Request,
+    package_id: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    match_class: str | None = None,
+    sort: str = "rank",
+):
+    row = get_job(job_id)
+    if not row:
+        raise analysis_error(404, "JOB_NOT_FOUND", job_id=job_id, package_id=package_id)
+    validate_job_access(row, package_id, request.headers.get("x-crewbidiq-session"))
+    active_package_id = require_active_package(row, package_id)
+    return paginated_recommendation_payload(
+        row,
+        package_id=active_package_id,
+        limit=limit,
+        offset=offset,
+        match_class=match_class,
+        sort=sort,
+    )
+
+
+@app.get("/api/jobs/{job_id}/recommendations/{trip_id}")
+def job_recommendation_detail(job_id: str, trip_id: str, request: Request, package_id: str | None = None):
+    row = get_job(job_id)
+    if not row:
+        raise analysis_error(404, "JOB_NOT_FOUND", job_id=job_id, package_id=package_id)
+    validate_job_access(row, package_id, request.headers.get("x-crewbidiq-session"))
+    active_package_id = require_active_package(row, package_id)
+    if row["status"] != "complete":
+        raise HTTPException(409, "Recommendations are not ready yet")
+    results = json.loads(row["results_json"] or "[]")
+    if row["package_id"]:
+        package_records(results, active_package_id)
+    target = next((result for result in results if str(result.get("id") or "") == trip_id), None)
+    if not target:
+        raise HTTPException(404, "Recommendation detail not found")
+    return {"job_id": job_id, "package_id": active_package_id, "result": target}
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str, request: Request, package_id: str | None = Form(None)):
+    row = get_job(job_id)
+    if not row:
+        raise analysis_error(404, "JOB_NOT_FOUND", job_id=job_id, package_id=package_id)
+    validate_job_access(row, package_id, request.headers.get("x-crewbidiq-session"))
+    active_package_id = require_active_package(row, package_id)
+    state = job_state(row)
+    if state == "cancelled":
+        return {"job_id": job_id, "package_id": active_package_id, "cancelled": True, "already_cancelled": True}
+    if state == "completed":
+        return {"job_id": job_id, "package_id": active_package_id, "cancelled": False, "completed": True}
+    update_job(
+        job_id,
+        status="failed",
+        state="cancelled",
+        current_stage="cancelled",
+        recoverable=0,
+        message="Analysis cancelled",
+        user_message="Analysis cancelled",
+    )
+    analysis_log("job_cancelled_by_request", get_job(job_id))
+    return {"job_id": job_id, "package_id": active_package_id, "cancelled": True, "already_cancelled": False}
+
+
+@app.post("/api/packages/{package_id}/reset")
+def reset_package(package_id: str, request: Request):
+    package = get_package(package_id)
+    if not package:
+        return {"package_id": package_id, "reset": True, "existed": False}
+    expected_session = package["session_id_hash"]
+    if expected_session and session_hash(request.headers.get("x-crewbidiq-session")) != expected_session:
+        raise analysis_error(403, "SESSION_EXPIRED", package_id=package_id)
+    uploads = [Path(value) for value in json.loads(package["uploads_json"] or "[]")]
+    now = utc_now()
+    with job_lock, db() as conn:
+        conn.execute(
+            """UPDATE jobs SET status='failed',state='cancelled',current_stage='cancelled',recoverable=0,
+               message='Analysis cancelled',user_message='Analysis cancelled',updated_at=?
+               WHERE package_id=? AND status IN ('queued','processing')""",
+            (now, package_id),
+        )
+        conn.execute("DELETE FROM jobs WHERE package_id=?", (package_id,))
+        conn.execute("DELETE FROM packages WHERE id=?", (package_id,))
+    for path in uploads:
+        safe_remove_package_upload(path)
+    analysis_log("package_reset", package_id=package_id)
+    return {"package_id": package_id, "reset": True, "existed": True}
 
 
 @app.post("/api/packages/{package_id}/analysis-jobs")

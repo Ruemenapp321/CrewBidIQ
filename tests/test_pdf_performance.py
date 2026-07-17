@@ -39,6 +39,10 @@ def sample_pairing(pairing_id: str = "1001") -> dict:
     }
 
 
+def sample_pairings(count: int) -> list[dict]:
+    return [sample_pairing(str(1000 + index)) for index in range(count)]
+
+
 def test_parser_cache_key_is_scoped_to_file_airline_and_parser_version(tmp_path):
     package = tmp_path / "package.pdf"
     package.write_bytes(b"%PDF-package-one")
@@ -148,3 +152,74 @@ def test_large_api_responses_are_gzip_compressed():
 
     assert response.status_code == 200
     assert response.headers["content-encoding"] == "gzip"
+
+
+def test_788_record_fixture_captures_timings_and_initial_payload_is_lightweight(tmp_path):
+    main.init_db()
+    job_id = "delta-788-performance-fixture"
+    package_id = "delta-788-performance-package"
+    package = tmp_path / "delta-788.pdf"
+    package.write_bytes(b"%PDF-delta-788")
+    cache_key = main.parser_cache_key(package, "delta")
+    pairings = sample_pairings(788)
+
+    with main.db() as conn:
+        conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+        conn.execute("DELETE FROM parse_cache WHERE cache_key=?", (cache_key,))
+        conn.execute(
+            """INSERT INTO jobs(id,filename,status,progress,message,airline,profile_json,uploads_json,package_id,state,current_stage,recoverable,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'),datetime('now'))""",
+            (
+                job_id,
+                "ATL320 AUG 2026.pdf",
+                "queued",
+                1,
+                "Upload received",
+                "delta",
+                "{}",
+                json.dumps([str(package)]),
+                package_id,
+                "queued",
+                "queued",
+                1,
+            ),
+        )
+    main.store_cached_pairings(cache_key, "delta", "delta_v1", pairings)
+
+    try:
+        main.process_job(job_id, [package], {}, "delta")
+        row = main.get_job(job_id)
+        performance = json.loads(row["performance_json"] or "{}")
+        assert row["status"] == "complete"
+        assert row["state"] == "completed"
+        assert performance["scoring_seconds"] >= 0
+        assert performance["summary_construction_seconds"] >= 0
+        assert performance["serialization_seconds"] >= 0
+        assert performance["processing_seconds"] >= performance["scoring_seconds"]
+        assert performance["time_to_first_usable_results_seconds"] >= performance["summary_construction_seconds"]
+        assert performance["summary_payload_bytes"] < performance["results_payload_bytes"]
+        assert performance["sqlite_payload_bytes"] >= performance["results_payload_bytes"]
+
+        with TestClient(main.app) as client:
+            response = client.get(
+                f"/api/jobs/{job_id}/recommendations",
+                params={"package_id": package_id, "limit": 50, "offset": 0},
+            )
+        body = response.json()
+        payload_size = len(json.dumps(body).encode("utf-8"))
+
+        assert response.status_code == 200
+        assert body["total_count"] == 788
+        assert body["limit"] == 50
+        assert len(body["results"]) == 50
+        assert payload_size < performance["results_payload_bytes"]
+        for record in body["results"]:
+            assert "ordered_events" not in record
+            assert "route_map_airports" not in record
+            assert "duty_days" not in record
+            assert "source_text" not in record
+            assert "source_page" not in record
+    finally:
+        with main.db() as conn:
+            conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+            conn.execute("DELETE FROM parse_cache WHERE cache_key=?", (cache_key,))

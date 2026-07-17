@@ -216,3 +216,120 @@ def test_classic_labs_and_demo_remain_isolated_on_the_shared_job_model():
     assert "demo:explicit" in classic
     assert "clearActiveAnalysis()" in classic
     assert "acceptPackageResponse(sessionJob)" in labs
+
+
+def test_reconnect_to_85_percent_job_preserves_elapsed_time_and_stage_truth():
+    job_id = "reconnect-85-test"
+    package_id = "reconnect-85-package"
+    with TestClient(main.app) as client:
+        with main.db() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO jobs(id,filename,status,progress,message,airline,profile_json,uploads_json,package_id,state,current_stage,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    job_id,
+                    "ATL320 AUG.pdf",
+                    "processing",
+                    85,
+                    "Building summaries: batch 2 of 8",
+                    "delta",
+                    "{}",
+                    "[]",
+                    package_id,
+                    "ranking",
+                    "building_recommendations",
+                    "2026-07-16T00:00:00",
+                    main.utc_now(),
+                ),
+            )
+        response = client.get(f"/api/jobs/{job_id}", params={"package_id": package_id}, headers=HEADERS)
+        with main.db() as conn:
+            conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["progress_percent"] == 85
+    assert body["stage"] == "building_recommendations"
+    assert body["stage_label"] == "Building recommendation data"
+    assert body["elapsed_seconds"] >= 60 * 60
+
+
+def test_reconnect_stage_and_elapsed_restore_logic_is_monotonic_in_classic_and_labs_clients():
+    classic = Path("app/static/app.js").read_text(encoding="utf-8")
+    labs = Path("app/static/labs.js").read_text(encoding="utf-8")
+
+    assert "current_stage: analysisState.current_stage || inferredStageFromProgress(lastConfirmedProgress)" in classic
+    assert "stage_label: analysisState.stage_label || analysisState.message || 'Building recommendation data'" in classic
+    assert "state: 'reconnecting'" in classic
+
+    assert "const incomingIndex = processingStageIndex.get(incomingStage) ?? -1;" in labs
+    assert "const previousIndex = processingStageIndex.get(previousStage) ?? -1;" in labs
+    assert "const stage = incomingIndex >= previousIndex ? incomingStage : previousStage;" in labs
+    assert "elapsed_seconds: Math.max(Number(body.elapsed_seconds || 0), elapsedSeconds(previous))" in labs
+    assert "elapsed_seconds: elapsedSeconds(previous)" in labs
+
+
+def test_startup_skips_cancelled_jobs_even_if_legacy_status_is_processing(monkeypatch, tmp_path):
+    cancelled_job = "startup-cancelled-job"
+    active_job = "startup-active-job"
+    cancelled_upload = tmp_path / "cancelled.pdf"
+    active_upload = tmp_path / "active.pdf"
+    cancelled_upload.write_bytes(b"%PDF-cancelled")
+    active_upload.write_bytes(b"%PDF-active")
+
+    with main.db() as conn:
+        conn.execute("DELETE FROM jobs WHERE id IN (?,?)", (cancelled_job, active_job))
+        conn.execute(
+            """INSERT INTO jobs(id,filename,status,progress,message,airline,profile_json,uploads_json,state,current_stage,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                cancelled_job,
+                "cancelled.pdf",
+                "processing",
+                44,
+                "Scoring recommendations: 4 of 20",
+                "delta",
+                "{}",
+                json.dumps([str(cancelled_upload)]),
+                "cancelled",
+                "cancelled",
+                "2026-07-16T00:00:00",
+                "2026-07-16T00:00:30",
+            ),
+        )
+        conn.execute(
+            """INSERT INTO jobs(id,filename,status,progress,message,airline,profile_json,uploads_json,state,current_stage,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                active_job,
+                "active.pdf",
+                "processing",
+                25,
+                "Extracting PDF page 2 of 4",
+                "delta",
+                "{}",
+                json.dumps([str(active_upload)]),
+                "parsing",
+                "extracting_text",
+                "2026-07-16T00:00:00",
+                "2026-07-16T00:00:30",
+            ),
+        )
+
+    started: list[str] = []
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            started.append(self.kwargs["args"][0])
+
+    monkeypatch.setattr(main.threading, "Thread", FakeThread)
+    main.startup()
+
+    assert active_job in started
+    assert cancelled_job not in started
+
+    with main.db() as conn:
+        conn.execute("DELETE FROM jobs WHERE id IN (?,?)", (cancelled_job, active_job))

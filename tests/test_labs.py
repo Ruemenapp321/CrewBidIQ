@@ -1,6 +1,7 @@
 import io
 import json
 import zipfile
+from pathlib import Path
 
 import fitz
 
@@ -183,6 +184,17 @@ def test_labs_replacement_clears_stale_recommendations_and_guards_duplicate_taps
     assert "navbluePlan = null" in script
     assert "if (labsUploadBusy) return" in script
     assert "button.disabled = busy" in script
+
+
+def test_browser_quota_failures_are_handled_as_optional_state_in_classic_and_labs():
+    classic = Path("app/static/app.js").read_text(encoding="utf-8")
+    labs = Path("app/static/labs.js").read_text(encoding="utf-8")
+    for script in (classic, labs):
+        assert "function isQuotaExceededError(error)" in script
+        assert "error.name === 'QuotaExceededError'" in script
+        assert "Optional browser state was not saved due to storage quota limits" in script
+        assert "return false;" in script
+        assert "throw error;" in script
 
 
 def test_labs_filename_progress_errors_and_post_parse_actions_are_explicit():
