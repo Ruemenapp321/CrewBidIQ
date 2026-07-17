@@ -123,6 +123,18 @@ def build_bid_report(results: list[dict[str, Any]], profile: dict[str, Any], air
         fatigue = item.get("fatigue_index") or {}
         hold = item.get("hold_outlook") or {}
         row_values = _pay_rows(item, item_airline) + [["Trip length", f"{item.get('trip_length')} days" if item.get("trip_length") else "N/A"], ["Route", model.get("simplified_route") or "Not available"], ["Operating cities", ", ".join(model.get("operating_cities", [])) or "Not available"], ["TAFB", item.get("tafb")], ["Layovers", ", ".join(x.get("city", "") for x in item.get("layovers", [])) or "None"], ["Equipment", equipment], ["Legs by duty day", " • ".join(map(str, item.get("duty_legs", []))) or "—"], ["WOCL departures", wocl_legs], ["Fatigue Index", f"{fatigue.get('level')} ({fatigue.get('confidence')} confidence)" if fatigue else "Insufficient Data"], ["Fatigue factors", "; ".join(fatigue.get("contributing_factors", [])) or "None identified"], ["Fatigue mitigations", "; ".join(fatigue.get("mitigating_factors", [])) or "None identified"], ["Hold outlook", f"{hold.get('outlook')} ({hold.get('confidence')} confidence) — {hold.get('estimate_basis')}" if hold else "Insufficient data"], ["Operating dates", ", ".join(item.get("operating_dates", [])) or "Not available"], ["Why it qualified", "; ".join(item.get("qualification_reasons", [])) or ("Near Match only" if item.get("eligible") is False else "No hard requirement was violated")], ["Matched preferences", "; ".join(item.get("matched_preferences", [])) or "None"], ["Compromises", "; ".join(item.get("compromises", [])) or "None"], ["Requirements not met", "; ".join(item.get("eligibility_violations", [])) or "None"], ["Trip facts", "; ".join(item.get("neutral_attributes", [])) or "Not available"]]
+        row_values = [row for row in row_values if row[0] != "Hold outlook"]
+        row_values.extend([
+            ["Fatigue missing data", fatigue.get("missing_data_warning") or "None"],
+            ["Desirability", hold.get("desirability") or "Insufficient Data"],
+            [
+                "Likelihood of Holding",
+                f"{hold.get('likelihood') or hold.get('outlook')} ({hold.get('confidence')} confidence) - {hold.get('estimate_basis')}"
+                if hold else "Insufficient Data",
+            ],
+            ["Holding factors", "; ".join(hold.get("factors") or hold.get("evidence") or []) or "None identified"],
+            ["Holding missing data", hold.get("missing_data_warning") or "None"],
+        ])
         if not item.get("operating_dates"):
             row_values = [row for row in row_values if row[0] != "Operating dates"]
         rows = [[_cell(label, styles["Small"]), _cell(value, styles["Small"])] for label, value in row_values]
@@ -131,6 +143,6 @@ def build_bid_report(results: list[dict[str, Any]], profile: dict[str, Any], air
         story += [table, Spacer(1, 12), Paragraph(item_terminology.view_original, styles["Heading2"]), Preformatted(item.get("original_display") or "Not available", styles["Raw"])]
 
     pay_definition = "Southwest TFP means Trips for Pay; Line TFP, carry-out TFP, and efficiency remain distinct. " if airline == "southwest" else ("Delta Total Pay is Trip Credit plus confidently parsed EDP, HOL, and SIT; absent components are not assumed to be zero. " if airline == "delta" else "")
-    story += [PageBreak(), Paragraph("Definitions", styles["Heading1"]), Paragraph(f"{pay_definition}Layover: an overnight or contractual rest location, not every airport operated through. Duty legs: working flight segments within each duty period. TAFB: total time away from base. Redeye: a parsed flight leg departing during the Window of Circadian Low (WOCL), 02:00 through 05:59 local departure time. Fatigue Index: a schedule-based planning signal that is separate from FAR 117 legality. Hold Outlook: an inventory-based category, not an award probability, unless validated historical award data is explicitly available. Match labels summarize eligibility and preference fit for each {terminology.singular.lower()}.", styles["BodyText"])]
+    story += [PageBreak(), Paragraph("Definitions", styles["Heading1"]), Paragraph(f"{pay_definition}Layover: an overnight or contractual rest location, not every airport operated through. Duty legs: working flight segments within each duty period. TAFB: total time away from base. Redeye: a parsed flight leg departing during the Window of Circadian Low (WOCL), 02:00 through 05:59 local departure time. Fatigue Index: a schedule-based planning signal that is separate from FAR legality. Likelihood of Holding: an inventory-based category, not an award probability, unless validated historical award data is explicitly available. Desirability is a separate preference-based assessment. Match labels summarize eligibility and preference fit for each {terminology.singular.lower()}.", styles["BodyText"])]
     doc.build(story)
     return out.getvalue()

@@ -287,7 +287,7 @@ function recommendationCards(results) {
     return `<article class="labs-recommendation">
       <div class="labs-rank">${index + 1}</div>
       <div><span>${escapeHtml(item.display_label || 'Trip')} ${escapeHtml(item.pairing)}</span><h3>${escapeHtml(layovers)}</h3><p>${reasons.length ? reasons.map(escapeHtml).join(' · ') : 'No hard requirement was violated.'}</p></div>
-      <div class="labs-recommendation-metrics"><strong>${escapeHtml(matchLabel(item))}</strong><span>${escapeHtml(pay.value || 'N/A')} ${escapeHtml(pay.label)}</span>${item.hold_outlook ? `<span>${escapeHtml(item.hold_outlook.outlook)} hold outlook</span>` : ''}</div>
+      <div class="labs-recommendation-metrics"><strong>${escapeHtml(matchLabel(item))}</strong><span>${escapeHtml(pay.value || 'N/A')} ${escapeHtml(pay.label)}</span>${item.hold_outlook ? `<span>${escapeHtml(item.hold_outlook.likelihood || item.hold_outlook.outlook)} likelihood of holding</span>` : ''}</div>
     </article>`;
   }).join('');
 }
