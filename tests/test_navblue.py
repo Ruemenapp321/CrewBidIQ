@@ -8,8 +8,8 @@ from app.navblue import build_navblue_layers
 
 def test_navblue_plan_builds_ordered_actual_requests():
     results = [
-        {"cities": ["HNL"], "duty_legs": [1, 2, 1]},
-        {"cities": ["DFW"], "duty_legs": [2, 1]},
+        {"cities": ["HNL"], "duty_legs": [1, 2, 1], "eligible": True},
+        {"cities": ["DFW"], "duty_legs": [2, 1], "eligible": True},
     ]
     plan = build_navblue_layers({
         "required_days_off": ["8/11"],
@@ -37,7 +37,7 @@ def test_navblue_plan_builds_ordered_actual_requests():
 def test_navblue_endpoint_uses_same_completed_classic_job(monkeypatch):
     monkeypatch.setenv("LABS_ENABLED", "true")
     job_id = "navblue-shared-job"
-    results = [{"cities": ["HNL"], "duty_legs": [1, 1], "pairing": "1001"}]
+    results = [{"cities": ["HNL"], "duty_legs": [1, 1], "pairing": "1001", "eligible": True}]
     with TestClient(app) as client:
         with db() as conn:
             conn.execute(
@@ -55,7 +55,7 @@ def test_navblue_endpoint_uses_same_completed_classic_job(monkeypatch):
 def test_navblue_length_counts_elapsed_trip_days_not_duty_periods():
     plan = build_navblue_layers(
         {"preferred_trip_lengths": ["4"]},
-        [{"trip_length": 4, "duty_legs": [3, 2, 3]}],
+        [{"trip_length": 4, "duty_legs": [3, 2, 3], "eligible": True}],
         "ATL320 AUG.pdf",
     )
     length_request = next(
@@ -70,7 +70,7 @@ def test_navblue_length_counts_elapsed_trip_days_not_duty_periods():
 def test_navblue_checklist_includes_entry_fields_order_and_manual_submission_warning():
     plan = build_navblue_layers(
         {"airline": "delta", "trip_length_priority": ["4", "3"], "must_avoid_redeye": True},
-        [{"trip_length": 4, "redeye": "none", "cities": []}],
+        [{"trip_length": 4, "redeye": "none", "cities": [], "eligible": True}],
         "ATL AUG 2026.pdf",
     )
     requests = [request for layer in plan["layers"] for request in layer["requests"]]
@@ -84,7 +84,7 @@ def test_navblue_checklist_includes_entry_fields_order_and_manual_submission_war
 def test_navblue_ordered_trip_lengths_remain_in_user_order():
     plan = build_navblue_layers(
         {"trip_length_priority": ["6+", "5", "4", "3", "2", "1"]},
-        [{"trip_length": 6, "cities": []}, {"trip_length": 5, "cities": []}],
+        [{"trip_length": 6, "cities": [], "eligible": True}, {"trip_length": 5, "cities": [], "eligible": True}],
     )
     length_requests = [
         request["values"][0]
@@ -93,3 +93,20 @@ def test_navblue_ordered_trip_lengths_remain_in_user_order():
         if "Pairing Length" in request["request"]
     ]
     assert length_requests == ["6+", "5", "4", "3", "2", "1"]
+
+
+def test_navblue_counts_only_stage_one_eligible_results():
+    plan = build_navblue_layers(
+        {"elite_cities": ["HNL"]},
+        [
+            {"cities": ["HNL"], "layovers": [{"city": "HNL"}], "eligible": True},
+            {"cities": ["HNL"], "layovers": [{"city": "HNL"}], "eligible": False, "match_class": "near", "eligibility_violations": ["hard failure"]},
+        ],
+    )
+    request = next(
+        request
+        for layer in plan["layers"]
+        for request in layer["requests"]
+        if "Layover In HNL" in request["request"]
+    )
+    assert request["matching_trip_count"] == 1

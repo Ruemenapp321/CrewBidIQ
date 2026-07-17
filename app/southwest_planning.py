@@ -87,7 +87,16 @@ def rank_southwest_line(line: dict[str, Any], members: list[dict[str, Any]], pro
     ]
     return {
         "score": score,
+        "ranking_score": score if not violations else None,
+        "ranking_stage": "ranked_eligible" if not violations else "not_ranked_hard_failure",
         "line_score_components": components,
+        "ranking_components": {
+            **components,
+            "user_priority_order": profile.get("priority_order") or [],
+            "fatigue": None,
+            "commute": None,
+            "seniority_or_holding": None,
+        } if not violations else {},
         "work_dates": work_dates,
         "off_dates": off_dates,
         "weekends_off": line.get("weekends_off"),
@@ -98,13 +107,23 @@ def rank_southwest_line(line: dict[str, Any], members: list[dict[str, Any]], pro
         "nights_at_home": nights_home,
         "eligible": not violations,
         "eligibility_result": "eligible" if not violations else "near_match_only",
+        "eligibility_stage": "passed" if not violations else "failed",
+        "hard_requirement_matches": [
+            "Does not work a required day off",
+            "All included pairing types passed hard eligibility",
+        ] if not violations else [],
         "eligibility_violations": violations,
         "relaxations_required": [f"Relax: {value}" for value in violations],
+        "qualification_reasons": [
+            "Does not work a required day off",
+            "All included pairing types passed hard eligibility",
+        ] if not violations else ["Shown only as a Near Match; it failed one or more hard requirements"],
         "matched_preferences": reasons,
         "compromises": [f"Works preferred day off {value}" for value in soft_conflicts],
         "neutral_attributes": [f"Contains {len(members)} pairing types", f"Contains {duty_periods} duty periods"],
         "match_class": match_class,
         "match_label": labels[match_class],
+        "near_match_distance": len(violations) if violations else None,
     }
 
 

@@ -246,11 +246,13 @@ function matchLabel(item) {
 function recommendationCards(results) {
   return results.slice(0, 8).map((item, index) => {
     const layovers = tripLayovers(item).map(layover => layover.airport || layover.city).join(', ') || 'No overnights';
-    const reasons = (item.matched_preferences || item.reasons || []).slice(0, 3);
+    const reasons = item.eligible === false
+      ? (item.eligibility_violations || []).map(value => `Hard failure: ${value}`).slice(0, 3)
+      : [...(item.qualification_reasons || ['No hard requirement was violated.']), ...(item.matched_preferences || [])].slice(0, 3);
     const pay = resultPay(item);
     return `<article class="labs-recommendation">
       <div class="labs-rank">${index + 1}</div>
-      <div><span>${escapeHtml(item.display_label || 'Trip')} ${escapeHtml(item.pairing)}</span><h3>${escapeHtml(layovers)}</h3><p>${reasons.length ? reasons.map(escapeHtml).join(' · ') : 'No strong preference signals were detected.'}</p></div>
+      <div><span>${escapeHtml(item.display_label || 'Trip')} ${escapeHtml(item.pairing)}</span><h3>${escapeHtml(layovers)}</h3><p>${reasons.length ? reasons.map(escapeHtml).join(' · ') : 'No hard requirement was violated.'}</p></div>
       <div class="labs-recommendation-metrics"><strong>${escapeHtml(matchLabel(item))}</strong><span>${escapeHtml(pay.value || 'N/A')} ${escapeHtml(pay.label)}</span>${item.hold_outlook ? `<span>${escapeHtml(item.hold_outlook.outlook)} hold outlook</span>` : ''}</div>
     </article>`;
   }).join('');
@@ -259,7 +261,7 @@ function recommendationCards(results) {
 function recommendationsPage() {
   const ready = sessionJob?.status === 'complete';
   const results = sessionJob?.results || [];
-  const eligible = results.filter(item => item.eligible !== false);
+  const eligible = results.filter(item => item.eligible === true);
   const near = results.filter(item => item.eligible === false);
   return `${pageHeader('REFINED RECOMMENDATIONS', 'See the trips worth your attention', 'A quieter review reranked from your current Classic preferences and saved Labs draft.')}
     ${packageCard()}

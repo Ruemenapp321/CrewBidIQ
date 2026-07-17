@@ -291,7 +291,7 @@ def test_four_day_sequence_survives_pdf_to_api_and_frontend_display(monkeypatch)
             }
             frontend = (Path(__file__).resolve().parents[1] / "app" / "static" / "app.js").read_text(encoding="utf-8")
             assert "item.trip_length ? `${item.trip_length} days`" in frontend
-            assert "allResults.filter(item => item.eligible !== false)" in frontend
+            assert "allResults.filter(item => item.eligible === true)" in frontend
             assert "trip_length <= 2" not in frontend
         finally:
             with db() as conn:

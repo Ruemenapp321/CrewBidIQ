@@ -33,7 +33,12 @@ from app.month_planner import build_month_plan
 from app.navblue import build_navblue_layers
 from app.pay import pay_minutes_per_duty_day, pay_priority_value, tfp_per_day_away, tfp_ratio
 from app.parsers import select_parser
-from app.recommendations import evaluate_recommendation, length_priority, length_score_contribution
+from app.recommendations import (
+    evaluate_recommendation,
+    length_priority,
+    length_score_contribution,
+    recommendation_pipeline,
+)
 from app.reporting import build_bid_report
 from app.seniority import build_seniority_context, estimate_hold_outlook
 from app.southwest_planning import optimize_schedule_conflicts, rank_southwest_line
@@ -190,6 +195,22 @@ def bind_pairings_to_package(pairings: list[dict[str, Any]], package_id: str) ->
     for original in pairings:
         pairing = dict(original)
         rotation = str(pairing.get("rotation_number") or pairing.get("id") or "").upper()
+        if "bidable_inventory_confirmed" not in pairing:
+            page_classification = str(pairing.get("page_classification") or "").upper()
+            source_context = " ".join(
+                str(pairing.get(key) or "")
+                for key in ("source_section", "fleet_section", "block")
+            )
+            instructional = page_classification in {
+                "COVER", "CONTENTS", "INSTRUCTIONS", "REFERENCE", "EXAMPLE", "HOTEL_LIST", "APPENDIX",
+            } or bool(re.search(
+                r"\b(?:EXAMPLE|SAMPLE|ILLUSTRATION|TRAINING EXAMPLE|NOT FOR BIDDING|FOR REFERENCE)\b",
+                source_context,
+                re.I,
+            ))
+            # Legacy caches predate explicit provenance. Normalize them once at
+            # this boundary, while failing closed on instructional context.
+            pairing["bidable_inventory_confirmed"] = not instructional
         pairing["package_id"] = package_id
         pairing["inventory_key"] = f"{package_id}:{rotation}"
         bound.append(attach_canonical_trip(pairing, package_id))
@@ -648,7 +669,10 @@ def consolidate_pairings(pairings: list[dict[str, Any]]) -> list[dict[str, Any]]
         pairing.setdefault("package_base", pairing.get("base"))
         pairing.setdefault("package_fleet", pairing.get("fleet"))
         pairing.setdefault("parser_confidence", pairing.get("confidence", 0.0))
-        pairing.setdefault("bidable_inventory_confirmed", True)
+        non_bidable_page = str(pairing.get("page_classification") or "").upper() in {
+            "COVER", "CONTENTS", "INSTRUCTIONS", "REFERENCE", "EXAMPLE", "HOTEL_LIST", "APPENDIX",
+        }
+        pairing.setdefault("bidable_inventory_confirmed", not non_bidable_page)
         if inventory_key not in candidates:
             order.append(inventory_key)
             candidates[inventory_key] = []
@@ -927,10 +951,9 @@ def pairing_trip_length(pairing: dict[str, Any]) -> int:
 
 
 def filter_pairings_for_profile(pairings: list[dict[str, Any]], profile: dict[str, Any]) -> list[dict[str, Any]]:
-    # Records from pre-provenance caches are normalized once at this boundary;
-    # explicit unconfirmed candidates can never enter recommendation input.
-    for pairing in pairings:
-        pairing.setdefault("bidable_inventory_confirmed", True)
+    # The normalization boundary must explicitly confirm inventory provenance.
+    # Missing and false values fail closed so instructional/example candidates
+    # can never enter the recommendation pipeline.
     pairings = [pairing for pairing in pairings if pairing.get("bidable_inventory_confirmed") is True]
     fleets = set(list_field(profile.get("bid_fleets")))
     if not fleets:
@@ -970,27 +993,9 @@ def build_bid_synopsis(pairings: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def sort_results(results: list[dict[str, Any]]) -> None:
-    def key(item: dict[str, Any]) -> tuple[Any, ...]:
-        complete = item.get("data_quality") != "incomplete"
-        eligible = bool(item.get("eligible", True))
-        match_order = {"exact": 3, "strong": 2, "partial": 1, "near": 0}
-        length_preference = bool(item.get("trip_length_preference_active"))
-        length_rank = item.get("length_priority_rank")
-        length_order = 0 if not length_preference else -(int(length_rank) if length_rank is not None else 10_000)
-        pay_preference = bool(item.get("pay_priority"))
-        pay_value = item.get("pay_priority_value")
-        return (
-            complete,
-            eligible,
-            length_order,
-            match_order.get(str(item.get("match_class")), 0),
-            pay_preference and pay_value is not None,
-            pay_value if pay_preference and pay_value is not None else float("-inf"),
-            item.get("score", 0),
-        )
-
-    results.sort(key=key, reverse=True)
+def sort_results(results: list[dict[str, Any]], active_package_id: str | None = None) -> None:
+    """Apply the explicit two-stage recommendation output order in place."""
+    results[:] = recommendation_pipeline(results, active_package_id)
 
 
 def match_level(score: float, conflicts: list[str]) -> str:
@@ -1343,10 +1348,10 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
         result["pay_explanation"] = f"{labels.get(preference, preference)}: {result.get(preference)}"
     else:
         result["pay_explanation"] = None
-    result.update(evaluate_recommendation(result, profile))
     result["fatigue_index"] = build_fatigue_index(result)
     result["seniority_context"] = build_seniority_context(profile.get("seniority_context"))
     result["hold_outlook"] = estimate_hold_outlook(result, result["seniority_context"])
+    result.update(evaluate_recommendation(result, profile))
     if os.environ.get("RECOMMENDATION_DEBUG_ENABLED", "false").lower() == "true":
         result["recommendation_debug"] = {
             "parser": result.get("parser"),
@@ -1354,6 +1359,10 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
             "normalization": pairing.get("normalization_diagnostics"),
             "eligibility_result": result.get("eligibility_result"),
             "eligibility_violations": result.get("eligibility_violations"),
+            "eligibility_stage": result.get("eligibility_stage"),
+            "ranking_stage": result.get("ranking_stage"),
+            "ranking_score": result.get("ranking_score"),
+            "ranking_components": result.get("ranking_components"),
             "trip_length": trip_length,
             "trip_length_priority": ranked_lengths,
             "length_priority_rank": length_rank,
@@ -1615,7 +1624,9 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
                 pairings_text = extract_text(paths[0], paths[0].suffix.lower(), job_id, deadline=deadline)
                 lines_text = extract_text(paths[1], paths[1].suffix.lower(), job_id, deadline=deadline)
             pairings, parser_name = parse_pairings(pairings_text, job_id, "southwest")
-            pairings = bind_pairings_to_package(pairings, package_id)
+            pairings = filter_pairings_for_profile(bind_pairings_to_package(pairings, package_id), {})
+            if not pairings:
+                raise RuntimeError("No confirmed bidable Southwest pairings were available for recommendation input.")
             update_job(job_id, progress=72, message=f"Matching {len(pairings)} pairings to offered lines")
             scored_pairings = {p["id"]: score_pairing(p, profile) for p in pairings}
             lines = parse_southwest_lines(lines_text, set(scored_pairings))
@@ -1660,7 +1671,7 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
             update_job(job_id, progress=75, message=f"Scoring {len(eligible_pairings)} pairings")
             results = [score_pairing(pairing, profile) for pairing in eligible_pairings]
             item_label = "pairings"
-        sort_results(results)
+        sort_results(results, package_id)
         package_records(results, package_id)
         synopsis = build_bid_synopsis(pairings)
         diagnostics = {
@@ -1673,6 +1684,8 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
             "accepted_inventory_count": len(filter_pairings_for_profile(pairings, {})),
             "recommendation_input_count": len(eligible_pairings) if airline != "southwest" else len(lines),
             "recommendation_output_count": len(results),
+            "eligible_recommendation_count": sum(result.get("eligible") is True for result in results),
+            "near_match_count": sum(result.get("eligible") is not True for result in results),
             "result_package_ids": [result.get("package_id") for result in results],
         }
         source = (
@@ -1885,6 +1898,9 @@ def rescore_job(job_id: str, profile_json: str = Form(...), package_id: str | No
     if source.get("cache_key") and not pairings:
         raise HTTPException(409, "The parsed bid-package cache is unavailable. Upload this bid package one more time.")
     if source.get("kind") == "southwest":
+        pairings = filter_pairings_for_profile(pairings, {})
+        if not pairings:
+            raise HTTPException(409, "No confirmed bidable Southwest pairings are available. Upload the package again.")
         scored_pairings = {pairing["id"]: score_pairing(pairing, profile) for pairing in pairings}
         lines = [{**line, "package_id": active_package_id} for line in source.get("lines") or []]
         results = [score_southwest_line(line, scored_pairings, profile) for line in lines]
@@ -1893,7 +1909,7 @@ def rescore_job(job_id: str, profile_json: str = Form(...), package_id: str | No
         if profile.get("bid_fleets") and not eligible_pairings:
             raise HTTPException(400, "No pairings matched the selected bid fleet. Check the fleet code.")
         results = [score_pairing(pairing, profile) for pairing in eligible_pairings]
-    sort_results(results)
+    sort_results(results, active_package_id)
     package_records(results, active_package_id)
     update_job(job_id, results_json=json.dumps(results), profile_json=json.dumps(profile), message=f"Preferences updated: {len(results)} recommendations reranked")
     synopsis = source.get("synopsis") or build_bid_synopsis(pairings)

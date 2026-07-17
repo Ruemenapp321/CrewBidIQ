@@ -28,6 +28,7 @@ def pairing(pairing_id="4461", start="JFK", fleet="320", date="2026-08-11"):
         "credit": "10:00",
         "tafb": "28:00",
         "confidence": 1.0,
+        "bidable_inventory_confirmed": True,
         "legs": [
             {"day": "A", "departure": start, "departure_time": "0830", "arrival": "BOS", "arrival_time": "1030", "deadhead": False},
             {"day": "B", "departure": "BOS", "departure_time": "1700", "arrival": start, "arrival_time": "1900", "deadhead": False},

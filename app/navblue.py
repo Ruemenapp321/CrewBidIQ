@@ -86,6 +86,7 @@ def build_navblue_layers(
     filename: str = "",
 ) -> dict[str, Any]:
     """Build a pilot-reviewable NavBlue PBS request order from CrewBidIQ preferences."""
+    results = [item for item in results if item.get("eligible") is True]
     airline = str(profile.get("airline") or "").lower()
     layers: list[dict[str, Any]] = []
     layers.append({"number": 1, "title": "Start Pairing Group", "requests": []})

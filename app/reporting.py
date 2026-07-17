@@ -90,12 +90,14 @@ def build_bid_report(results: list[dict[str, Any]], profile: dict[str, Any], air
     else:
         story.append(Paragraph("No preferences were supplied.", styles["BodyText"]))
 
-    eligible_results = [item for item in results if item.get("eligible", True)]
+    eligible_results = [item for item in results if item.get("eligible") is True]
     near_results = [item for item in results if item.get("eligible") is False]
     story += [PageBreak(), Paragraph(terminology.recommended, styles["Heading1"])]
     for index, item in enumerate(eligible_results[:10], 1):
         rating = _match_label(item)
-        story += [Paragraph(f"{index}. {item.get('display_label', terminology.singular)} {item.get('pairing')} — {rating}", styles["Heading2"]), Paragraph("; ".join(item.get("reasons") or ["No strong preference signals were detected."]), styles["BodyText"]), Spacer(1, 8)]
+        explanation = list(item.get("qualification_reasons") or ["No hard requirement was violated."])
+        explanation.extend(item.get("matched_preferences") or [])
+        story += [Paragraph(f"{index}. {item.get('display_label', terminology.singular)} {item.get('pairing')} — {rating}", styles["Heading2"]), Paragraph("; ".join(dict.fromkeys(explanation)), styles["BodyText"]), Spacer(1, 8)]
     if near_results:
         story += [Spacer(1, 12), Paragraph("Near Matches", styles["Heading1"]), Paragraph("These options miss at least one hard requirement and are not part of the eligible recommendation list.", styles["BodyText"])]
         for index, item in enumerate(near_results[:5], 1):
@@ -120,7 +122,7 @@ def build_bid_report(results: list[dict[str, Any]], profile: dict[str, Any], air
         item_airline = item.get("airline") or airline
         fatigue = item.get("fatigue_index") or {}
         hold = item.get("hold_outlook") or {}
-        row_values = _pay_rows(item, item_airline) + [["Trip length", f"{item.get('trip_length')} days" if item.get("trip_length") else "N/A"], ["TAFB", item.get("tafb")], ["Layovers", ", ".join(x.get("city", "") for x in item.get("layovers", [])) or "None"], ["Equipment", equipment], ["Legs by duty day", " • ".join(map(str, item.get("duty_legs", []))) or "—"], ["WOCL departures", wocl_legs], ["Fatigue Index", f"{fatigue.get('level')} ({fatigue.get('confidence')} confidence)" if fatigue else "Insufficient Data"], ["Fatigue factors", "; ".join(fatigue.get("contributing_factors", [])) or "None identified"], ["Fatigue mitigations", "; ".join(fatigue.get("mitigating_factors", [])) or "None identified"], ["Hold outlook", f"{hold.get('outlook')} ({hold.get('confidence')} confidence) — {hold.get('estimate_basis')}" if hold else "Insufficient data"], ["Operating dates", ", ".join(item.get("operating_dates", [])) or "Not available"], ["Matched preferences", "; ".join(item.get("matched_preferences", [])) or "; ".join(item.get("reasons", [])) or "No weighted signals"], ["Compromises", "; ".join(item.get("compromises", [])) or "None"], ["Requirements not met", "; ".join(item.get("eligibility_violations", [])) or "None"], ["Trip facts", "; ".join(item.get("neutral_attributes", [])) or "Not available"]]
+        row_values = _pay_rows(item, item_airline) + [["Trip length", f"{item.get('trip_length')} days" if item.get("trip_length") else "N/A"], ["TAFB", item.get("tafb")], ["Layovers", ", ".join(x.get("city", "") for x in item.get("layovers", [])) or "None"], ["Equipment", equipment], ["Legs by duty day", " • ".join(map(str, item.get("duty_legs", []))) or "—"], ["WOCL departures", wocl_legs], ["Fatigue Index", f"{fatigue.get('level')} ({fatigue.get('confidence')} confidence)" if fatigue else "Insufficient Data"], ["Fatigue factors", "; ".join(fatigue.get("contributing_factors", [])) or "None identified"], ["Fatigue mitigations", "; ".join(fatigue.get("mitigating_factors", [])) or "None identified"], ["Hold outlook", f"{hold.get('outlook')} ({hold.get('confidence')} confidence) — {hold.get('estimate_basis')}" if hold else "Insufficient data"], ["Operating dates", ", ".join(item.get("operating_dates", [])) or "Not available"], ["Why it qualified", "; ".join(item.get("qualification_reasons", [])) or ("Near Match only" if item.get("eligible") is False else "No hard requirement was violated")], ["Matched preferences", "; ".join(item.get("matched_preferences", [])) or "None"], ["Compromises", "; ".join(item.get("compromises", [])) or "None"], ["Requirements not met", "; ".join(item.get("eligibility_violations", [])) or "None"], ["Trip facts", "; ".join(item.get("neutral_attributes", [])) or "Not available"]]
         if not item.get("operating_dates"):
             row_values = [row for row in row_values if row[0] != "Operating dates"]
         rows = [[_cell(label, styles["Small"]), _cell(value, styles["Small"])] for label, value in row_values]

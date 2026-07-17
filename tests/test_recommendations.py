@@ -1,4 +1,13 @@
-from app.recommendations import evaluate_recommendation, length_rule_matches, matching_length_rank
+import pytest
+
+from app.recommendations import (
+    evaluate_eligibility,
+    evaluate_recommendation,
+    length_rule_matches,
+    matching_length_rank,
+    rank_eligible_recommendations,
+    recommendation_pipeline,
+)
 from app.main import sort_results
 
 
@@ -63,3 +72,111 @@ def test_strongly_avoided_destination_is_a_hard_violation():
     })
     assert evaluated["eligible"] is False
     assert evaluated["eligibility_violations"] == ["Includes strongly avoided destination HAWAII"]
+
+
+def test_stage_one_collects_every_hard_failure_and_stage_two_is_skipped():
+    candidate = result(length=2, city="HNL", redeye="WOCL departure")
+    candidate["deadheads"] = 2
+    profile = {
+        "required_trip_lengths": ["4"],
+        "required_destination_groups": ["EUROPE"],
+        "must_avoid_redeye": True,
+        "hard_max_deadheads": 0,
+    }
+    evaluated = evaluate_recommendation(candidate, profile)
+    assert evaluated["eligibility_stage"] == "failed"
+    assert evaluated["ranking_stage"] == "not_ranked_hard_failure"
+    assert evaluated["ranking_score"] is None
+    assert evaluated["match_label"] == "Near Match"
+    assert evaluated["eligibility_violations"] == [
+        "Requires 4 days; this trip is 2 days",
+        "Missing required destination group EUROPE",
+        "Contains a WOCL departure, which you marked Must avoid",
+        "Has 2 deadheads; hard maximum is 0",
+    ]
+
+
+def test_exact_match_has_passed_every_hard_requirement():
+    profile = {
+        "required_trip_lengths": ["4"],
+        "required_destination_groups": ["HAWAII"],
+        "must_avoid_redeye": True,
+        "hard_max_deadheads": 0,
+    }
+    evaluated = evaluate_recommendation(result(), profile)
+    assert evaluated["match_label"] == "Exact Match"
+    assert evaluated["eligible"] is True
+    assert evaluated["eligibility_violations"] == []
+    assert len(evaluated["hard_requirement_matches"]) == 4
+    assert evaluated["ranking_stage"] == "ranked_eligible"
+
+
+def test_stage_two_rejects_ineligible_input_even_with_a_large_score():
+    with pytest.raises(ValueError, match="eligible trips only"):
+        rank_eligible_recommendations([
+            {"pairing": "NEAR", "eligible": False, "score": 99999, "eligibility_violations": ["hard failure"]}
+        ])
+
+
+def test_no_exact_match_returns_closest_near_matches_by_complete_failure_distance():
+    profile = {"required_trip_lengths": ["4"], "required_destination_groups": ["EUROPE"]}
+    one_failure = {"pairing": "ONE", "package_id": "pkg", **result(length=4, city="HNL")}
+    two_failures = {"pairing": "TWO", "package_id": "pkg", **result(length=2, city="HNL")}
+    evaluated = [evaluate_recommendation(two_failures, profile), evaluate_recommendation(one_failure, profile)]
+    for source, output in zip((two_failures, one_failure), evaluated):
+        output.update({"pairing": source["pairing"], "package_id": source["package_id"]})
+    ordered = recommendation_pipeline(evaluated, "pkg")
+    assert not any(item["eligible"] for item in ordered)
+    assert [item["pairing"] for item in ordered] == ["ONE", "TWO"]
+    assert [len(item["eligibility_violations"]) for item in ordered] == [1, 2]
+
+
+def test_explicit_preference_rules_support_all_four_levels():
+    candidate = result(length=4, city="HNL")
+    profile = {
+        "preference_rules": [
+            {"criterion": "trip_length", "value": "4", "level": "Must have"},
+            {"criterion": "destination", "value": "HAWAII", "level": "Prefer"},
+            {"criterion": "redeye", "level": "Avoid"},
+            {"criterion": "deadheads", "level": "Must avoid"},
+        ]
+    }
+    evaluated = evaluate_recommendation(candidate, profile)
+    assert evaluated["eligible"] is True
+    assert evaluated["preference_classes"] == {
+        "must_have": ["trip_length"],
+        "prefer": ["destination"],
+        "avoid": ["redeye"],
+        "must_avoid": ["deadheads"],
+    }
+    assert evaluated["match_label"] == "Exact Match"
+
+
+def test_recommendation_pipeline_rejects_mixed_packages():
+    with pytest.raises(ValueError, match="another bid package"):
+        recommendation_pipeline([
+            {"pairing": "A", "package_id": "package-a", "eligible": True, "match_class": "exact"}
+        ], "package-b")
+
+
+def test_instructional_example_is_a_hard_integrity_failure():
+    candidate = result()
+    candidate.update({"page_classification": "EXAMPLE", "bidable_inventory_confirmed": False})
+    evaluated = evaluate_recommendation(candidate, {})
+    assert evaluated["eligible"] is False
+    assert evaluated["ranking_stage"] == "not_ranked_hard_failure"
+    assert evaluated["eligibility_violations"] == [
+        "Source record is not confirmed bidable inventory",
+        "Source record is instructional or example material, not bidable inventory",
+    ]
+
+
+def test_explanations_do_not_use_unsupported_generic_language():
+    evaluated = evaluate_recommendation(result(), {"required_trip_lengths": ["4"], "elite_cities": ["HAWAII"]})
+    explanation = " ".join(
+        value
+        for section in ("qualification_reasons", "matched_preferences", "compromises", "neutral_attributes", "eligibility_violations")
+        for value in evaluated[section]
+    )
+    for phrase in ("Good quality of life", "Competitive", "Great connection coverage", "Strong trip", "Heavy recovery"):
+        assert phrase not in explanation

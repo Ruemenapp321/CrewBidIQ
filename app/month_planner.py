@@ -51,7 +51,7 @@ def _pool(name: str, items: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def build_month_plan(intent: dict[str, Any], results: list[dict[str, Any]]) -> dict[str, Any]:
-    eligible = [item for item in results if item.get("eligible", True)]
+    eligible = [item for item in results if item.get("eligible") is True]
     primary_items = [item for item in eligible if item.get("match_class") == "exact"]
     secondary_items = [item for item in eligible if item.get("match_class") == "strong"]
     fallback_items = [item for item in eligible if item.get("match_class") not in {"exact", "strong"}]
