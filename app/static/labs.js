@@ -2,6 +2,7 @@ const labsContent = document.getElementById('labsContent');
 const labsPage = window.CREWBIDIQ_LABS_PAGE || 'landing';
 const latestJobKey = 'crewbidiqLatestJob';
 const activeJobKey = 'crewbidiqActiveJob';
+const activePackageKey = 'crewbidiqActivePackage';
 const draftKey = 'crewbidiqLabsDraft';
 let sessionJob = null;
 let sessionLoading = true;
@@ -20,6 +21,25 @@ let refinedRecommendationsSignature = '';
 let tripIntentResult = null;
 let tripIntentLoading = false;
 let tripIntentError = '';
+
+const packageStateKeys = ['crewbidiqShortlist', 'crewbidiqComparison', 'crewbidiqPbsPool', 'crewbidiqCommuteAssessments', 'crewbidiqExports'];
+function activePackageId() { return localStorage.getItem(activePackageKey); }
+function invalidatePackageState(nextPackageId) {
+  packageStateKeys.forEach(key => localStorage.removeItem(key));
+  const draft = readJson(draftKey, {}) || {};
+  ['fixedEvents', 'swCarryOutDates', 'swVacationDates', 'swTrainingDates', 'swAbsenceDates', 'swOtherDates'].forEach(key => delete draft[key]);
+  localStorage.setItem(draftKey, JSON.stringify({ ...draft, package_id: nextPackageId }));
+  navbluePlan = null; navbluePlanJob = null; navbluePlanError = '';
+  monthPlan = null; monthPlanJob = null; monthPlanError = '';
+  refinedRecommendationsSignature = '';
+}
+function acceptPackageResponse(body) {
+  const expected = activePackageId();
+  const incoming = body?.package_id || body?.package?.package_id;
+  if (!incoming || (expected && incoming !== expected)) throw new Error('Results from a replaced bid package were rejected.');
+  if ((body.results || []).some(item => item.package_id !== incoming)) throw new Error('Mixed-package results were rejected.');
+  return incoming;
+}
 
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, character => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -461,12 +481,12 @@ async function submitLabsPackage(replaceConfirmed = false) {
     let body = {}; try { body = responseText ? JSON.parse(responseText) : {}; } catch (_) {}
     if (!response.ok) throw new Error(body.detail || `Upload failed (${response.status})`);
     if (!body.job_id) throw new Error('Upload finished, but the parsing job was not created.');
+    invalidatePackageState(body.package_id);
+    localStorage.setItem(activePackageKey, body.package_id);
     localStorage.setItem(activeJobKey, body.job_id);
     localStorage.removeItem(latestJobKey);
     sessionJob = { ...body, status: 'queued', progress: 1, stage: 'detecting_package', stage_label: 'Detecting airline and package type', message: 'Upload received' };
     sessionLoading = false;
-    navbluePlan = null; navbluePlanJob = null; navbluePlanError = '';
-    monthPlan = null; monthPlanJob = null; monthPlanError = '';
     labsUploadBusy = false; labsUploadController = null; labsUploadError = '';
     render();
     loadSharedSession();
@@ -573,7 +593,8 @@ function bindBuilder() {
 
 async function loadRefinedRecommendations(jobId) {
   const profile = mergedLabsProfile();
-  const signature = `${jobId}:${JSON.stringify(profile)}`;
+  const packageId = activePackageId();
+  const signature = `${jobId}:${packageId}:${JSON.stringify(profile)}`;
   if (!jobId || refinedRecommendationsLoading || refinedRecommendationsSignature === signature) return;
   refinedRecommendationsLoading = true;
   refinedRecommendationsError = '';
@@ -581,9 +602,11 @@ async function loadRefinedRecommendations(jobId) {
   try {
     const data = new FormData();
     data.append('profile_json', JSON.stringify(profile));
+    data.append('package_id', packageId || '');
     const response = await fetch(`/api/jobs/${jobId}/rescore`, { method: 'POST', body: data, headers: { Accept: 'application/json' } });
     const body = await response.json();
     if (!response.ok) throw new Error(body.detail || 'Could not apply the saved trip preferences');
+    acceptPackageResponse(body);
     sessionJob = { ...sessionJob, results: body.results || [], synopsis: body.synopsis || sessionJob.synopsis };
     refinedRecommendationsSignature = signature;
   } catch (error) {
@@ -604,10 +627,11 @@ async function loadNavbluePlan(jobId) {
     const response = await fetch(`/api/jobs/${jobId}/navblue-plan`, {
       method: 'POST',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-      body: JSON.stringify(mergedLabsProfile())
+      body: JSON.stringify({ ...mergedLabsProfile(), package_id: activePackageId() })
     });
     const body = await response.json();
     if (!response.ok) throw new Error(body.detail || 'Could not build the NavBlue request plan');
+    acceptPackageResponse(body);
     navbluePlan = body;
   } catch (error) {
     navbluePlanError = error.message || 'Could not build the NavBlue request plan';
@@ -625,10 +649,11 @@ async function loadMonthPlan(jobId) {
     const response = await fetch(`/api/jobs/${jobId}/month-plan`, {
       method: 'POST',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-      body: JSON.stringify(mergedLabsProfile())
+      body: JSON.stringify({ ...mergedLabsProfile(), package_id: activePackageId() })
     });
     const body = await response.json();
     if (!response.ok) throw new Error(body.detail || 'Could not build the month plan');
+    acceptPackageResponse(body);
     monthPlan = body;
   } catch (error) {
     monthPlanError = error.message || 'Could not build the month plan';
@@ -643,6 +668,8 @@ async function loadSharedSession() {
     const response = await fetch(`/api/jobs/${jobId}`, { headers: { Accept: 'application/json' } });
     if (!response.ok) throw new Error('Stored analysis is unavailable');
     sessionJob = await response.json();
+    const incomingPackageId = acceptPackageResponse(sessionJob);
+    if (!activePackageId()) localStorage.setItem(activePackageKey, incomingPackageId);
     if (sessionJob.status === 'complete') {
       localStorage.setItem(latestJobKey, jobId);
       localStorage.removeItem(activeJobKey);
@@ -654,6 +681,7 @@ async function loadSharedSession() {
     if (sessionJob.status === 'queued' || sessionJob.status === 'processing') setTimeout(loadSharedSession, 2000);
   } catch (_) {
     if (localStorage.getItem(latestJobKey) === jobId) localStorage.removeItem(latestJobKey);
+    localStorage.removeItem(activePackageKey);
     sessionJob = null;
     sessionLoading = false;
     render();

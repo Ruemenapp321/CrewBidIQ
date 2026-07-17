@@ -82,6 +82,7 @@ def init_db() -> None:
                 profile_json TEXT,
                 uploads_json TEXT,
                 source_json TEXT,
+                package_id TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
@@ -97,7 +98,7 @@ def init_db() -> None:
             """
         )
         columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
-        for name in ("airline", "profile_json", "uploads_json", "source_json"):
+        for name in ("airline", "profile_json", "uploads_json", "source_json", "package_id"):
             if name not in columns:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} TEXT")
 
@@ -174,6 +175,40 @@ def source_pairings(source: dict[str, Any]) -> list[dict[str, Any]]:
     cache_key = source.get("cache_key")
     cached = load_cached_pairings(cache_key) if cache_key else None
     return cached[0] if cached else []
+
+
+def row_package_id(row: sqlite3.Row) -> str:
+    """Return the upload identity, with job id as the legacy migration identity."""
+    return str(row["package_id"] or row["id"])
+
+
+def bind_pairings_to_package(pairings: list[dict[str, Any]], package_id: str) -> list[dict[str, Any]]:
+    """Clone cached/parser records into exactly one upload package namespace."""
+    bound: list[dict[str, Any]] = []
+    for original in pairings:
+        pairing = dict(original)
+        rotation = str(pairing.get("rotation_number") or pairing.get("id") or "").upper()
+        pairing["package_id"] = package_id
+        pairing["inventory_key"] = f"{package_id}:{rotation}"
+        bound.append(pairing)
+    return bound
+
+
+def package_records(records: list[dict[str, Any]], package_id: str) -> list[dict[str, Any]]:
+    """Fail closed if any package-dependent record crosses an upload boundary."""
+    mismatches = [record for record in records if str(record.get("package_id") or "") != package_id]
+    if mismatches:
+        raise HTTPException(409, "Package isolation check rejected records from another bid package.")
+    return records
+
+
+def require_active_package(row: sqlite3.Row, supplied_package_id: str | None) -> str:
+    expected = row_package_id(row)
+    if row["package_id"] and not supplied_package_id:
+        raise HTTPException(400, "active package_id is required")
+    if supplied_package_id and supplied_package_id != expected:
+        raise HTTPException(409, "The requested package is no longer active. Reload the current bid package.")
+    return expected
 
 
 INDEX_HTML = r"""
@@ -1349,6 +1384,10 @@ def score_southwest_line(line: dict[str, Any], pairing_scores: dict[str, dict[st
     members = [pairing_scores[p] for p in line["pairing_ids"] if p in pairing_scores]
     if not members:
         raise RuntimeError(f"No pairing details found for Southwest line {line['id']}")
+    package_ids = {str(item.get("package_id") or "") for item in members}
+    line_package_id = str(line.get("package_id") or (next(iter(package_ids)) if len(package_ids) == 1 else "") or "legacy-package")
+    if package_ids != {""} and (len(package_ids) != 1 or line_package_id not in package_ids):
+        raise RuntimeError("Package isolation check rejected a Southwest line with mixed pairing sources.")
     cities = list(dict.fromkeys(c for item in members for c in item.get("cities", [])))
     layovers = []
     for item in members:
@@ -1370,6 +1409,7 @@ def score_southwest_line(line: dict[str, Any], pairing_scores: dict[str, dict[st
     ]
     result = {
         "pairing": line["id"], "item_type": "line", "score": 0.0,
+        "package_id": line_package_id,
         "dates": line.get("work_dates") or [], "cities": cities, "touched_cities": touched, "preferred_aircraft": sorted(set(a for item in members for a in item.get("preferred_aircraft", []))),
         "redeye": "WOCL departure" if redeye_legs else "none", "redeye_legs": redeye_legs,
         "deadheads": sum(x.get("deadheads", 0) for x in members), "transfers": sorted(set(t for x in members for t in x.get("transfers", []))),
@@ -1445,6 +1485,7 @@ def validate_uploaded_path(path: Path, expected: str) -> None:
 
 
 def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline: str) -> None:
+    package_id = job_id
     work_dir = UPLOAD_DIR / f"{job_id}_work"
     cache_key: str | None = None
     cache_hit = False
@@ -1484,11 +1525,13 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
                 pairings_text = extract_text(paths[0], paths[0].suffix.lower(), job_id, deadline=deadline)
                 lines_text = extract_text(paths[1], paths[1].suffix.lower(), job_id, deadline=deadline)
             pairings, parser_name = parse_pairings(pairings_text, job_id, "southwest")
+            pairings = bind_pairings_to_package(pairings, package_id)
             update_job(job_id, progress=72, message=f"Matching {len(pairings)} pairings to offered lines")
             scored_pairings = {p["id"]: score_pairing(p, profile) for p in pairings}
             lines = parse_southwest_lines(lines_text, set(scored_pairings))
             if not lines:
                 raise RuntimeError("No Southwest lines could be matched to the pairing IDs. Confirm that the correct Pairings and Lines ZIP files were uploaded.")
+            lines = [{**line, "package_id": package_id} for line in lines]
             results = [score_southwest_line(line, scored_pairings, profile) for line in lines]
             item_label = "lines"
         else:
@@ -1516,6 +1559,7 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
                     airline if airline in {"delta", "american", "generic"} else "auto",
                 )
                 store_cached_pairings(cache_key, airline, parser_name, pairings)
+            pairings = bind_pairings_to_package(pairings, package_id)
             if airline == "auto" and pairings:
                 detected_airline = airline_for_pairing(pairings[0])
                 airline = detected_airline
@@ -1527,16 +1571,31 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
             results = [score_pairing(pairing, profile) for pairing in eligible_pairings]
             item_label = "pairings"
         sort_results(results)
+        package_records(results, package_id)
         synopsis = build_bid_synopsis(pairings)
+        diagnostics = {
+            "active_package_id": package_id,
+            "airline": airline,
+            "base": next((item.get("airport") for item in synopsis.get("start_airports", []) if item.get("airport")), None),
+            "fleet": next((item.get("fleet") for item in synopsis.get("fleets", []) if item.get("fleet")), None),
+            "month": infer_bid_month(get_job(job_id)["filename"]),
+            "parsed_candidate_count": len(pairings),
+            "accepted_inventory_count": len(filter_pairings_for_profile(pairings, {})),
+            "recommendation_input_count": len(eligible_pairings) if airline != "southwest" else len(lines),
+            "recommendation_output_count": len(results),
+            "result_package_ids": [result.get("package_id") for result in results],
+        }
         source = (
-            {"kind": "southwest", "pairings": pairings, "lines": lines, "parser_name": parser_name, "synopsis": synopsis}
+            {"kind": "southwest", "package_id": package_id, "pairings": pairings, "lines": lines, "parser_name": parser_name, "synopsis": synopsis, "package_diagnostics": diagnostics}
             if airline == "southwest"
             else {
                 "kind": "pairings",
+                "package_id": package_id,
                 "cache_key": cache_key,
                 "parser_name": parser_name,
                 "cache_hit": cache_hit,
                 "synopsis": synopsis,
+                "package_diagnostics": diagnostics,
             }
         )
         update_job(job_id, status="complete", progress=100, message=f"Complete: {len(results)} {item_label} ranked", results_json=json.dumps(results), source_json=json.dumps(source), profile_json=json.dumps(profile))
@@ -1617,9 +1676,9 @@ async def create_job(
         raise
     filenames = " + ".join(x.filename or "upload" for x in uploads)
     with db() as conn:
-        conn.execute("INSERT INTO jobs(id,filename,context,status,progress,message,airline,profile_json,uploads_json) VALUES(?,?,?,?,?,?,?,?,?)", (job_id, filenames, context, "queued", 1, "Upload received", airline, json.dumps(profile), json.dumps([str(path) for path in paths])))
+        conn.execute("INSERT INTO jobs(id,filename,context,status,progress,message,airline,profile_json,uploads_json,package_id) VALUES(?,?,?,?,?,?,?,?,?,?)", (job_id, filenames, context, "queued", 1, "Upload received", airline, json.dumps(profile), json.dumps([str(path) for path in paths]), job_id))
     background_tasks.add_task(process_job, job_id, paths, profile, airline)
-    return {"job_id": job_id, "status": "queued", "filename": filenames, "airline": airline, "maximum_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024)}
+    return {"job_id": job_id, "package_id": job_id, "status": "queued", "filename": filenames, "airline": airline, "maximum_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024)}
 
 
 def infer_bid_month(filename: str) -> str | None:
@@ -1675,6 +1734,7 @@ def job_package_metadata(row: sqlite3.Row, results: list[dict[str, Any]], source
     fleets = [str(item.get("fleet")) for item in (synopsis.get("fleets") or []) if item.get("fleet")]
     is_southwest = source.get("kind") == "southwest" or row["airline"] == "southwest"
     return {
+        "package_id": row_package_id(row),
         "filename": row["filename"],
         "airline": row["airline"],
         "base": starts[0].get("airport") if starts else None,
@@ -1695,6 +1755,7 @@ def job_status(job_id: str):
         raise HTTPException(404, "Job not found")
     payload = {
         "job_id": row["id"],
+        "package_id": row_package_id(row),
         "filename": row["filename"],
         "airline": row["airline"],
         "status": row["status"],
@@ -1708,16 +1769,21 @@ def job_status(job_id: str):
     if row["status"] == "complete":
         payload["results"] = json.loads(row["results_json"] or "[]")
         source = json.loads(row["source_json"] or "{}")
+        if row["package_id"]:
+            package_records(payload["results"], row_package_id(row))
         payload["synopsis"] = source.get("synopsis") or build_bid_synopsis(source_pairings(source))
         payload["package"] = job_package_metadata(row, payload["results"], source)
+        if os.environ.get("PACKAGE_DEBUG_ENABLED", "false").lower() == "true":
+            payload["package_diagnostics"] = source.get("package_diagnostics") or {}
     return payload
 
 
 @app.post("/api/jobs/{job_id}/rescore")
-def rescore_job(job_id: str, profile_json: str = Form(...)):
+def rescore_job(job_id: str, profile_json: str = Form(...), package_id: str | None = Form(None)):
     row = get_job(job_id)
     if not row or row["status"] != "complete":
         raise HTTPException(404, "Completed analysis not found")
+    active_package_id = require_active_package(row, package_id)
     try:
         profile = json.loads(profile_json)
     except json.JSONDecodeError as exc:
@@ -1725,21 +1791,23 @@ def rescore_job(job_id: str, profile_json: str = Form(...)):
     source = json.loads(row["source_json"] or "null")
     if not source:
         raise HTTPException(409, "This analysis was created before preference reruns were available. Upload the bid package one more time.")
-    pairings = source_pairings(source)
+    pairings = bind_pairings_to_package(source_pairings(source), active_package_id)
     if source.get("cache_key") and not pairings:
         raise HTTPException(409, "The parsed bid-package cache is unavailable. Upload this bid package one more time.")
     if source.get("kind") == "southwest":
         scored_pairings = {pairing["id"]: score_pairing(pairing, profile) for pairing in pairings}
-        results = [score_southwest_line(line, scored_pairings, profile) for line in source.get("lines") or []]
+        lines = [{**line, "package_id": active_package_id} for line in source.get("lines") or []]
+        results = [score_southwest_line(line, scored_pairings, profile) for line in lines]
     else:
         eligible_pairings = filter_pairings_for_profile(pairings, profile)
         if profile.get("bid_fleets") and not eligible_pairings:
             raise HTTPException(400, "No pairings matched the selected bid fleet. Check the fleet code.")
         results = [score_pairing(pairing, profile) for pairing in eligible_pairings]
     sort_results(results)
+    package_records(results, active_package_id)
     update_job(job_id, results_json=json.dumps(results), profile_json=json.dumps(profile), message=f"Preferences updated: {len(results)} recommendations reranked")
     synopsis = source.get("synopsis") or build_bid_synopsis(pairings)
-    return {"job_id": job_id, "status": "complete", "results": results, "synopsis": synopsis, "message": f"Reranked {len(results)} recommendations without parsing the bid package again"}
+    return {"job_id": job_id, "package_id": active_package_id, "status": "complete", "results": results, "synopsis": synopsis, "message": f"Reranked {len(results)} recommendations without parsing the bid package again"}
 
 
 @app.post("/api/jobs/{job_id}/navblue-plan")
@@ -1749,12 +1817,15 @@ def navblue_plan(job_id: str, profile: dict[str, Any]):
     row = get_job(job_id)
     if not row or row["status"] != "complete":
         raise HTTPException(404, "Completed analysis not found")
+    active_package_id = require_active_package(row, str(profile.pop("package_id", "")) or None)
     if row["airline"] == "southwest":
         raise HTTPException(400, "Southwest line bidding is not a NAVBLUE/PBS workflow.")
     results = json.loads(row["results_json"] or "[]")
+    if row["package_id"]:
+        package_records(results, active_package_id)
     stored_profile = json.loads(row["profile_json"] or "{}")
     merged_profile = {**stored_profile, **(profile or {}), "airline": row["airline"]}
-    return build_navblue_layers(merged_profile, results, row["filename"] or "")
+    return {**build_navblue_layers(merged_profile, results, row["filename"] or ""), "package_id": active_package_id}
 
 
 @app.post("/api/jobs/{job_id}/month-plan")
@@ -1764,9 +1835,12 @@ def month_plan(job_id: str, intent: dict[str, Any]):
     row = get_job(job_id)
     if not row or row["status"] != "complete":
         raise HTTPException(404, "Completed analysis not found")
+    active_package_id = require_active_package(row, str(intent.pop("package_id", "")) or None)
     results = json.loads(row["results_json"] or "[]")
+    if row["package_id"]:
+        package_records(results, active_package_id)
     stored_profile = json.loads(row["profile_json"] or "{}")
-    return build_month_plan({**stored_profile, **(intent or {})}, results)
+    return {**build_month_plan({**stored_profile, **(intent or {})}, results), "package_id": active_package_id}
 
 
 @app.post("/api/jobs/{job_id}/diagnostic.json")
@@ -1775,10 +1849,12 @@ def result_diagnostic(
     pairing_id: str = Form(...),
     category: str = Form(...),
     notes: str = Form(""),
+    package_id: str | None = Form(None),
 ):
     row = get_job(job_id)
     if not row or row["status"] != "complete":
         raise HTTPException(404, "Completed analysis not found")
+    active_package_id = require_active_package(row, package_id)
     allowed = {"missing_data", "wrong_layover", "wrong_ranking", "wrong_times", "other"}
     if category not in allowed:
         raise HTTPException(400, "Unknown diagnostic category")
@@ -1786,13 +1862,13 @@ def result_diagnostic(
         raise HTTPException(400, "Diagnostic note is too long")
 
     source = json.loads(row["source_json"] or "{}")
-    pairings = source_pairings(source)
+    pairings = bind_pairings_to_package(source_pairings(source), active_package_id)
     if source.get("cache_key") and not pairings:
         raise HTTPException(409, "The parsed bid-package cache is unavailable. Upload this bid package one more time.")
     selected_id = pairing_id.strip().upper()
     selected_index = next((index for index, pairing in enumerate(pairings) if str(pairing.get("id") or "").upper() == selected_id), None)
     target = pairings[selected_index] if selected_index is not None else None
-    results = json.loads(row["results_json"] or "[]")
+    results = package_records(json.loads(row["results_json"] or "[]"), active_package_id) if row["package_id"] else json.loads(row["results_json"] or "[]")
     result = next((item for item in results if str(item.get("pairing") or "").upper() == selected_id), None)
     if target is None and result is None:
         raise HTTPException(404, "Result not found")
@@ -1807,7 +1883,7 @@ def result_diagnostic(
     bundle = {
         "schema": "crewbidiq.parser-diagnostic.v1",
         "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "job": {"airline": row["airline"], "filename": row["filename"]},
+        "job": {"airline": row["airline"], "filename": row["filename"], "package_id": active_package_id},
         "report": {"pairing_id": selected_id, "category": category, "notes": notes.strip()},
         "parsed_result": result,
         "source_record": target,
@@ -1827,10 +1903,11 @@ def result_diagnostic(
 
 @app.get("/api/jobs/{job_id}/report.pdf")
 @app.get("/api/jobs/{job_id}/csv", include_in_schema=False)
-def job_report(job_id: str):
+def job_report(job_id: str, package_id: str | None = None):
     row = get_job(job_id)
     if not row or row["status"] != "complete":
         raise HTTPException(404, "Completed analysis not found")
-    results = json.loads(row["results_json"] or "[]")
+    active_package_id = require_active_package(row, package_id)
+    results = package_records(json.loads(row["results_json"] or "[]"), active_package_id) if row["package_id"] else json.loads(row["results_json"] or "[]")
     pdf = build_bid_report(results, json.loads(row["profile_json"] or "{}"), row["airline"] or row["context"] or "airline", row["filename"])
     return Response(pdf, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="crewbidiq_{job_id}.pdf"'})

@@ -1,6 +1,7 @@
 const $ = id => document.getElementById(id);
 let activeJob = localStorage.getItem('crewbidiqActiveJob');
 let latestJob = localStorage.getItem('crewbidiqLatestJob');
+let activePackageId = localStorage.getItem('crewbidiqActivePackage');
 let pollTimer = null;
 let pollFailures = 0;
 let allResults = [];
@@ -9,6 +10,19 @@ let diagnosticPairingId = null;
 let airlineTerminology = { generic: { singular: 'Pairing', plural: 'Pairings', recommended: 'Recommended pairings', details: 'Pairing details', view_original: 'View original pairing', analyzed: 'Pairings analyzed' } };
 
 const csv = value => value.split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
+const packageStateKeys = ['crewbidiqShortlist', 'crewbidiqComparison', 'crewbidiqPbsPool', 'crewbidiqCommuteAssessments', 'crewbidiqExports'];
+function clearPackageDependentState() {
+  packageStateKeys.forEach(key => localStorage.removeItem(key));
+  allResults = []; bidSynopsis = null; diagnosticPairingId = null;
+}
+function acceptPackagePayload(body) {
+  const incoming = body?.package_id || body?.package?.package_id;
+  if (!incoming) throw new Error('The server response did not identify its source package.');
+  if (activePackageId && incoming !== activePackageId) throw new Error('Results from a replaced bid package were rejected. Reload the active package.');
+  const mismatched = (body.results || []).filter(item => item.package_id !== incoming);
+  if (mismatched.length) throw new Error('Mixed-package results were rejected.');
+  return incoming;
+}
 const num = id => $(id) && $(id).value !== '' ? Number($(id).value) : null;
 function mins(value, fallback) { if (!value) return fallback; const [h, m] = value.split(':').map(Number); return h * 60 + m; }
 function profile() {
@@ -91,6 +105,9 @@ $('analyzeBtn').addEventListener('click', async () => {
     const response = await fetch('/api/jobs', { method: 'POST', body: data, headers: { Accept: 'application/json' } });
     const text = await response.text(); let body = {}; try { body = text ? JSON.parse(text) : {}; } catch (_) { throw new Error(`Upload failed (${response.status}). The server returned an invalid response.`); }
     if (!response.ok) throw new Error(body.detail || body.error || `Upload failed (${response.status})`); if (!body.job_id) throw new Error('Upload completed, but no analysis job was created.');
+    clearPackageDependentState();
+    activePackageId = body.package_id; localStorage.setItem('crewbidiqActivePackage', activePackageId);
+    localStorage.removeItem('crewbidiqLatestJob'); latestJob = null;
     activeJob = body.job_id; localStorage.setItem('crewbidiqActiveJob', activeJob); pollFailures = 0; clearInterval(pollTimer); pollTimer = setInterval(pollJob, 1500); await pollJob();
   } catch (error) { showError(error.message || 'Upload failed'); setJob(false); button.textContent = 'Analyze bid package'; updateAnalyzeAvailability(); }
 });
@@ -106,6 +123,8 @@ async function pollJob() {
 }
 
 function applyCompletedJob(jobId, body) {
+  activePackageId = acceptPackagePayload(body);
+  localStorage.setItem('crewbidiqActivePackage', activePackageId);
   latestJob = jobId;
   localStorage.setItem('crewbidiqLatestJob', latestJob);
   if (body.airline && Array.from($('airlineChoice').options).some(option => option.value === body.airline)) {
@@ -117,7 +136,7 @@ function applyCompletedJob(jobId, body) {
   bidSynopsis = body.synopsis || null;
   renderSynopsis();
   render();
-  $('csvLink').href = `/api/jobs/${latestJob}/report.pdf`;
+  $('csvLink').href = `/api/jobs/${latestJob}/report.pdf?package_id=${encodeURIComponent(activePackageId)}`;
   $('csvLink').classList.remove('disabled');
   setLabsContinuation(true);
 }
@@ -131,9 +150,11 @@ async function loadLatestJob() {
     const response = await fetch(`/api/jobs/${latestJob}`, { headers: { Accept: 'application/json' } });
     const body = await response.json();
     if (!response.ok) throw new Error(body.detail || 'Could not load the saved analysis');
+    acceptPackagePayload(body);
     if (body.status === 'complete') applyCompletedJob(latestJob, body);
   } catch (error) {
     localStorage.removeItem('crewbidiqLatestJob');
+    localStorage.removeItem('crewbidiqActivePackage'); activePackageId = null;
     latestJob = null;
     setLabsContinuation(false);
     showError(error.message || 'Could not load the saved analysis');
@@ -240,14 +261,15 @@ $('runPreferencesBtn').addEventListener('click', async () => {
   if (!latestJob) return showError('Upload and analyze a bid package first.');
   const button = $('runPreferencesBtn'), data = new FormData();
   data.append('profile_json', JSON.stringify(profile()));
+  data.append('package_id', activePackageId || '');
   button.disabled = true; button.textContent = 'Reranking…'; setJob(true, 'Updating', 85, 'Applying your preferences to the parsed bid package');
   try {
     const response = await fetch(`/api/jobs/${latestJob}/rescore`, { method: 'POST', body: data, headers: { Accept: 'application/json' } });
     const body = await response.json();
     if (!response.ok) throw new Error(body.detail || 'Could not rerun preferences');
-    allResults = body.results || []; bidSynopsis = body.synopsis || bidSynopsis; localStorage.setItem('crewbidiqProfile', JSON.stringify(profile())); renderSynopsis(); render();
+    acceptPackagePayload(body); allResults = body.results || []; bidSynopsis = body.synopsis || bidSynopsis; localStorage.setItem('crewbidiqProfile', JSON.stringify(profile())); renderSynopsis(); render();
     setJob(true, 'Complete', 100, body.message || 'Recommendations updated');
-    $('csvLink').href = `/api/jobs/${latestJob}/report.pdf`; $('csvLink').classList.remove('disabled');
+    $('csvLink').href = `/api/jobs/${latestJob}/report.pdf?package_id=${encodeURIComponent(activePackageId)}`; $('csvLink').classList.remove('disabled');
     $('resultsPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (error) { showError(error.message || 'Could not rerun preferences'); setJob(false); }
   finally { button.disabled = false; button.textContent = 'Run preferences'; }
@@ -264,7 +286,7 @@ function downloadDiagnostic() {
   clearError();
   const form = document.createElement('form');
   form.method = 'POST'; form.action = `/api/jobs/${latestJob}/diagnostic.json`; form.target = '_blank'; form.hidden = true;
-  const fields = { pairing_id: diagnosticPairingId, category: $('diagnosticCategory').value, notes: $('diagnosticNotes').value.trim() };
+  const fields = { pairing_id: diagnosticPairingId, category: $('diagnosticCategory').value, notes: $('diagnosticNotes').value.trim(), package_id: activePackageId || '' };
   Object.entries(fields).forEach(([name, value]) => { const input = document.createElement('input'); input.type = 'hidden'; input.name = name; input.value = value; form.appendChild(input); });
   document.body.appendChild(form); form.submit(); form.remove();
   closeDiagnostic(); setJob(true, 'Diagnostic download started', 100, 'Check your browser downloads for the JSON problem report.');
@@ -276,5 +298,7 @@ $('diagnosticModal').addEventListener('click', event => { if (event.target === $
 $('avoidHolidays').addEventListener('change', () => { if ($('avoidHolidays').checked) $('workHolidays').checked = false; }); $('workHolidays').addEventListener('change', () => { if ($('workHolidays').checked) $('avoidHolidays').checked = false; });
 $('demoBtn').addEventListener('click', () => { allResults = [{ pairing: '2478', display_label: 'Rotation', match_level: 'excellent', credit: '21:35', tafb: '72:10', start_airport: 'ATL', fleet: '320', layovers: [{ city: 'SAN', duration: '16:00' }], cities: ['SAN'], touched_cities: ['ATL', 'MCO', 'SAN'], redeye: 'none', redeye_legs: [], deadheads: 0, duty_legs: [2, 3, 1], first_day_legs: 2, last_day_legs: 1, calendar_conflicts: [], reasons: ['SAN is a highest-priority overnight', 'Matches your preferred trip length', 'No required-day conflicts'], legs: [{ departure: 'ATL', departure_time: '0830', arrival: 'SAN', arrival_time: '1035', flight: '1234', aircraft: '321', deadhead: false }], original_display: '#2478 ATL 0830 SAN 1035' }, { pairing: '1884', display_label: 'Rotation', match_level: 'strong', credit: '19:50', tafb: '67:20', start_airport: 'ATL', fleet: '320', layovers: [{ city: 'BOS', duration: '14:20' }], cities: ['BOS'], touched_cities: ['ATL', 'BOS'], redeye: 'WOCL departure', redeye_legs: [{ departure: 'BOS', departure_time: '0230' }], deadheads: 1, duty_legs: [1, 3, 2], first_day_legs: 1, last_day_legs: 2, calendar_conflicts: ['Preferred off: 2026-08-11'], reasons: ['Departs during WOCL (02:00–05:59 local): BOS 0230', 'One deadhead', 'Touches a preferred day off'] }]; bidSynopsis = { total: 2, complete: 2, incomplete: 0, count_basis: 'unique_trip_id', redeye: { count: 1, percent: 50 }, deadhead: { count: 1, percent: 50 }, overnight_city_count: 2, trip_lengths: [{ days: '3', count: 2, percent: 100 }], start_airports: [{ airport: 'ATL', count: 2, percent: 100 }], fleets: [{ fleet: '320', count: 2, percent: 100 }], layover_cities: [{ city: 'SAN', count: 1, percent: 50 }, { city: 'BOS', count: 1, percent: 50 }] }; renderSynopsis(); render(); });
 if (activeJob) { setJob(true, 'Resuming', 1, 'Reconnecting to your analysis…'); pollTimer = setInterval(pollJob, 1500); pollJob(); }
-if (latestJob) { $('runPreferencesBtn').disabled = false; $('csvLink').href = `/api/jobs/${latestJob}/report.pdf`; $('csvLink').classList.remove('disabled'); setLabsContinuation(true); }
+// Demo fixtures are isolated in an explicit, non-persistent package namespace.
+$('demoBtn').addEventListener('click', () => { packageStateKeys.forEach(key => localStorage.removeItem(key)); activePackageId = 'demo:explicit'; latestJob = null; allResults = allResults.map(item => ({ ...item, package_id: activePackageId, demo_mode: true })); $('runPreferencesBtn').disabled = true; $('csvLink').classList.add('disabled'); setLabsContinuation(false); render(); });
+if (latestJob && activePackageId) { $('runPreferencesBtn').disabled = false; $('csvLink').href = `/api/jobs/${latestJob}/report.pdf?package_id=${encodeURIComponent(activePackageId)}`; $('csvLink').classList.remove('disabled'); setLabsContinuation(true); }
 if (document.body.dataset.classicPage === 'results') loadLatestJob();
