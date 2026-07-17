@@ -20,3 +20,11 @@ services:
         value: "true"
       - key: SOUTHWEST_LINE_RANKER_ENABLED
         value: "true"
+      - key: MAX_PARSE_SECONDS
+        value: "600"
+      - key: JOB_STALE_SECONDS
+        value: "720"
+      - key: PACKAGE_RETENTION_SECONDS
+        value: "86400"
+      - key: ANALYSIS_DEBUG_ENABLED
+        value: "false"

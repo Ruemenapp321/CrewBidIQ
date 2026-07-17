@@ -14,12 +14,12 @@ import os
 import gzip
 import hashlib
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import fitz
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -52,6 +52,9 @@ DB_PATH = DATA_DIR / "pairingiq.db"
 PARSER_CACHE_VERSION = "2026-07-17.3"
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_PARSE_SECONDS = int(os.environ.get("MAX_PARSE_SECONDS", "600"))
+JOB_STALE_SECONDS = int(os.environ.get("JOB_STALE_SECONDS", str(MAX_PARSE_SECONDS + 120)))
+PACKAGE_RETENTION_SECONDS = int(os.environ.get("PACKAGE_RETENTION_SECONDS", "86400"))
+ANALYSIS_DEBUG_ENABLED = os.environ.get("ANALYSIS_DEBUG_ENABLED", "false").lower() == "true"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -64,6 +67,23 @@ app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "app" / "static"), name="static")
 app.include_router(labs_router)
 job_lock = threading.Lock()
+active_job_threads: set[str] = set()
+
+
+ANALYSIS_ERROR_MESSAGES = {
+    "UPLOAD_FAILED": "The upload could not be completed. Please try again.",
+    "PACKAGE_NOT_PERSISTED": "The upload was not saved. Please upload the bid package again.",
+    "JOB_CREATION_FAILED": "The upload was saved, but analysis could not be started. Try Resume analysis.",
+    "JOB_NOT_FOUND": "This analysis session could not be recovered. Restart analysis using the uploaded file.",
+    "JOB_EXPIRED": "The earlier analysis expired. Restarting from your saved upload.",
+    "JOB_PACKAGE_MISMATCH": "This analysis belongs to a different bid package. Reload the active package.",
+    "JOB_TIMEOUT": "Analysis reached the processing time limit. Resume to retry from the saved upload.",
+    "POLLING_NETWORK_ERROR": "Connection interrupted. Reconnecting to the last confirmed analysis state.",
+    "PARSER_FAILED": "The bid package could not be parsed. Check the file and try again.",
+    "SESSION_EXPIRED": "This browser session cannot access that analysis. Please upload the bid package again.",
+    "RATE_LIMITED": "Status checks are temporarily limited. CrewBidIQ will retry shortly.",
+    "UNKNOWN_ANALYSIS_ERROR": "The analysis could not be completed. Please try again.",
+}
 
 
 def db() -> sqlite3.Connection:
@@ -90,6 +110,30 @@ def init_db() -> None:
                 uploads_json TEXT,
                 source_json TEXT,
                 package_id TEXT,
+                state TEXT,
+                current_stage TEXT,
+                last_successful_poll_at TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                recoverable INTEGER NOT NULL DEFAULT 1,
+                error_code TEXT,
+                user_message TEXT,
+                request_id TEXT,
+                session_id_hash TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS packages (
+                id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                context TEXT,
+                airline TEXT,
+                profile_json TEXT,
+                uploads_json TEXT,
+                persisted INTEGER NOT NULL DEFAULT 1,
+                recoverable INTEGER NOT NULL DEFAULT 1,
+                session_id_hash TEXT,
+                request_id TEXT,
+                expires_at TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
@@ -105,35 +149,171 @@ def init_db() -> None:
             """
         )
         columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
-        for name in ("airline", "profile_json", "uploads_json", "source_json", "package_id"):
+        migrations = {
+            "airline": "TEXT", "profile_json": "TEXT", "uploads_json": "TEXT",
+            "source_json": "TEXT", "package_id": "TEXT", "state": "TEXT",
+            "current_stage": "TEXT", "last_successful_poll_at": "TEXT",
+            "retry_count": "INTEGER NOT NULL DEFAULT 0", "recoverable": "INTEGER NOT NULL DEFAULT 1",
+            "error_code": "TEXT", "user_message": "TEXT", "request_id": "TEXT",
+            "session_id_hash": "TEXT",
+        }
+        for name, definition in migrations.items():
             if name not in columns:
-                conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} TEXT")
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
+
+
+def utc_now() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds")
+
+
+def session_hash(session_id: str | None) -> str | None:
+    value = str(session_id or "").strip()
+    return hashlib.sha256(value.encode("utf-8")).hexdigest() if value else None
+
+
+def get_job(job_id: str):
+    with db() as conn:
+        return conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+
+
+def get_package(package_id: str):
+    with db() as conn:
+        return conn.execute("SELECT * FROM packages WHERE id=?", (package_id,)).fetchone()
+
+
+def inferred_stage(message: str, status: str = "") -> str:
+    lowered = str(message or "").lower()
+    if status == "complete":
+        return "ready"
+    if status == "failed":
+        return "failed"
+    if "extracting pdf" in lowered or "reading southwest" in lowered or "reading " in lowered and " file " in lowered:
+        return "extracting_text"
+    if "identifying trip records" in lowered or "reusing the parsed" in lowered:
+        return "identifying_records"
+    if "parsing details" in lowered or "matching" in lowered:
+        return "parsing_details"
+    if "normaliz" in lowered:
+        return "normalizing"
+    if "scoring" in lowered or "recommendation" in lowered:
+        return "building_recommendations"
+    return "detecting_package"
+
+
+def state_for_stage(stage: str, status: str) -> str:
+    if status == "complete":
+        return "completed"
+    if status == "failed":
+        return "failed"
+    if status == "queued":
+        return "queued"
+    if stage == "normalizing":
+        return "normalizing"
+    if stage == "building_recommendations":
+        return "ranking"
+    return "parsing"
+
+
+def analysis_log(event: str, row: sqlite3.Row | None = None, **extra: Any) -> None:
+    payload: dict[str, Any] = {"event": event, "timestamp": utc_now(), **extra}
+    if row:
+        payload.update({
+            "package_id": row["package_id"] or row["id"],
+            "job_id": row["id"],
+            "job_state": row["state"] or state_for_stage(row["current_stage"] or "", row["status"] or ""),
+            "stage": row["current_stage"],
+            "progress": row["progress"],
+            "retry_count": row["retry_count"] or 0,
+            "error_code": row["error_code"],
+            "session_id_hash": row["session_id_hash"],
+            "request_id": row["request_id"],
+            "deployment_instance": os.environ.get("RENDER_INSTANCE_ID") or os.environ.get("HOSTNAME"),
+        })
+    log.info("analysis_job %s", json.dumps(payload, separators=(",", ":"), default=str))
+
+
+def update_job(job_id: str, **fields: Any) -> None:
+    current = get_job(job_id)
+    if current and current["state"] in {"cancelled", "expired"} and fields.get("state") not in {current["state"]}:
+        analysis_log("terminal_update_ignored", current)
+        return
+    if current and "progress" in fields:
+        fields["progress"] = max(int(current["progress"] or 0), int(fields["progress"] or 0))
+    status = str(fields.get("status") or (current["status"] if current else ""))
+    if "message" in fields and "current_stage" not in fields:
+        fields["current_stage"] = inferred_stage(str(fields.get("message") or ""), status)
+    stage = str(fields.get("current_stage") or (current["current_stage"] if current else "") or "detecting_package")
+    if "state" not in fields:
+        fields["state"] = state_for_stage(stage, status)
+    if "message" in fields and "user_message" not in fields:
+        fields["user_message"] = fields["message"]
+    fields["updated_at"] = utc_now()
+    clause = ", ".join(f"{k}=?" for k in fields)
+    with job_lock, db() as conn:
+        conn.execute(f"UPDATE jobs SET {clause} WHERE id=?", [*fields.values(), job_id])
+    analysis_log("state_updated", get_job(job_id))
+
+
+def safe_remove_package_upload(path: Path) -> None:
+    try:
+        resolved = path.resolve()
+        if resolved.parent == UPLOAD_DIR.resolve():
+            resolved.unlink(missing_ok=True)
+    except OSError:
+        log.warning("Could not remove expired package upload %s", path.name)
+
+
+def cleanup_expired_packages() -> None:
+    now = datetime.utcnow()
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM packages WHERE persisted=1 AND expires_at IS NOT NULL").fetchall()
+    for package in rows:
+        try:
+            expired = datetime.fromisoformat(str(package["expires_at"]).replace(" ", "T")) <= now
+        except ValueError:
+            expired = True
+        if not expired:
+            continue
+        for value in json.loads(package["uploads_json"] or "[]"):
+            safe_remove_package_upload(Path(value))
+        with job_lock, db() as conn:
+            conn.execute(
+                "UPDATE packages SET persisted=0,recoverable=0,updated_at=? WHERE id=?",
+                (utc_now(), package["id"]),
+            )
+        analysis_log("package_expired", package_id=package["id"])
+
+
+def run_job_once(job_id: str, paths: list[Path], profile: dict[str, Any], airline: str) -> None:
+    with job_lock:
+        if job_id in active_job_threads:
+            analysis_log("duplicate_worker_skipped", get_job(job_id))
+            return
+        active_job_threads.add(job_id)
+    try:
+        process_job(job_id, paths, profile, airline)
+    finally:
+        with job_lock:
+            active_job_threads.discard(job_id)
 
 
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    cleanup_expired_packages()
     with db() as conn:
         pending = conn.execute("SELECT * FROM jobs WHERE status IN ('queued','processing')").fetchall()
     for row in pending:
         paths = [Path(p) for p in json.loads(row["uploads_json"] or "[]")]
         if paths and all(path.exists() for path in paths) and row["airline"]:
             profile = json.loads(row["profile_json"] or "{}")
-            threading.Thread(target=process_job, args=(row["id"], paths, profile, row["airline"]), daemon=True).start()
+            threading.Thread(target=run_job_once, args=(row["id"], paths, profile, row["airline"]), daemon=True).start()
         else:
-            update_job(row["id"], status="failed", progress=100, error="Analysis was interrupted before it completed. Please upload the package again.", message="Analysis interrupted")
-
-
-def update_job(job_id: str, **fields: Any) -> None:
-    fields["updated_at"] = datetime.utcnow().isoformat(timespec="seconds")
-    clause = ", ".join(f"{k}=?" for k in fields)
-    with job_lock, db() as conn:
-        conn.execute(f"UPDATE jobs SET {clause} WHERE id=?", [*fields.values(), job_id])
-
-
-def get_job(job_id: str):
-    with db() as conn:
-        return conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            update_job(
+                row["id"], status="failed", state="failed", progress=row["progress"], recoverable=0,
+                error_code="PACKAGE_NOT_PERSISTED", error=ANALYSIS_ERROR_MESSAGES["PACKAGE_NOT_PERSISTED"],
+                message=ANALYSIS_ERROR_MESSAGES["PACKAGE_NOT_PERSISTED"],
+            )
 
 
 def parser_cache_key(path: Path, airline: str) -> str:
@@ -288,7 +468,7 @@ INDEX_HTML = r"""
           <div id="southwestUploads" class="drop-zone hidden"><span class="drop-step">2 · Upload package</span><div class="upload-icon">⇧</div><strong>Southwest bid package</strong><span id="southwestZipName" data-empty-text="Upload the airline ZIP, or individual TXT files">Upload the airline ZIP, or individual TXT files</span><label class="file-picker" for="southwestZip">Choose ZIP</label><input id="southwestZip" class="native-file-input" type="file" accept=".zip,application/zip"><div class="or">OR</div><div class="sw-files"><label>Pairings TXT<input id="southwestPairingsFile" type="file" accept=".txt,text/plain"></label><label>Lines TXT<input id="southwestLinesFile" type="file" accept=".txt,text/plain"></label><label>Seniority TXT<input id="southwestSeniorityFile" type="file" accept=".txt,text/plain"></label><label>Cover TXT<input id="southwestCoverFile" type="file" accept=".txt,text/plain"></label></div></div>
         </div>
         <div class="primary-actions"><button id="analyzeBtn" class="primary" disabled>Analyze bid package</button><button id="demoBtn" class="secondary">View sample results</button></div>
-        <div id="jobPanel" class="job-panel hidden"><div class="job-row"><strong id="jobStatus">Preparing…</strong><span id="jobPercent">0%</span></div><div class="progress"><div id="progressFill"></div></div><div id="jobMessage" class="muted"></div></div>
+        <div id="jobPanel" class="job-panel hidden"><div class="job-row"><strong id="jobStatus">Preparing…</strong><span id="jobPercent">0%</span></div><div class="progress"><div id="progressFill"></div></div><div id="jobMessage" class="muted"></div><dl id="analysisDebugPanel" class="analysis-debug hidden"><dt>Package ID</dt><dd data-debug="package">—</dd><dt>Job ID</dt><dd data-debug="job">—</dd><dt>State</dt><dd data-debug="state">idle</dd><dt>Last confirmed progress</dt><dd data-debug="progress">0%</dd><dt>Last successful poll</dt><dd data-debug="poll">—</dd><dt>Latest status</dt><dd data-debug="status">—</dd><dt>Retry count</dt><dd data-debug="retries">0</dd></dl></div>
         <div id="errorBox" class="error hidden"></div>
       </section>
 
@@ -498,7 +678,8 @@ INDEX_HTML = r"""
     __MOBILE_NAV__
   </div>
 </div>
-<script src="/static/app.js?v=0423"></script>
+<script>window.CREWBIDIQ_ANALYSIS_DEBUG_ENABLED=__ANALYSIS_DEBUG_ENABLED__;</script>
+<script src="/static/app.js?v=0424"></script>
 <script>document.getElementById('mobileGuideBtn').addEventListener('click',()=>document.getElementById('guideBtn').click());</script>
 </body></html>
 """
@@ -547,6 +728,7 @@ def classic_html(page: str) -> str:
         "__CONTINUE_LABS__": continue_labs,
         "__FLIGHT_DECK_LINK__": flight_deck_link,
         "__MOBILE_NAV__": mobile_nav,
+        "__ANALYSIS_DEBUG_ENABLED__": "true" if ANALYSIS_DEBUG_ENABLED else "false",
     }
     html = INDEX_HTML
     for marker, value in replacements.items():
@@ -1603,13 +1785,21 @@ def validate_uploaded_path(path: Path, expected: str) -> None:
 
 
 def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline: str) -> None:
-    package_id = job_id
+    job = get_job(job_id)
+    if not job or job["status"] == "complete" or job["state"] in {"cancelled", "expired"}:
+        return
+    package_id = row_package_id(job)
     work_dir = UPLOAD_DIR / f"{job_id}_work"
     cache_key: str | None = None
     cache_hit = False
+    completed = False
     deadline = time.monotonic() + MAX_PARSE_SECONDS
     try:
-        update_job(job_id, status="processing", progress=5, message="Detecting airline and package type")
+        update_job(
+            job_id, status="processing", state="parsing", current_stage="detecting_package",
+            progress=max(5, int(job["progress"] or 0)), retry_count=int(job["retry_count"] or 0),
+            message="Detecting airline and package type", error=None, error_code=None,
+        )
         if airline == "southwest":
             if len(paths) == 1 and paths[0].suffix.lower() == ".zip":
                 with zipfile.ZipFile(paths[0]) as archive:
@@ -1643,6 +1833,7 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
                 pairings_text = extract_text(paths[0], paths[0].suffix.lower(), job_id, deadline=deadline)
                 lines_text = extract_text(paths[1], paths[1].suffix.lower(), job_id, deadline=deadline)
             pairings, parser_name = parse_pairings(pairings_text, job_id, "southwest")
+            update_job(job_id, state="normalizing", current_stage="normalizing", progress=71, message="Normalizing parsed Southwest pairings")
             pairings = filter_pairings_for_profile(bind_pairings_to_package(pairings, package_id), {})
             if not pairings:
                 raise RuntimeError("No confirmed bidable Southwest pairings were available for recommendation input.")
@@ -1679,6 +1870,7 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
                     airline if airline in {"delta", "american", "generic"} else "auto",
                 )
                 store_cached_pairings(cache_key, airline, parser_name, pairings)
+            update_job(job_id, state="normalizing", current_stage="normalizing", progress=72, message=f"Normalizing {len(pairings)} parsed trip records")
             pairings = bind_pairings_to_package(pairings, package_id)
             if airline == "auto" and pairings:
                 detected_airline = airline_for_pairing(pairings[0])
@@ -1687,9 +1879,10 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
             eligible_pairings = filter_pairings_for_profile(pairings, profile)
             if profile.get("bid_fleets") and not eligible_pairings:
                 raise RuntimeError("No pairings matched the selected bid fleet. Check the fleet code and run the package again.")
-            update_job(job_id, progress=75, message=f"Scoring {len(eligible_pairings)} pairings")
+            update_job(job_id, state="ranking", current_stage="building_recommendations", progress=75, message=f"Scoring {len(eligible_pairings)} pairings")
             results = [score_pairing(pairing, profile) for pairing in eligible_pairings]
             item_label = "pairings"
+        update_job(job_id, state="ranking", current_stage="building_recommendations", progress=85, message=f"Building recommendation data for {len(results)} records")
         sort_results(results, package_id)
         package_records(results, package_id)
         synopsis = build_bid_synopsis(pairings)
@@ -1720,27 +1913,52 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
                 "package_diagnostics": diagnostics,
             }
         )
-        update_job(job_id, status="complete", progress=100, message=f"Complete: {len(results)} {item_label} ranked", results_json=json.dumps(results), source_json=json.dumps(source), profile_json=json.dumps(profile))
+        if job_state(get_job(job_id)) == "cancelled":
+            analysis_log("cancelled_job_result_discarded", get_job(job_id))
+            return
+        update_job(
+            job_id, status="complete", state="completed", current_stage="ready", progress=100,
+            recoverable=1, error=None, error_code=None,
+            message=f"Complete: {len(results)} {item_label} ranked", results_json=json.dumps(results),
+            source_json=json.dumps(source), profile_json=json.dumps(profile),
+        )
+        completed = True
+        with job_lock, db() as conn:
+            conn.execute(
+                "UPDATE packages SET persisted=0,recoverable=0,updated_at=? WHERE id=?",
+                (utc_now(), package_id),
+            )
     except Exception as exc:
         log.exception("Job %s failed", job_id)
-        error = (
-            "Parsing timed out before the package was complete. Try again or upload a smaller airline package."
-            if isinstance(exc, TimeoutError)
-            else str(exc)
+        error_code = "JOB_TIMEOUT" if isinstance(exc, TimeoutError) else "PARSER_FAILED"
+        current = get_job(job_id)
+        confirmed_progress = int(current["progress"] or 0) if current else 0
+        user_message = ANALYSIS_ERROR_MESSAGES[error_code]
+        update_job(
+            job_id, status="failed", state="failed", current_stage="failed",
+            progress=confirmed_progress, recoverable=1, error_code=error_code,
+            error=str(exc) or user_message, user_message=user_message, message=user_message,
         )
-        update_job(job_id, status="failed", progress=100, error=error, message="Analysis failed")
     finally:
-        for path in paths:
-            path.unlink(missing_ok=True)
+        if completed:
+            for path in paths:
+                if get_package(package_id):
+                    safe_remove_package_upload(path)
+                else:
+                    # Legacy direct-parser jobs may supply a caller-owned temp
+                    # path outside UPLOAD_DIR and historically remove it.
+                    path.unlink(missing_ok=True)
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @app.post("/api/jobs")
 async def create_job(
     background_tasks: BackgroundTasks,
+    request: Request,
     airline: str = Form(...),
     profile_json: str = Form(...),
     context: str = Form(""),
+    session_id: str = Form(""),
     file: UploadFile | None = File(None),
     pairings_file: UploadFile | None = File(None),
     lines_file: UploadFile | None = File(None),
@@ -1774,12 +1992,13 @@ async def create_job(
     else:
         raise HTTPException(400, "That airline is not supported yet.")
 
+    package_id = uuid.uuid4().hex
     job_id = uuid.uuid4().hex
     paths: list[Path] = []
     try:
         for index, upload in enumerate(uploads):
             suffix = Path(upload.filename or "").suffix.lower()
-            path = UPLOAD_DIR / f"{job_id}_{index}{suffix}"
+            path = UPLOAD_DIR / f"{package_id}_{index}{suffix}"
             total = 0
             with path.open("wb") as out:
                 while chunk := await upload.read(1024 * 1024):
@@ -1797,10 +2016,54 @@ async def create_job(
             candidate.unlink(missing_ok=True)
         raise
     filenames = " + ".join(x.filename or "upload" for x in uploads)
-    with db() as conn:
-        conn.execute("INSERT INTO jobs(id,filename,context,status,progress,message,airline,profile_json,uploads_json,package_id) VALUES(?,?,?,?,?,?,?,?,?,?)", (job_id, filenames, context, "queued", 1, "Upload received", airline, json.dumps(profile), json.dumps([str(path) for path in paths]), job_id))
-    background_tasks.add_task(process_job, job_id, paths, profile, airline)
-    return {"job_id": job_id, "package_id": job_id, "status": "queued", "filename": filenames, "airline": airline, "maximum_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024)}
+    now = utc_now()
+    expires_at = (datetime.utcnow() + timedelta(seconds=PACKAGE_RETENTION_SECONDS)).isoformat(timespec="seconds")
+    request_id = request.headers.get("x-request-id") or request.headers.get("x-render-request-id") or uuid.uuid4().hex
+    hashed_session = session_hash(session_id)
+    uploads_json = json.dumps([str(path) for path in paths])
+    try:
+        with job_lock, db() as conn:
+            if hashed_session:
+                conn.execute(
+                    """UPDATE jobs SET status='failed',state='cancelled',current_stage='cancelled',recoverable=0,
+                       error_code='UNKNOWN_ANALYSIS_ERROR',error='Replaced by a newer bid package.',
+                       message='Replaced by a newer bid package.',user_message='Replaced by a newer bid package.',updated_at=?
+                       WHERE session_id_hash=? AND status IN ('queued','processing')""",
+                    (now, hashed_session),
+                )
+                conn.execute(
+                    "UPDATE packages SET recoverable=0,updated_at=? WHERE session_id_hash=?",
+                    (now, hashed_session),
+                )
+            conn.execute(
+                """INSERT INTO packages
+                   (id,filename,context,airline,profile_json,uploads_json,persisted,recoverable,session_id_hash,request_id,expires_at,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,1,1,?,?,?,?,?)""",
+                (package_id, filenames, context, airline, json.dumps(profile), uploads_json, hashed_session, request_id, expires_at, now, now),
+            )
+            conn.execute(
+                """INSERT INTO jobs
+                   (id,filename,context,status,progress,message,airline,profile_json,uploads_json,package_id,state,current_stage,retry_count,recoverable,user_message,request_id,session_id_hash,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (job_id, filenames, context, "queued", 1, "Upload received", airline, json.dumps(profile), uploads_json,
+                 package_id, "queued", "queued", 0, 1, "Upload received", request_id, hashed_session, now, now),
+            )
+    except Exception as exc:
+        for path in paths:
+            safe_remove_package_upload(path)
+        log.exception("Could not persist analysis package %s", package_id)
+        raise HTTPException(500, {"error_code": "JOB_CREATION_FAILED", "user_message": ANALYSIS_ERROR_MESSAGES["JOB_CREATION_FAILED"]}) from exc
+    row = get_job(job_id)
+    analysis_log("package_persisted", row, package_persisted=True)
+    background_tasks.add_task(run_job_once, job_id, paths, profile, airline)
+    return {
+        "job_id": job_id, "package_id": package_id, "status": "queued", "state": "queued",
+        "current_stage": "queued", "progress": 1, "progress_percent": 1,
+        "created_at": now, "updated_at": now, "last_successful_poll_at": None,
+        "retry_count": 0, "recoverable": True, "error_code": None,
+        "user_message": "Upload received", "package_persisted": True,
+        "filename": filenames, "airline": airline, "maximum_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
+    }
 
 
 def infer_bid_month(filename: str) -> str | None:
@@ -1820,21 +2083,16 @@ def infer_bid_month(filename: str) -> str | None:
 def job_progress_payload(row: sqlite3.Row) -> dict[str, Any]:
     status = str(row["status"] or "")
     message = str(row["message"] or "")
-    lowered = message.lower()
-    if status == "complete":
-        stage, label = "ready", "Ready"
-    elif status == "failed":
-        stage, label = "failed", "Failed"
-    elif "extracting pdf" in lowered or "reading southwest" in lowered:
-        stage, label = "extracting_text", "Extracting text"
-    elif "identifying trip records" in lowered or "reusing the parsed" in lowered:
-        stage, label = "identifying_records", "Identifying trip records"
-    elif "parsing details" in lowered or "matching" in lowered:
-        stage, label = "parsing_details", "Parsing details"
-    elif "scoring" in lowered:
-        stage, label = "building_recommendations", "Building recommendation data"
-    else:
-        stage, label = "detecting_package", "Detecting airline and package type"
+    stage = str(row["current_stage"] or inferred_stage(message, status))
+    labels = {
+        "idle": "Idle", "file_selected": "File selected", "uploading": "Uploading",
+        "upload_complete": "Upload complete", "creating_job": "Creating analysis job", "queued": "Queued",
+        "detecting_package": "Detecting airline and package type", "extracting_text": "Extracting text",
+        "identifying_records": "Identifying trip records", "parsing_details": "Parsing details",
+        "normalizing": "Normalizing trip records", "building_recommendations": "Building recommendation data",
+        "ready": "Ready", "failed": "Failed", "cancelled": "Cancelled", "expired": "Expired",
+    }
+    label = labels.get(stage, stage.replace("_", " ").title())
 
     detail: dict[str, int] = {}
     page = re.search(r"page\s+(\d+)\s+of\s+(\d+)", message, re.IGNORECASE)
@@ -1870,34 +2128,167 @@ def job_package_metadata(row: sqlite3.Row, results: list[dict[str, Any]], source
     }
 
 
-@app.get("/api/jobs/{job_id}")
-def job_status(job_id: str):
-    row = get_job(job_id)
-    if not row:
-        raise HTTPException(404, "Job not found")
+def package_is_recoverable(package_id: str) -> bool:
+    package = get_package(package_id)
+    if not package or not package["persisted"] or not package["recoverable"]:
+        return False
+    paths = [Path(value) for value in json.loads(package["uploads_json"] or "[]")]
+    return bool(paths) and all(path.exists() for path in paths)
+
+
+def job_state(row: sqlite3.Row) -> str:
+    return str(row["state"] or state_for_stage(row["current_stage"] or "", row["status"] or ""))
+
+
+def job_is_stale(row: sqlite3.Row) -> bool:
+    if row["status"] not in {"queued", "processing"}:
+        return False
+    # Rows created before the explicit state model did not represent a
+    # recoverable background job and retain their legacy status behavior.
+    if not row["state"] and not row["package_id"]:
+        return False
+    try:
+        updated = datetime.fromisoformat(str(row["updated_at"]).replace(" ", "T"))
+    except ValueError:
+        return True
+    return (datetime.utcnow() - updated).total_seconds() > JOB_STALE_SECONDS
+
+
+def analysis_error(status_code: int, error_code: str, **detail: Any) -> HTTPException:
+    return HTTPException(
+        status_code,
+        {"error_code": error_code, "user_message": ANALYSIS_ERROR_MESSAGES[error_code], **detail},
+    )
+
+
+def validate_job_access(row: sqlite3.Row, supplied_package_id: str | None, supplied_session_id: str | None) -> None:
+    expected_package_id = row_package_id(row)
+    if supplied_package_id and supplied_package_id != expected_package_id:
+        raise analysis_error(409, "JOB_PACKAGE_MISMATCH", package_id=expected_package_id, job_id=row["id"])
+    expected_session = row["session_id_hash"]
+    if expected_session and session_hash(supplied_session_id) != expected_session:
+        raise analysis_error(403, "SESSION_EXPIRED", package_id=expected_package_id, job_id=row["id"])
+
+
+def job_status_payload(row: sqlite3.Row) -> dict[str, Any]:
+    package_id = row_package_id(row)
+    state = job_state(row)
+    persisted = package_is_recoverable(package_id)
     payload = {
         "job_id": row["id"],
-        "package_id": row_package_id(row),
+        "package_id": package_id,
         "filename": row["filename"],
         "airline": row["airline"],
         "status": row["status"],
+        "state": state,
+        "current_stage": row["current_stage"] or inferred_stage(row["message"] or "", row["status"] or ""),
         "progress": row["progress"],
+        "progress_percent": row["progress"],
         "message": row["message"],
+        "user_message": row["user_message"] or row["message"],
         "error": row["error"],
+        "error_code": row["error_code"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+        "last_successful_poll_at": row["last_successful_poll_at"],
+        "retry_count": row["retry_count"] or 0,
+        "recoverable": bool(row["recoverable"]) and (state == "completed" or persisted),
+        "package_persisted": persisted,
         **job_progress_payload(row),
     }
     if row["status"] == "complete":
         payload["results"] = json.loads(row["results_json"] or "[]")
         source = json.loads(row["source_json"] or "{}")
         if row["package_id"]:
-            package_records(payload["results"], row_package_id(row))
+            package_records(payload["results"], package_id)
         payload["synopsis"] = source.get("synopsis") or build_bid_synopsis(source_pairings(source))
         payload["package"] = job_package_metadata(row, payload["results"], source)
         if os.environ.get("PACKAGE_DEBUG_ENABLED", "false").lower() == "true":
             payload["package_diagnostics"] = source.get("package_diagnostics") or {}
     return payload
+
+
+@app.get("/api/jobs/{job_id}")
+def job_status(job_id: str, request: Request, package_id: str | None = None):
+    row = get_job(job_id)
+    if not row:
+        raise analysis_error(404, "JOB_NOT_FOUND", job_id=job_id, package_id=package_id)
+    validate_job_access(row, package_id, request.headers.get("x-crewbidiq-session"))
+    if job_is_stale(row):
+        update_job(
+            job_id, status="failed", state="expired", current_stage="expired", progress=row["progress"],
+            recoverable=1, error_code="JOB_EXPIRED", error=ANALYSIS_ERROR_MESSAGES["JOB_EXPIRED"],
+            message=ANALYSIS_ERROR_MESSAGES["JOB_EXPIRED"],
+        )
+        row = get_job(job_id)
+    if job_state(row) == "expired":
+        raise analysis_error(
+            410, "JOB_EXPIRED", job_id=job_id, package_id=row_package_id(row),
+            progress_percent=row["progress"], recoverable=package_is_recoverable(row_package_id(row)),
+        )
+    polled_at = utc_now()
+    with job_lock, db() as conn:
+        conn.execute("UPDATE jobs SET last_successful_poll_at=? WHERE id=?", (polled_at, job_id))
+    row = get_job(job_id)
+    analysis_log("status_polled", row)
+    return job_status_payload(row)
+
+
+@app.post("/api/packages/{package_id}/analysis-jobs")
+def resume_package_analysis(
+    package_id: str,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    session_id: str = Form(""),
+):
+    cleanup_expired_packages()
+    package = get_package(package_id)
+    if not package or not package_is_recoverable(package_id):
+        raise analysis_error(404, "PACKAGE_NOT_PERSISTED", package_id=package_id)
+    if package["session_id_hash"] and session_hash(session_id) != package["session_id_hash"]:
+        raise analysis_error(403, "SESSION_EXPIRED", package_id=package_id)
+    paths = [Path(value) for value in json.loads(package["uploads_json"] or "[]")]
+    created = False
+    new_job_id = ""
+    now = utc_now()
+    with job_lock, db() as conn:
+        latest = conn.execute(
+            "SELECT * FROM jobs WHERE package_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1",
+            (package_id,),
+        ).fetchone()
+        if latest and latest["status"] in {"queued", "processing", "complete"} and not job_is_stale(latest):
+            new_job_id = latest["id"]
+        else:
+            if latest and job_is_stale(latest):
+                conn.execute(
+                    """UPDATE jobs SET status='failed',state='expired',current_stage='expired',recoverable=1,
+                       error_code='JOB_EXPIRED',error=?,message=?,user_message=?,updated_at=? WHERE id=?""",
+                    (ANALYSIS_ERROR_MESSAGES["JOB_EXPIRED"], ANALYSIS_ERROR_MESSAGES["JOB_EXPIRED"],
+                     ANALYSIS_ERROR_MESSAGES["JOB_EXPIRED"], now, latest["id"]),
+                )
+            new_job_id = uuid.uuid4().hex
+            retry_count = int(latest["retry_count"] or 0) + 1 if latest else 1
+            request_id = request.headers.get("x-request-id") or request.headers.get("x-render-request-id") or uuid.uuid4().hex
+            conn.execute(
+                """INSERT INTO jobs
+                   (id,filename,context,status,progress,message,airline,profile_json,uploads_json,package_id,state,current_stage,retry_count,recoverable,user_message,request_id,session_id_hash,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (new_job_id, package["filename"], package["context"], "queued", 1, "Replacement analysis queued",
+                 package["airline"], package["profile_json"], package["uploads_json"], package_id, "queued", "queued",
+                 retry_count, 1, "Replacement analysis queued", request_id, package["session_id_hash"], now, now),
+            )
+            conn.execute(
+                "UPDATE packages SET updated_at=?,expires_at=? WHERE id=?",
+                (now, (datetime.utcnow() + timedelta(seconds=PACKAGE_RETENTION_SECONDS)).isoformat(timespec="seconds"), package_id),
+            )
+            created = True
+    row = get_job(new_job_id)
+    analysis_log("replacement_job_created" if created else "existing_job_resumed", row)
+    if created:
+        background_tasks.add_task(
+            run_job_once, new_job_id, paths, json.loads(package["profile_json"] or "{}"), package["airline"],
+        )
+    return {**job_status_payload(row), "replacement_created": created}
 
 
 @app.post("/api/jobs/{job_id}/rescore")

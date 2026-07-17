@@ -4,6 +4,8 @@ const flightDeckPreviewEnabled = window.CREWBIDIQ_FLIGHT_DECK_PREVIEW_ENABLED ==
 const latestJobKey = 'crewbidiqLatestJob';
 const activeJobKey = 'crewbidiqActiveJob';
 const activePackageKey = 'crewbidiqActivePackage';
+const analysisStateKey = 'crewbidiqAnalysisJob';
+const analysisSessionKey = 'crewbidiqAnalysisSession';
 const draftKey = 'crewbidiqLabsDraft';
 let sessionJob = null;
 let sessionLoading = true;
@@ -22,6 +24,21 @@ let refinedRecommendationsSignature = '';
 let tripIntentResult = null;
 let tripIntentLoading = false;
 let tripIntentError = '';
+let sessionPollTimer = null;
+let sessionPollFailures = 0;
+let sessionPollInFlight = false;
+let sessionResumeInFlight = false;
+let lastConfirmedProgress = Number(readJson(analysisStateKey, {})?.progress_percent || 0);
+let latestStatusCode = null;
+function browserSessionId() {
+  let value = localStorage.getItem(analysisSessionKey);
+  if (!value) { value = globalThis.crypto?.randomUUID?.() || `session-${Date.now()}-${Math.random().toString(16).slice(2)}`; localStorage.setItem(analysisSessionKey, value); }
+  return value;
+}
+function analysisHeaders() { return { Accept: 'application/json', 'X-CrewBidIQ-Session': browserSessionId() }; }
+function storedAnalysis() { return readJson(analysisStateKey, {}) || {}; }
+function persistAnalysis(body) { localStorage.setItem(analysisStateKey, JSON.stringify({ ...storedAnalysis(), ...body, progress_percent: Math.max(lastConfirmedProgress, Number(body.progress_percent ?? body.progress ?? 0)) })); }
+function analysisErrorDetail(body, fallback) { const detail = body?.detail || body || {}; return typeof detail === 'string' ? { user_message: detail } : { ...detail, user_message: detail.user_message || fallback }; }
 
 const packageStateKeys = ['crewbidiqShortlist', 'crewbidiqComparison', 'crewbidiqPbsPool', 'crewbidiqCommuteAssessments', 'crewbidiqExports'];
 function activePackageId() { return localStorage.getItem(activePackageKey); }
@@ -92,7 +109,12 @@ function formatParsedTime(value) {
 }
 
 function currentJobId() {
-  return localStorage.getItem(activeJobKey) || localStorage.getItem(latestJobKey);
+  const record = storedAnalysis(), packageId = activePackageId(); let activeId = localStorage.getItem(activeJobKey);
+  if (record.job_id && record.package_id === packageId) return record.job_id;
+  if (record.job_id && record.package_id !== packageId) { localStorage.removeItem(activeJobKey); localStorage.removeItem(analysisStateKey); activeId = null; }
+  if (activeId && packageId) return activeId;
+  if (activeId && !packageId) { localStorage.removeItem(activeJobKey); localStorage.removeItem(analysisStateKey); }
+  return localStorage.getItem(latestJobKey);
 }
 
 function pageHeader(kicker, title, description) {
@@ -121,27 +143,34 @@ function packageCard() {
 
 const processingStages = [
   ['uploading', 'Uploading file'],
+  ['queued', 'Queued'],
   ['detecting_package', 'Detecting airline and package type'],
   ['extracting_text', 'Extracting text'],
   ['identifying_records', 'Identifying trip records'],
   ['parsing_details', 'Parsing details'],
+  ['normalizing', 'Normalizing trip records'],
   ['building_recommendations', 'Building recommendation data'],
   ['ready', 'Ready']
 ];
 
 function uploadProgressPanel() {
   if (!labsUploadBusy && !sessionJob) return '';
-  const stage = labsUploadBusy ? 'uploading' : (sessionJob?.stage || (sessionJob?.status === 'complete' ? 'ready' : 'detecting_package'));
+  const stage = labsUploadBusy ? 'uploading' : (sessionJob?.current_stage || sessionJob?.stage || (sessionJob?.status === 'complete' ? 'ready' : 'detecting_package'));
   const activeIndex = processingStages.findIndex(([value]) => value === stage);
-  const percent = labsUploadBusy ? null : sessionJob?.progress;
+  const percent = labsUploadBusy ? null : Math.max(lastConfirmedProgress, Number(sessionJob?.progress_percent ?? sessionJob?.progress ?? 0));
   const pageDetail = sessionJob?.pages_total ? `Page ${sessionJob.pages_processed} of ${sessionJob.pages_total}` : '';
   const fileDetail = sessionJob?.files_total ? `File ${sessionJob.files_processed} of ${sessionJob.files_total}` : '';
   const packageName = airlineName(sessionJob?.airline);
-  return `<div class="labs-processing ${stage === 'failed' ? 'failed' : ''}">
-    <div class="labs-processing-heading"><div><span>${stage === 'failed' ? 'Analysis failed' : `Processing ${escapeHtml(packageName)} bid package`}</span><strong>${escapeHtml(sessionJob?.stage_label || (labsUploadBusy ? 'Uploading file' : sessionJob?.message || 'Preparing package'))}</strong><small>${escapeHtml(pageDetail || fileDetail || sessionJob?.message || 'Your progress is saved if you move to another Labs page.')}</small></div><div><strong>${percent == null ? '—' : `${escapeHtml(percent)}%`}</strong><small>${escapeHtml(sessionJob?.elapsed_seconds || 0)}s elapsed</small></div></div>
+  const stopped = ['failed', 'expired', 'stale', 'cancelled'].includes(sessionJob?.state) || stage === 'failed';
+  const canResume = stopped || sessionJob?.state === 'reconnecting';
+  const debug = window.CREWBIDIQ_ANALYSIS_DEBUG_ENABLED === true ? `<dl class="analysis-debug"><dt>Package ID</dt><dd>${escapeHtml(activePackageId() || '—')}</dd><dt>Job ID</dt><dd>${escapeHtml(currentJobId() || '—')}</dd><dt>State</dt><dd>${escapeHtml(sessionJob?.state || 'idle')}</dd><dt>Last confirmed progress</dt><dd>${escapeHtml(percent || 0)}%</dd><dt>Last successful poll</dt><dd>${escapeHtml(sessionJob?.last_successful_poll_at || '—')}</dd><dt>Latest status</dt><dd>${escapeHtml(latestStatusCode ?? '—')}</dd><dt>Retry count</dt><dd>${escapeHtml(sessionPollFailures)}</dd></dl>` : '';
+  return `<div class="labs-processing ${stopped ? 'failed' : ''}">
+    <div class="labs-processing-heading"><div><span>${stopped ? 'Analysis needs attention' : `Processing ${escapeHtml(packageName)} bid package`}</span><strong>${escapeHtml(sessionJob?.stage_label || (labsUploadBusy ? 'Uploading file' : sessionJob?.user_message || sessionJob?.message || 'Preparing package'))}</strong><small>${escapeHtml(pageDetail || fileDetail || sessionJob?.user_message || sessionJob?.message || 'Your progress is saved if you move to another Labs page.')}</small></div><div><strong>${percent == null ? '—' : `${escapeHtml(percent)}%`}</strong><small>${escapeHtml(sessionJob?.elapsed_seconds || 0)}s elapsed</small></div></div>
     <div class="progress"><i style="width:${Math.max(0, Math.min(Number(percent) || (labsUploadBusy ? 4 : 0), 100))}%"></i></div>
     <ol class="labs-stage-list">${processingStages.map(([value, label], index) => `<li class="${index < activeIndex ? 'done' : (index === activeIndex ? 'active' : '')}"><span>${index + 1}</span>${escapeHtml(label)}</li>`).join('')}</ol>
-    ${stage === 'failed' ? `<div class="labs-upload-error"><strong>${escapeHtml(sessionJob?.error || 'The server could not analyze this package.')}</strong><p>Try again, select the airline manually, upload Southwest files individually, or return to Classic.</p></div>` : ''}
+    ${stopped ? `<div class="labs-upload-error"><strong>${escapeHtml(sessionJob?.user_message || sessionJob?.error || 'The server could not analyze this package.')}</strong><p>Resume the saved analysis, select the airline manually, or upload the package again.</p></div>` : ''}
+    ${canResume ? '<button id="labsResumeAnalysis" class="primary" type="button">Resume analysis</button>' : ''}
+    ${debug}
   </div>`;
 }
 
@@ -479,6 +508,7 @@ async function submitLabsPackage(replaceConfirmed = false) {
   data.append('airline', airline);
   data.append('context', 'labs');
   data.append('profile_json', JSON.stringify(mergedLabsProfile()));
+  data.append('session_id', browserSessionId());
   if (files.packageFile) data.append('file', files.packageFile);
   else {
     data.append('pairings_file', files.pairingsFile);
@@ -491,13 +521,16 @@ async function submitLabsPackage(replaceConfirmed = false) {
     const response = await fetch('/api/jobs', { method: 'POST', body: data, signal: labsUploadController.signal, headers: { Accept: 'application/json' } });
     const responseText = await response.text();
     let body = {}; try { body = responseText ? JSON.parse(responseText) : {}; } catch (_) {}
-    if (!response.ok) throw new Error(body.detail || `Upload failed (${response.status})`);
+    if (!response.ok) throw new Error(analysisErrorDetail(body, `Upload failed (${response.status})`).user_message);
+    if (!body.package_id || body.package_persisted !== true) throw new Error('The upload was not saved. Please upload the bid package again.');
     if (!body.job_id) throw new Error('Upload finished, but the parsing job was not created.');
     invalidatePackageState(body.package_id);
     localStorage.setItem(activePackageKey, body.package_id);
     localStorage.setItem(activeJobKey, body.job_id);
     localStorage.removeItem(latestJobKey);
-    sessionJob = { ...body, status: 'queued', progress: 1, stage: 'detecting_package', stage_label: 'Detecting airline and package type', message: 'Upload received' };
+    lastConfirmedProgress = Number(body.progress_percent ?? body.progress ?? 1);
+    sessionJob = { ...body, status: 'queued', state: body.state || 'queued', progress: lastConfirmedProgress, progress_percent: lastConfirmedProgress, current_stage: body.current_stage || 'queued', stage_label: 'Queued', message: 'Upload received' };
+    persistAnalysis(sessionJob);
     sessionLoading = false;
     labsUploadBusy = false; labsUploadController = null; labsUploadError = '';
     render();
@@ -527,6 +560,7 @@ function bindUploader() {
   document.getElementById('labsConfirmReplace')?.addEventListener('click', () => { document.getElementById('labsReplacePrompt')?.classList.add('hidden'); submitLabsPackage(true); });
   document.getElementById('labsCancelReplace')?.addEventListener('click', () => document.getElementById('labsReplacePrompt')?.classList.add('hidden'));
   document.getElementById('labsCancelUpload')?.addEventListener('click', () => labsUploadController?.abort());
+  document.getElementById('labsResumeAnalysis')?.addEventListener('click', resumeSharedAnalysis);
 }
 
 function bindBuilder() {
@@ -673,33 +707,86 @@ async function loadMonthPlan(jobId) {
   render();
 }
 
+function sharedJobState(body) { return body.state || (body.status === 'complete' ? 'completed' : body.status === 'failed' ? 'failed' : body.status === 'queued' ? 'queued' : 'parsing'); }
+function scheduleSharedPoll(delay = 2000) { clearTimeout(sessionPollTimer); sessionPollTimer = setTimeout(loadSharedSession, delay); }
+async function fetchSharedJob() {
+  const jobId = currentJobId(), packageId = activePackageId();
+  if (!jobId || !packageId) throw Object.assign(new Error('No recoverable analysis reference exists.'), { status: 400, detail: { error_code: 'PACKAGE_NOT_PERSISTED' } });
+  const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 12000);
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}?package_id=${encodeURIComponent(packageId)}`, { headers: analysisHeaders(), signal: controller.signal });
+    latestStatusCode = response.status;
+    const text = await response.text(); let body = {}; try { body = text ? JSON.parse(text) : {}; } catch (_) {}
+    if (!response.ok) { const detail = analysisErrorDetail(body, 'Stored analysis is unavailable.'); throw Object.assign(new Error(detail.user_message), { status: response.status, detail }); }
+    if (body.job_id !== jobId || body.package_id !== packageId) throw Object.assign(new Error('The stored job belongs to another bid package.'), { status: 409, detail: { error_code: 'JOB_PACKAGE_MISMATCH' } });
+    return body;
+  } finally { clearTimeout(timeout); }
+}
+function applySharedJob(body) {
+  const jobId = body.job_id, state = sharedJobState(body);
+  lastConfirmedProgress = Math.max(lastConfirmedProgress, Number(body.progress_percent ?? body.progress ?? 0)); sessionPollFailures = 0;
+  sessionJob = { ...body, state, progress: lastConfirmedProgress, progress_percent: lastConfirmedProgress };
+  acceptPackageResponse(sessionJob); persistAnalysis(sessionJob); sessionLoading = false; render();
+  if (state === 'completed' || body.status === 'complete') {
+    localStorage.setItem(latestJobKey, jobId); localStorage.removeItem(activeJobKey); localStorage.removeItem(analysisStateKey);
+    if (labsPage === 'recommendations') loadRefinedRecommendations(jobId);
+    if (labsPage === 'plan') { loadMonthPlan(jobId); loadNavbluePlan(jobId); }
+  } else if (['queued', 'parsing', 'normalizing', 'ranking'].includes(state)) scheduleSharedPoll(2000);
+}
+function handleSharedFailure(error) {
+  const status = Number(error.status || 0), code = error.detail?.error_code || 'POLLING_NETWORK_ERROR';
+  latestStatusCode = status || 'network'; sessionLoading = false;
+  if (code === 'PACKAGE_NOT_PERSISTED') {
+    localStorage.removeItem(activeJobKey); localStorage.removeItem(latestJobKey); localStorage.removeItem(activePackageKey); localStorage.removeItem(analysisStateKey);
+    sessionJob = null; labsUploadError = 'The upload was not saved. Please upload the bid package again.'; render(); return;
+  }
+  if (status === 404 || status === 410) {
+    sessionJob = { ...(sessionJob || storedAnalysis()), state: status === 410 ? 'expired' : 'stale', current_stage: status === 410 ? 'expired' : 'stale', progress: lastConfirmedProgress, progress_percent: lastConfirmedProgress, error_code: code, user_message: error.message, recoverable: error.detail?.recoverable !== false };
+    persistAnalysis(sessionJob); clearTimeout(sessionPollTimer); render(); return;
+  }
+  if (status === 401 || status === 403 || status === 409 || status === 400) {
+    localStorage.removeItem(activeJobKey); localStorage.removeItem(latestJobKey); localStorage.removeItem(activePackageKey); localStorage.removeItem(analysisStateKey);
+    sessionJob = null; labsUploadError = `${error.message} Please upload the bid package again.`; render(); return;
+  }
+  sessionPollFailures += 1;
+  sessionJob = { ...(sessionJob || storedAnalysis()), state: 'reconnecting', current_stage: sessionJob?.current_stage || 'detecting_package', progress: lastConfirmedProgress, progress_percent: lastConfirmedProgress, error_code: status === 429 ? 'RATE_LIMITED' : 'POLLING_NETWORK_ERROR', user_message: `Connection interrupted. Last confirmed progress: ${lastConfirmedProgress}%.`, retry_count: sessionPollFailures };
+  persistAnalysis(sessionJob); render();
+  if (sessionPollFailures <= 6) scheduleSharedPoll(Math.min(2000 * (2 ** (sessionPollFailures - 1)), 15000));
+}
+async function restartSharedAnalysis() {
+  const packageId = activePackageId(); if (!packageId) throw new Error('The upload was not saved. Please upload the bid package again.');
+  const data = new FormData(); data.append('session_id', browserSessionId());
+  const response = await fetch(`/api/packages/${encodeURIComponent(packageId)}/analysis-jobs`, { method: 'POST', body: data, headers: { Accept: 'application/json' } });
+  latestStatusCode = response.status;
+  const text = await response.text(); let body = {}; try { body = text ? JSON.parse(text) : {}; } catch (_) {}
+  if (!response.ok) { const detail = analysisErrorDetail(body, 'The saved upload could not be restarted.'); throw Object.assign(new Error(detail.user_message), { status: response.status, detail }); }
+  if (!body.job_id || body.package_id !== packageId) throw Object.assign(new Error('The replacement job does not match the active package.'), { status: 409, detail: { error_code: 'JOB_PACKAGE_MISMATCH' } });
+  localStorage.setItem(activeJobKey, body.job_id); localStorage.removeItem(latestJobKey); lastConfirmedProgress = Number(body.progress_percent ?? body.progress ?? 1); persistAnalysis(body); applySharedJob(body);
+}
+async function resumeSharedAnalysis() {
+  if (sessionResumeInFlight) return;
+  sessionResumeInFlight = true; clearTimeout(sessionPollTimer); const button = document.getElementById('labsResumeAnalysis'); if (button) { button.disabled = true; button.textContent = 'Resuming…'; }
+  try {
+    const body = await fetchSharedJob(), state = sharedJobState(body);
+    if ((state === 'failed' || state === 'expired') && body.package_persisted && body.recoverable) await restartSharedAnalysis(); else applySharedJob(body);
+  } catch (error) {
+    if (error.status === 404 || error.status === 410) { try { await restartSharedAnalysis(); } catch (restartError) { handleSharedFailure(restartError); } }
+    else handleSharedFailure(error);
+  } finally { sessionResumeInFlight = false; const currentButton = document.getElementById('labsResumeAnalysis'); if (currentButton) { currentButton.disabled = false; currentButton.textContent = 'Resume analysis'; } }
+}
 async function loadSharedSession() {
+  if (sessionPollInFlight) return;
   const jobId = currentJobId();
   if (!jobId) { sessionLoading = false; render(); return; }
-  try {
-    const response = await fetch(`/api/jobs/${jobId}`, { headers: { Accept: 'application/json' } });
-    if (!response.ok) throw new Error('Stored analysis is unavailable');
-    sessionJob = await response.json();
-    const incomingPackageId = acceptPackageResponse(sessionJob);
-    if (!activePackageId()) localStorage.setItem(activePackageKey, incomingPackageId);
-    if (sessionJob.status === 'complete') {
-      localStorage.setItem(latestJobKey, jobId);
-      localStorage.removeItem(activeJobKey);
-    }
-    sessionLoading = false;
-    render();
-    if (labsPage === 'recommendations' && sessionJob.status === 'complete') loadRefinedRecommendations(jobId);
-    if (labsPage === 'plan' && sessionJob.status === 'complete') { loadMonthPlan(jobId); loadNavbluePlan(jobId); }
-    if (sessionJob.status === 'queued' || sessionJob.status === 'processing') setTimeout(loadSharedSession, 2000);
-  } catch (_) {
-    if (localStorage.getItem(latestJobKey) === jobId) localStorage.removeItem(latestJobKey);
-    localStorage.removeItem(activePackageKey);
-    sessionJob = null;
-    sessionLoading = false;
-    render();
-  }
+  sessionPollInFlight = true;
+  try { applySharedJob(await fetchSharedJob()); }
+  catch (error) { handleSharedFailure(error); }
+  finally { sessionPollInFlight = false; }
 }
 
 document.documentElement.dataset.theme = 'dark';
 render();
 loadSharedSession();
+window.addEventListener('online', () => { if (currentJobId()) resumeSharedAnalysis(); });
+window.addEventListener('pageshow', () => { if (currentJobId()) resumeSharedAnalysis(); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && currentJobId()) resumeSharedAnalysis(); });
