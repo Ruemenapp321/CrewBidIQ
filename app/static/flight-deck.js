@@ -32,7 +32,19 @@ let filterState = {
 };
 let sortMode = 'best';
 let selectionNotice = '';
-function browserSessionId() { let value = localStorage.getItem(analysisSessionKey); if (!value) { value = globalThis.crypto?.randomUUID?.() || `session-${Date.now()}-${Math.random().toString(16).slice(2)}`; localStorage.setItem(analysisSessionKey, value); } return value; }
+function browserSessionId() { let value = localStorage.getItem(analysisSessionKey); if (!value) { value = globalThis.crypto?.randomUUID?.() || `session-${Date.now()}-${Math.random().toString(16).slice(2)}`; safeLocalStorageSetItem(analysisSessionKey, value); } return value; }
+function isQuotaExceededError(error) { return Boolean(error && (error.name === 'QuotaExceededError' || error.code === 22 || error.code === 1014)); }
+function safeLocalStorageSetItem(key, value) {
+  try { localStorage.setItem(key, value); return true; }
+  catch (error) {
+    if (isQuotaExceededError(error)) {
+      console.warn(`Optional browser state was not saved due to storage quota limits for ${key}.`);
+      return false;
+    }
+    throw error;
+  }
+}
+function safeLocalStorageRemoveItem(key) { try { localStorage.removeItem(key); } catch (_) {} }
 
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, character => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -55,14 +67,14 @@ function flightDeckSessionId() {
   let value = localStorage.getItem('crewbidiqAnalysisSession') || localStorage.getItem(flightDeckSessionKey);
   if (!value) {
     value = globalThis.crypto?.randomUUID?.() || `flight-deck-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    localStorage.setItem(flightDeckSessionKey, value);
+    safeLocalStorageSetItem(flightDeckSessionKey, value);
   }
   return value;
 }
 
 function clearPackageDependentState(nextPackageId = '') {
-  packageStateKeys.forEach(key => localStorage.removeItem(key));
-  if (nextPackageId) localStorage.setItem(activePackageKey, nextPackageId);
+  packageStateKeys.forEach(key => safeLocalStorageRemoveItem(key));
+  if (nextPackageId) safeLocalStorageSetItem(activePackageKey, nextPackageId);
 }
 
 function acceptPackageResponse(body) {
@@ -74,7 +86,7 @@ function acceptPackageResponse(body) {
   if (records.some(record => record.package_id !== incoming || !canonicalTrips(record).length || canonicalTrips(record).some(trip => trip.package_id !== incoming))) {
     throw new Error('Mixed-package results were rejected.');
   }
-  if (!expected) localStorage.setItem(activePackageKey, incoming);
+  if (!expected) safeLocalStorageSetItem(activePackageKey, incoming);
   return incoming;
 }
 
@@ -83,7 +95,7 @@ function packageScopedIds(key) {
   const expectedPackage = activePackageId(), expectedSession = flightDeckSessionId();
   if (!stored) return [];
   if (stored.package_id !== expectedPackage || stored.session_id !== expectedSession || !Array.isArray(stored.trip_ids)) {
-    localStorage.removeItem(key);
+    safeLocalStorageRemoveItem(key);
     return [];
   }
   return [...new Set(stored.trip_ids.map(value => String(value || '')).filter(Boolean))];
@@ -92,7 +104,7 @@ function packageScopedIds(key) {
 function savePackageScopedIds(key, tripIds) {
   const packageId = activePackageId();
   if (!packageId) return;
-  localStorage.setItem(key, JSON.stringify({
+  safeLocalStorageSetItem(key, JSON.stringify({
     package_id: packageId,
     session_id: flightDeckSessionId(),
     trip_ids: [...new Set(tripIds)],
@@ -1132,7 +1144,7 @@ function applyTheme() {
 
 document.getElementById('flightDeckTheme')?.addEventListener('click', () => {
   const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
-  localStorage.setItem('crewbidiqTheme', next); applyTheme();
+  safeLocalStorageSetItem('crewbidiqTheme', next); applyTheme();
 });
 
 document.addEventListener('fullscreenchange', () => setTimeout(() => flightDeckMap?.invalidateSize(), 0));
