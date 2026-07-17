@@ -107,7 +107,8 @@ FLIGHT_DECK_HTML = r"""
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#071525">
   <title>Flight Deck Preview | CrewBidIQ</title>
-  <link rel="stylesheet" href="/static/app.css?v=0427">
+  __FLIGHT_DECK_MAP_STYLES__
+  <link rel="stylesheet" href="/static/app.css?v=0428">
 </head>
 <body class="labs-body flight-deck-body" data-flight-deck-page="__FLIGHT_DECK_PAGE__">
 <div class="app-shell">
@@ -137,7 +138,8 @@ FLIGHT_DECK_HTML = r"""
   </div>
 </div>
 <script>window.CREWBIDIQ_FLIGHT_DECK_PAGE="__FLIGHT_DECK_PAGE__";window.CREWBIDIQ_FLIGHT_DECK_TRIP_ID=__TRIP_ID_JSON__;</script>
-<script src="/static/flight-deck.js?v=0003"></script>
+__FLIGHT_DECK_MAP_SCRIPTS__
+<script src="/static/flight-deck.js?v=0004"></script>
 </body>
 </html>
 """
@@ -146,10 +148,17 @@ FLIGHT_DECK_HTML = r"""
 def flight_deck_page(page: str, trip_id: str = "") -> HTMLResponse:
     if not labs_enabled() or not flight_deck_preview_enabled():
         raise HTTPException(404, "Flight Deck Preview is not enabled")
+    map_styles = '<link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css?v=1.9.4">' if page == "trip" else ""
+    map_scripts = (
+        '<script src="/static/airport-coordinates.js?v=20260716"></script>\n'
+        '<script src="/static/vendor/leaflet/leaflet.js?v=1.9.4"></script>'
+        if page == "trip" else ""
+    )
     return HTMLResponse(
-        FLIGHT_DECK_HTML.replace("__FLIGHT_DECK_PAGE__", page).replace(
-            "__TRIP_ID_JSON__", json.dumps(trip_id).replace("<", "\\u003c")
-        )
+        FLIGHT_DECK_HTML.replace("__FLIGHT_DECK_PAGE__", page)
+        .replace("__TRIP_ID_JSON__", json.dumps(trip_id).replace("<", "\\u003c"))
+        .replace("__FLIGHT_DECK_MAP_STYLES__", map_styles)
+        .replace("__FLIGHT_DECK_MAP_SCRIPTS__", map_scripts)
     )
 
 

@@ -1,8 +1,10 @@
+import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.canonical import attach_canonical_trip
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -214,7 +216,7 @@ def test_trip_briefing_has_airline_titles_and_all_required_sections():
     ):
         assert f"<h2>{section}</h2>" in script
     assert "Exact match explanation" in script
-    assert 'src="/static/flight-deck.js?v=0003"' in labs
+    assert 'src="/static/flight-deck.js?v=0004"' in labs
 
 
 def test_trip_briefing_reads_trip_facts_from_confirmed_canonical_models_only():
@@ -333,3 +335,107 @@ def test_trip_flow_mobile_layout_stacks_connections_and_layover_details():
     assert ".fd-duty-layover{display:grid;grid-template-columns:1fr auto 1fr" in styles
     assert ".fd-duty-layover{grid-template-columns:1fr}" in styles
     assert ".fd-trip-connection{align-items:flex-start;flex-direction:column}" in styles
+
+
+def test_ordered_leg_route_map_stress_fixture_preserves_every_segment_and_event():
+    source = json.loads((ROOT / "tests" / "fixtures" / "flight_deck_route_map.json").read_text(encoding="utf-8"))
+    model = attach_canonical_trip(source, source["package_id"])["canonical_trip"]
+    legs = model["ordered_legs"]
+    events = [legs[0]["origin"], *[leg["destination"] for leg in legs]]
+
+    assert len(legs) == 25
+    assert len(events) == 26
+    assert len(model["duty_days"]) == 5
+    assert [len(day["ordered_legs"]) for day in model["duty_days"]] == [5, 5, 5, 5, 5]
+    assert [leg for day in model["duty_days"] for leg in day["ordered_legs"]] == legs
+    assert model["route_map_airports"] == events
+    assert [(leg["origin"], leg["destination"]) for leg in legs][-5:] == [
+        ("SMF", "LAX"), ("LAX", "SMF"), ("SMF", "SAN"), ("SAN", "PHX"), ("PHX", "LAX")
+    ]
+    assert events.count("LAX") == 3
+    assert events.count("SMF") == 2
+
+
+def test_route_map_airport_database_is_verified_and_keyed_by_iata_and_icao():
+    coordinate_script = (ROOT / "app" / "static" / "airport-coordinates.js").read_text(encoding="utf-8")
+    payload = coordinate_script.split("Object.freeze(", 1)[1].rsplit(");", 1)[0]
+    coordinates = json.loads(payload)
+    stress_airports = {
+        "LAX", "LAS", "AUS", "DEN", "MDW", "DTW", "MCO", "MIA", "BWI", "COS",
+        "SAT", "HOU", "DAL", "ELP", "SEA", "OAK", "BUR", "SMF", "SAN", "PHX",
+    }
+
+    assert "OurAirports airports.csv (Public Domain)" in coordinate_script
+    assert len(coordinates) >= 8000
+    assert stress_airports <= coordinates.keys()
+    assert coordinates["LAX"] == coordinates["KLAX"]
+    assert coordinates["LHR"] == coordinates["EGLL"]
+    assert all(-90 <= coordinates[code]["latitude"] <= 90 for code in stress_airports)
+    assert all(-180 <= coordinates[code]["longitude"] <= 180 for code in stress_airports)
+
+
+def test_flight_deck_loads_local_leaflet_and_coordinates_before_map_code(monkeypatch):
+    monkeypatch.setenv("LABS_ENABLED", "true")
+    monkeypatch.setenv("FLIGHT_DECK_PREVIEW_ENABLED", "true")
+    with TestClient(app) as client:
+        page = client.get("/labs/flight-deck/trip/route-map-stress-package%3AMAP25")
+        results_page = client.get("/labs/flight-deck")
+
+    assert page.status_code == 200
+    assert '/static/vendor/leaflet/leaflet.css?v=1.9.4' in page.text
+    assert page.text.index('/static/airport-coordinates.js?v=20260716') < page.text.index('/static/vendor/leaflet/leaflet.js?v=1.9.4')
+    assert page.text.index('/static/vendor/leaflet/leaflet.js?v=1.9.4') < page.text.index('/static/flight-deck.js?v=0004')
+    assert "/static/airport-coordinates.js" not in results_page.text
+    assert "/static/vendor/leaflet/leaflet.js" not in results_page.text
+    assert (ROOT / "app" / "static" / "vendor" / "leaflet" / "leaflet.js").is_file()
+    assert "Leaflet 1.9.4" in (ROOT / "app" / "static" / "vendor" / "leaflet" / "leaflet.js").read_text(encoding="utf-8")
+
+
+def test_route_map_builds_chronological_segments_without_airport_deduplication():
+    script = (ROOT / "app" / "static" / "flight-deck.js").read_text(encoding="utf-8")
+    builder = script.split("function canonicalMapLegs(models)", 1)[1].split("function canonicalMapEvents", 1)[0]
+    renderer = script.split("function initializeFlightDeckMap(models)", 1)[1].split("function toggleRouteMapFullscreen", 1)[0]
+
+    assert "model.ordered_legs" in builder
+    assert "orderedLegs.map" in builder
+    assert "routeSegmentIndex: ++routeSegmentIndex" in builder
+    assert "new Set" not in builder
+    assert "visibleLegs.forEach" in renderer
+    assert "greatCircleArc(origin, destination)" in renderer
+    assert "splitGreatCircleAtDateLine(arc)" in renderer
+    assert "unwrapRoutePoints(part, routeLongitudeAnchor)" in renderer
+    assert "worldCopyJump: true" in renderer
+    assert "fitBounds" in renderer
+    assert "route_map_airports" not in renderer
+
+
+def test_route_map_visual_roles_filters_and_trip_flow_synchronization_are_explicit():
+    script = (ROOT / "app" / "static" / "flight-deck.js").read_text(encoding="utf-8")
+    styles = (ROOT / "app" / "static" / "app.css").read_text(encoding="utf-8")
+
+    for text in ("All Days", "Global Route Map", "Home Base", "Layover", "Connection", "Favorite", "Full Screen"):
+        assert text in script
+    assert "Array.from({ length: dayCount }" in script
+    assert "entry.mapDayIndex" in script
+    assert 'data-map-duty-day="${mapDayIndex}"' in script
+    assert "syncTripFlowMapDay" in script
+    assert "fd-map-day-selected" in script
+    assert "fd-map-day-muted" in script
+    assert "operation === 'deadhead' ? '#e45656' : '#21ad6b'" in script
+    assert "dashArray: operation === 'deadhead' ? '8 8' : null" in script
+    assert "fd-map-pin-home" in styles
+    assert "fd-map-pin-layover" in styles
+    assert "fd-map-pin-connection" in styles
+    assert ".fd-map-legend .fd-legend-deadhead:before{border-top-style:dashed}" in styles
+
+
+def test_route_map_desktop_mobile_and_fullscreen_layouts_are_responsive():
+    styles = (ROOT / "app" / "static" / "app.css").read_text(encoding="utf-8")
+
+    assert ".fd-route-map{height:460px;min-height:320px" in styles
+    assert ".fd-route-map-shell:fullscreen,.fd-route-map-expanded" in styles
+    assert ".fd-route-map-expanded{position:fixed;z-index:1000;inset:0" in styles
+    assert ".fd-route-map-toolbar{align-items:stretch;flex-direction:column}" in styles
+    assert ".fd-map-day-filters button,.fd-map-fullscreen{min-height:44px}" in styles
+    assert ".fd-route-map{height:390px;min-height:300px}" in styles
+    assert "[data-theme=dark] .fd-route-map .leaflet-tile" in styles

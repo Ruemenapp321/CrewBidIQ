@@ -12,6 +12,10 @@ const packageStateKeys = [shortlistKey, comparisonKey, 'crewbidiqPbsPool', 'crew
 let sessionJob = null;
 let sessionLoading = true;
 let sessionError = '';
+let selectedMapDay = 'all';
+let flightDeckMap = null;
+let flightDeckMapLayers = null;
+let renderedBriefingModels = [];
 let filterState = {
   exactOnly: false,
   oneDay: false,
@@ -454,21 +458,254 @@ function thingsToKnow(item) {
     ${neutral.length ? `<div class="fd-briefing-detail"><h3>Neutral trip facts</h3>${detailList(neutral)}</div>` : ''}`;
 }
 
+function canonicalDutyDayGroups(models) {
+  let dayOffset = 0;
+  return models.map(model => {
+    const canonicalDays = Array.isArray(model.duty_days) ? model.duty_days : [];
+    const days = canonicalDays.map((day, dayIndex) => ({ day, mapDayIndex: dayOffset + dayIndex + 1 }));
+    dayOffset += days.length;
+    return { model, days };
+  });
+}
+
+function canonicalMapLegs(models) {
+  let routeSegmentIndex = 0;
+  return canonicalDutyDayGroups(models).flatMap(({ model, days }, modelIndex) => {
+    const dayIndexByCanonicalValue = new Map(days.map(({ day, mapDayIndex }) => [String(day.day_index), mapDayIndex]));
+    const orderedLegs = Array.isArray(model.ordered_legs) ? model.ordered_legs : [];
+    return orderedLegs.map((leg, modelLegIndex) => ({
+      leg,
+      model,
+      modelIndex,
+      modelLegIndex,
+      mapDayIndex: dayIndexByCanonicalValue.get(String(leg.duty_day_index)) || null,
+      routeSegmentIndex: ++routeSegmentIndex,
+    }));
+  });
+}
+
+function canonicalMapEvents(visibleLegs, allLegs = visibleLegs) {
+  if (!visibleLegs.length) return [];
+  const first = visibleLegs[0];
+  const previousLeg = allLegs[first.routeSegmentIndex - 2] || null;
+  const events = [{
+    airport: first.leg.origin,
+    mapDayIndex: first.mapDayIndex,
+    model: first.model,
+    leg: first.leg,
+    previousLeg,
+    nextLeg: first,
+    boundaryAfterDutyDay: previousLeg && previousLeg.model === first.model && previousLeg.mapDayIndex !== first.mapDayIndex
+      ? previousLeg.leg.duty_day_index : null,
+  }];
+  visibleLegs.forEach(entry => {
+    const nextLeg = allLegs[entry.routeSegmentIndex] || null;
+    events.push({
+      airport: entry.leg.destination,
+      mapDayIndex: entry.mapDayIndex,
+      model: entry.model,
+      leg: entry.leg,
+      previousLeg: entry,
+      nextLeg,
+      boundaryAfterDutyDay: !nextLeg || nextLeg.model !== entry.model || nextLeg.mapDayIndex !== entry.mapDayIndex
+        ? entry.leg.duty_day_index : null,
+    });
+  });
+  return events.map((event, eventIndex) => ({ ...event, eventIndex: eventIndex + 1 }));
+}
+
+function airportCoordinate(airport) {
+  const code = String(airport || '').trim().toUpperCase();
+  const record = window.CREWBIDIQ_AIRPORT_COORDINATES?.[code];
+  if (!record || !Number.isFinite(record.latitude) || !Number.isFinite(record.longitude)) return null;
+  return { ...record, code };
+}
+
+function mapEventRole(event) {
+  const airport = String(event.airport || '').toUpperCase();
+  if (airport && airport === String(event.model?.base || '').toUpperCase()) return 'home';
+  const isCanonicalLayover = event.boundaryAfterDutyDay !== null && (event.model?.layovers || []).some(layover => (
+    String(layover.after_duty_day) === String(event.boundaryAfterDutyDay)
+      && layoverAirport(layover) === airport
+  ));
+  return isCanonicalLayover ? 'layover' : 'connection';
+}
+
+function greatCircleArc(start, end, pointCount = 48) {
+  const radians = degrees => degrees * Math.PI / 180;
+  const degrees = radiansValue => radiansValue * 180 / Math.PI;
+  const vector = coordinate => {
+    const latitude = radians(coordinate.latitude), longitude = radians(coordinate.longitude);
+    return [Math.cos(latitude) * Math.cos(longitude), Math.cos(latitude) * Math.sin(longitude), Math.sin(latitude)];
+  };
+  const startVector = vector(start), endVector = vector(end);
+  const angle = Math.acos(Math.max(-1, Math.min(1, startVector.reduce((sum, value, index) => sum + value * endVector[index], 0))));
+  if (angle < 1e-10) return [[start.latitude, start.longitude], [end.latitude, end.longitude]];
+  const denominator = Math.sin(angle);
+  return Array.from({ length: pointCount + 1 }, (_, index) => {
+    const fraction = index / pointCount;
+    const startWeight = Math.sin((1 - fraction) * angle) / denominator;
+    const endWeight = Math.sin(fraction * angle) / denominator;
+    const x = startWeight * startVector[0] + endWeight * endVector[0];
+    const y = startWeight * startVector[1] + endWeight * endVector[1];
+    const z = startWeight * startVector[2] + endWeight * endVector[2];
+    return [degrees(Math.atan2(z, Math.hypot(x, y))), ((degrees(Math.atan2(y, x)) + 540) % 360) - 180];
+  });
+}
+
+function splitGreatCircleAtDateLine(points) {
+  if (!points.length) return [];
+  const parts = [[points[0]]];
+  for (let index = 1; index < points.length; index += 1) {
+    const previous = points[index - 1], current = points[index];
+    const difference = current[1] - previous[1];
+    if (Math.abs(difference) <= 180) {
+      parts[parts.length - 1].push(current);
+      continue;
+    }
+    const crossingLongitude = difference < -180 ? 180 : -180;
+    const wrappedLongitude = difference < -180 ? current[1] + 360 : current[1] - 360;
+    const fraction = (crossingLongitude - previous[1]) / (wrappedLongitude - previous[1]);
+    const crossingLatitude = previous[0] + (current[0] - previous[0]) * fraction;
+    parts[parts.length - 1].push([crossingLatitude, crossingLongitude]);
+    parts.push([[crossingLatitude, -crossingLongitude], current]);
+  }
+  return parts;
+}
+
+function unwrapRoutePoints(points, anchorLongitude = null) {
+  let previousLongitude = anchorLongitude;
+  return points.map(([latitude, rawLongitude]) => {
+    let longitude = rawLongitude;
+    if (previousLongitude !== null) {
+      while (longitude - previousLongitude > 180) longitude -= 360;
+      while (longitude - previousLongitude < -180) longitude += 360;
+    }
+    previousLongitude = longitude;
+    return [latitude, longitude];
+  });
+}
+
+function routeMapMarkup(models) {
+  const legs = canonicalMapLegs(models);
+  if (!legs.length) return '<p class="fd-missing">Canonical ordered legs are unavailable for the route map.</p>';
+  const dayCount = canonicalDutyDayGroups(models).reduce((total, group) => total + group.days.length, 0);
+  if (selectedMapDay !== 'all' && (Number(selectedMapDay) < 1 || Number(selectedMapDay) > dayCount)) selectedMapDay = 'all';
+  const events = canonicalMapEvents(legs);
+  const dayButtons = [['all', 'All Days'], ...Array.from({ length: dayCount }, (_, index) => [String(index + 1), `Day ${index + 1}`])];
+  return `<div class="fd-route-map-shell" data-selected-day="${escapeHtml(selectedMapDay)}">
+    <div class="fd-route-map-toolbar"><div class="fd-map-day-filters" role="group" aria-label="Route map duty-day filter">${dayButtons.map(([value, label]) => `<button type="button" data-map-day="${value}" aria-pressed="${selectedMapDay === value}">${label}</button>`).join('')}</div><button type="button" class="fd-map-fullscreen" data-action="map-fullscreen" aria-label="Open route map full screen">Full Screen</button></div>
+    <div class="fd-map-legend" aria-label="Route map legend"><span class="fd-legend-operating">Operating</span><span class="fd-legend-deadhead">Deadhead</span><span class="fd-legend-home">Home Base</span><span class="fd-legend-layover">Layover</span><span class="fd-legend-connection">Connection</span><span class="fd-legend-favorite">Favorite</span></div>
+    <div id="flightDeckRouteMap" class="fd-route-map" role="application" aria-label="Interactive chronological trip route map"></div>
+    <div id="flightDeckMapNotice" class="fd-map-notice" aria-live="polite"></div>
+    <p class="fd-map-sequence-summary"><strong>${legs.length}</strong> ordered route segment${legs.length === 1 ? '' : 's'} &middot; <strong>${events.length}</strong> ordered airport event${events.length === 1 ? '' : 's'}. Repeated visits remain in sequence. Airport coordinates: <a href="https://ourairports.com/data/" target="_blank" rel="noopener">OurAirports public-domain data</a>.</p>
+  </div>`;
+}
+
+function syncTripFlowMapDay() {
+  document.querySelectorAll('.fd-duty-day[data-map-duty-day]').forEach(day => {
+    const selected = selectedMapDay === 'all' || day.dataset.mapDutyDay === selectedMapDay;
+    day.classList.toggle('fd-map-day-selected', selectedMapDay !== 'all' && selected);
+    day.classList.toggle('fd-map-day-muted', selectedMapDay !== 'all' && !selected);
+  });
+}
+
+function initializeFlightDeckMap(models) {
+  const mapElement = document.getElementById('flightDeckRouteMap');
+  if (!mapElement) return;
+  if (!window.L || !window.CREWBIDIQ_AIRPORT_COORDINATES) {
+    mapElement.innerHTML = '<p class="fd-missing">The interactive route map is temporarily unavailable.</p>';
+    return;
+  }
+  const allLegs = canonicalMapLegs(models);
+  const visibleLegs = selectedMapDay === 'all' ? allLegs : allLegs.filter(entry => String(entry.mapDayIndex) === selectedMapDay);
+  const visibleEvents = canonicalMapEvents(visibleLegs, allLegs);
+  if (flightDeckMap) flightDeckMap.remove();
+  flightDeckMap = window.L.map(mapElement, { worldCopyJump: true, minZoom: 2, zoomControl: true });
+  window.L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    maxZoom: 19,
+  }).addTo(flightDeckMap);
+  flightDeckMapLayers = window.L.layerGroup().addTo(flightDeckMap);
+  const bounds = [];
+  const missingAirports = new Set();
+  let routeLongitudeAnchor = null;
+  visibleLegs.forEach(entry => {
+    const origin = airportCoordinate(entry.leg.origin), destination = airportCoordinate(entry.leg.destination);
+    if (!origin || !destination) {
+      if (!origin) missingAirports.add(String(entry.leg.origin || 'unknown'));
+      if (!destination) missingAirports.add(String(entry.leg.destination || 'unknown'));
+      return;
+    }
+    const operation = entry.leg.operating_or_deadhead === 'deadhead' ? 'deadhead' : 'operating';
+    const arc = greatCircleArc(origin, destination);
+    splitGreatCircleAtDateLine(arc).forEach(part => {
+      const displayedPart = unwrapRoutePoints(part, routeLongitudeAnchor);
+      routeLongitudeAnchor = displayedPart[displayedPart.length - 1][1];
+      window.L.polyline(displayedPart, {
+        className: `fd-map-leg fd-map-leg-${operation}`,
+        color: operation === 'deadhead' ? '#e45656' : '#21ad6b',
+        dashArray: operation === 'deadhead' ? '8 8' : null,
+        lineCap: 'round',
+        opacity: 0.92,
+        weight: 4,
+      }).bindPopup(`<strong>Leg ${entry.routeSegmentIndex}</strong><br>${escapeHtml(entry.leg.origin)} &rarr; ${escapeHtml(entry.leg.destination)}<br>${operation === 'deadhead' ? 'Deadhead' : 'Operating'}${entry.leg.flight_number ? ` &middot; Flight ${escapeHtml(entry.leg.flight_number)}` : ''}`).addTo(flightDeckMapLayers);
+      bounds.push(...displayedPart);
+    });
+  });
+  const favorites = preferredAirports();
+  let eventLongitudeAnchor = bounds[0]?.[1] ?? null;
+  visibleEvents.forEach(event => {
+    const coordinate = airportCoordinate(event.airport);
+    if (!coordinate) return;
+    const role = mapEventRole(event);
+    const favorite = favorites.has(String(event.airport || '').toUpperCase());
+    const roleLabel = ({ home: 'Home base', layover: 'Layover', connection: 'Connection' })[role];
+    const icon = window.L.divIcon({
+      className: 'fd-map-marker',
+      html: `<span class="fd-map-pin fd-map-pin-${role}" data-map-event-index="${event.eventIndex}">${role === 'home' ? '&#8962;' : event.eventIndex}${favorite ? '<b aria-label="Favorite destination">&#9733;</b>' : ''}</span>`,
+      iconAnchor: [17, 17], iconSize: [34, 34], popupAnchor: [0, -16],
+    });
+    const displayedCoordinate = unwrapRoutePoints([[coordinate.latitude, coordinate.longitude]], eventLongitudeAnchor)[0];
+    eventLongitudeAnchor = displayedCoordinate[1];
+    window.L.marker(displayedCoordinate, { icon, keyboard: true, title: `${event.eventIndex}. ${event.airport} - ${roleLabel}` })
+      .bindPopup(`<strong>${event.eventIndex}. ${escapeHtml(event.airport)}</strong><br>${escapeHtml(coordinate.name)}<br>${roleLabel}${favorite ? ' &middot; Favorite destination' : ''}`)
+      .addTo(flightDeckMapLayers);
+  });
+  if (bounds.length === 1) flightDeckMap.setView(bounds[0], 6);
+  else if (bounds.length > 1) flightDeckMap.fitBounds(window.L.latLngBounds(bounds), { padding: [28, 28], maxZoom: 7 });
+  else flightDeckMap.setView([20, 0], 2);
+  const notice = document.getElementById('flightDeckMapNotice');
+  if (notice && missingAirports.size) notice.textContent = `Coordinates unavailable for: ${[...missingAirports].join(', ')}. Affected legs were not drawn.`;
+  setTimeout(() => flightDeckMap?.invalidateSize(), 0);
+  syncTripFlowMapDay();
+}
+
+function toggleRouteMapFullscreen() {
+  const shell = document.querySelector('.fd-route-map-shell');
+  if (!shell) return;
+  if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen();
+  else if (shell.requestFullscreen) shell.requestFullscreen();
+  else shell.classList.toggle('fd-route-map-expanded');
+  setTimeout(() => flightDeckMap?.invalidateSize(), 0);
+}
+
 function tripFlow(models) {
-  const groups = models.map(model => {
-    const days = Array.isArray(model.duty_days) ? model.duty_days : [];
+  const groups = canonicalDutyDayGroups(models).map(({ model, days: mappedDays }) => {
+    if (!Array.isArray(model.duty_days)) return '';
+    const days = mappedDays;
     if (!days.length) return '';
-    const dayCards = days.map(day => {
+    const dayCards = days.map(({ day, mapDayIndex }) => {
       const legs = Array.isArray(day.ordered_legs) ? day.ordered_legs : [];
       const legRows = legs.length ? legs.map(leg => {
         const operation = leg.operating_or_deadhead === 'deadhead' ? 'Deadhead' : 'Operating';
         const details = [operation, leg.flight_number ? `Flight ${leg.flight_number}` : null, leg.equipment ? `Aircraft ${leg.equipment}` : null].filter(Boolean);
         const connection = leg.connection_after ? `<div class="fd-trip-connection"><span>Connection / Sit</span><strong>${escapeHtml(displayValue(leg.destination))} | ${escapeHtml(leg.connection_after)}</strong></div>` : '';
-        return `<li class="fd-trip-leg"><span>${escapeHtml(displayValue(leg.sequence_index))}</span><div><strong>${escapeHtml(displayValue(leg.origin))} &rarr; ${escapeHtml(displayValue(leg.destination))}</strong><small>${escapeHtml(details.join(' | '))}</small><div class="fd-leg-times"><span>Depart <strong>${escapeHtml(formatLocalTime24(leg.local_departure_time))}</strong></span><span>Arrive <strong>${escapeHtml(formatLocalTime24(leg.local_arrival_time))}</strong></span></div>${connection}</div></li>`;
+        return `<li class="fd-trip-leg" data-map-leg-sequence="${escapeHtml(displayValue(leg.sequence_index))}"><span>${escapeHtml(displayValue(leg.sequence_index))}</span><div><strong>${escapeHtml(displayValue(leg.origin))} &rarr; ${escapeHtml(displayValue(leg.destination))}</strong><small>${escapeHtml(details.join(' | '))}</small><div class="fd-leg-times"><span>Depart <strong>${escapeHtml(formatLocalTime24(leg.local_departure_time))}</strong></span><span>Arrive <strong>${escapeHtml(formatLocalTime24(leg.local_arrival_time))}</strong></span></div>${connection}</div></li>`;
       }).join('') : '<li class="fd-missing">No normalized legs are available for this duty day.</li>';
       const layover = day.layover_after_duty;
       const layoverBlock = layover ? `<footer class="fd-duty-layover"><div><span>Layover / Overnight after release</span><strong>${escapeHtml(displayValue(layover.airport || layover.city))}</strong></div><div><span>Duration</span><strong>${escapeHtml(displayValue(layover.duration))}</strong></div><div><span>Hotel</span><strong>${escapeHtml(displayValue(layover.hotel))}</strong></div></footer>` : '<footer class="fd-duty-layover fd-no-layover"><span>No canonical layover after release.</span></footer>';
-      return `<article class="fd-duty-day" data-duty-day="${escapeHtml(displayValue(day.day_index))}"><header><div><span>Duty Day ${escapeHtml(displayValue(day.day_index))}</span><strong>${escapeHtml(displayValue(day.calendar_date, 'Date unavailable'))}</strong></div><div class="fd-duty-endpoints"><small>Local Report</small><strong>${escapeHtml(formatLocalTime24(day.report_event?.local_time))}</strong><span>${escapeHtml(displayValue(day.report_event?.airport, 'Airport unavailable'))}</span><small>Local Release</small><strong>${escapeHtml(formatLocalTime24(day.release_event?.local_time))}</strong><span>${escapeHtml(displayValue(day.release_event?.airport, 'Airport unavailable'))}</span></div></header><ol>${legRows}</ol>${layoverBlock}</article>`;
+      return `<article class="fd-duty-day" data-duty-day="${escapeHtml(displayValue(day.day_index))}" data-map-duty-day="${mapDayIndex}"><header><div><span>Duty Day ${escapeHtml(displayValue(day.day_index))}</span><strong>${escapeHtml(displayValue(day.calendar_date, 'Date unavailable'))}</strong></div><div class="fd-duty-endpoints"><small>Local Report</small><strong>${escapeHtml(formatLocalTime24(day.report_event?.local_time))}</strong><span>${escapeHtml(displayValue(day.report_event?.airport, 'Airport unavailable'))}</span><small>Local Release</small><strong>${escapeHtml(formatLocalTime24(day.release_event?.local_time))}</strong><span>${escapeHtml(displayValue(day.release_event?.airport, 'Airport unavailable'))}</span></div></header><ol>${legRows}</ol>${layoverBlock}</article>`;
     }).join('');
     const showMember = models.length > 1;
     return `<div class="fd-duty-group" data-canonical-trip-id="${escapeHtml(model.id)}">${showMember ? `<h3>${escapeHtml(model.terminology || 'pairing')} ${escapeHtml(model.source_trip_number)}</h3>` : ''}${dayCards}</div>`;
@@ -547,6 +784,7 @@ function tripBriefingPage() {
   const models = briefingModels(item);
   const model = briefingPrimaryModel(item);
   if (!models.length) return `${pageHero('TRIP BRIEFING', 'Trip unavailable', 'Confirmed canonical bidable inventory is unavailable for this result.')}<a class="primary button" href="/labs/flight-deck">Return to results</a>`;
+  renderedBriefingModels = models;
   const exactExplanation = matchClass(item) === 'exact'
     ? uniqueDetails([...(item.qualification_reasons || []), ...(item.matched_preferences || [])])
     : uniqueDetails(item.eligibility_violations || item.hard_failures || item.violations || item.qualification_reasons || []);
@@ -561,6 +799,7 @@ function tripBriefingPage() {
         <div class="fd-briefing-detail"><h3>${matchClass(item) === 'exact' ? 'Exact match explanation' : 'Match explanation'}</h3>${detailList(exactExplanation, 'A recommendation explanation is unavailable.')}</div>
       </section>
       <section class="surface fd-briefing-section"><span class="fd-section-number">02</span><h2>Operational Highlights</h2>${operationalHighlights(model)}</section>
+      <section class="surface fd-briefing-section fd-briefing-wide fd-route-map-section"><span class="fd-section-number">MAP</span><h2>Global Route Map</h2>${routeMapMarkup(models)}</section>
       <section class="surface fd-briefing-section"><span class="fd-section-number">03</span><h2>Things to Know</h2>${thingsToKnow(item)}</section>
       <section class="surface fd-briefing-section fd-briefing-wide"><span class="fd-section-number">04</span><span class="fd-trip-flow-label">Trip Flow</span><h2>Duty-Day Summary</h2><div class="fd-trip-flow">${tripFlow(models)}</div></section>
       <section class="surface fd-briefing-section fd-briefing-wide"><span class="fd-section-number">05</span><h2>Layovers and Hotels</h2>${layoversAndHotels(models)}</section>
@@ -585,6 +824,10 @@ function loadingPage() {
 }
 
 function render() {
+  if (flightDeckMap) flightDeckMap.remove();
+  flightDeckMap = null;
+  flightDeckMapLayers = null;
+  renderedBriefingModels = [];
   if (sessionLoading) flightDeckContent.innerHTML = loadingPage();
   else if (sessionError) flightDeckContent.innerHTML = `${pageHero('FLIGHT DECK PREVIEW', 'Package unavailable', sessionError)}<a class="primary button" href="/labs">Open Labs</a>`;
   else if (!sessionJob) flightDeckContent.innerHTML = noPackagePage();
@@ -595,6 +838,7 @@ function render() {
   }
   document.querySelectorAll('[data-flight-deck-route]').forEach(link => link.classList.toggle('active', link.dataset.flightDeckRoute === flightDeckPage));
   bindControls();
+  if (flightDeckPage === 'trip' && renderedBriefingModels.length) initializeFlightDeckMap(renderedBriefingModels);
 }
 
 function bindControls() {
@@ -603,8 +847,13 @@ function bindControls() {
     filterState[event.target.dataset.filter] = event.target.checked;
     render();
   }));
+  document.querySelectorAll('[data-map-day]').forEach(control => control.addEventListener('click', event => {
+    selectedMapDay = event.currentTarget.dataset.mapDay || 'all';
+    render();
+  }));
   document.querySelectorAll('[data-action]').forEach(control => control.addEventListener('click', event => {
     const action = event.currentTarget.dataset.action;
+    if (action === 'map-fullscreen') { toggleRouteMapFullscreen(); return; }
     if (action === 'clear-filters') filterState = Object.fromEntries(Object.keys(filterState).map(key => [key, false]));
     if (action === 'shortlist') togglePackageScopedId(shortlistKey, event.currentTarget.dataset.tripId);
     if (action === 'compare') togglePackageScopedId(comparisonKey, event.currentTarget.dataset.tripId, 4);
@@ -640,9 +889,15 @@ document.getElementById('flightDeckTheme')?.addEventListener('click', () => {
   localStorage.setItem('crewbidiqTheme', next); applyTheme();
 });
 
+document.addEventListener('fullscreenchange', () => setTimeout(() => flightDeckMap?.invalidateSize(), 0));
+window.addEventListener('resize', () => flightDeckMap?.invalidateSize());
+
 window.addEventListener('storage', event => {
   if (![latestJobKey, activeJobKey, activePackageKey].includes(event.key)) return;
-  if (event.key === activePackageKey && event.oldValue && event.newValue !== event.oldValue) clearPackageDependentState(event.newValue || '');
+  if (event.key === activePackageKey && event.oldValue && event.newValue !== event.oldValue) {
+    clearPackageDependentState(event.newValue || '');
+    selectedMapDay = 'all';
+  }
   sessionJob = null; sessionLoading = true; sessionError = ''; render(); loadSharedSession();
 });
 
