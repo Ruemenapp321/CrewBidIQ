@@ -3,6 +3,7 @@ uvicorn[standard]==0.34.0
 python-multipart==0.0.20
 PyMuPDF==1.25.1
 reportlab==4.2.5
+tzdata==2025.2
 
 pytest==8.3.4
 httpx==0.28.1

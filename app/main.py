@@ -36,13 +36,14 @@ from app.recommendations import evaluate_recommendation, length_priority, length
 from app.reporting import build_bid_report
 from app.seniority import build_seniority_context, estimate_hold_outlook
 from app.southwest_planning import optimize_schedule_conflicts, rank_southwest_line
+from app.southwest_time import public_local_leg
 from app.trip_intent import interpret_trip_intent, trip_intent_profile
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR / "data"))
 UPLOAD_DIR = DATA_DIR / "uploads"
 DB_PATH = DATA_DIR / "pairingiq.db"
-PARSER_CACHE_VERSION = "2026-07-16.4"
+PARSER_CACHE_VERSION = "2026-07-17.1"
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_PARSE_SECONDS = int(os.environ.get("MAX_PARSE_SECONDS", "600"))
 
@@ -1001,13 +1002,31 @@ def match_level(score: float, conflicts: list[str]) -> str:
     return "low"
 
 
+def _southwest_local_display(pairing: dict[str, Any]) -> str:
+    rows = ["Local schedule"]
+    for leg in pairing.get("legs", []) or []:
+        departure_time = leg.get("departure_time")
+        arrival_time = leg.get("arrival_time")
+        if not departure_time or not arrival_time:
+            continue
+        departure_zone = leg.get("departure_local_event_timezone") or "local"
+        arrival_zone = leg.get("arrival_local_event_timezone") or "local"
+        rows.append(
+            f"{leg.get('event_date') or ''} {leg.get('departure')} {departure_time} ({departure_zone}) "
+            f"→ {leg.get('arrival')} {arrival_time} ({arrival_zone})"
+        )
+    return "\n".join(rows)
+
+
 def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
     block = pairing["block"]
     upper = block.upper()
     airline = airline_for_pairing(pairing)
     touched_cities = detect_airports(block, pairing)
     cities = detect_layover_cities(pairing)
-    if "operating_dates" in pairing:
+    if airline == "southwest":
+        dates = list(dict.fromkeys(str(leg.get("event_date")) for leg in pairing.get("legs", []) if leg.get("event_date")))
+    elif "operating_dates" in pairing:
         dates = [str(value) for value in pairing.get("operating_dates") or []]
     elif pairing.get("effective"):
         dates = list_field(pairing.get("effective"))
@@ -1107,7 +1126,16 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
         score -= len(holiday_hits) * float(w.get("holiday_conflict") or 60)
         calendar_conflicts.append("Holiday: " + ", ".join(holiday_hits))
 
-    times = detect_time_values(block)
+    times = (
+        [
+            value
+            for leg in pairing.get("legs", [])
+            for value in (clock_minutes(leg.get("departure_time")), clock_minutes(leg.get("arrival_time")))
+            if value is not None
+        ]
+        if airline == "southwest"
+        else detect_time_values(block)
+    )
     if times:
         earliest_report = profile.get("earliest_report_minutes")
         latest_release = profile.get("latest_release_minutes")
@@ -1168,7 +1196,7 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
     level = match_level(score, calendar_conflicts)
     terminology = get_airline_terminology(airline)
     result_legs = [
-        {**leg, "wocl_departure": is_wocl_departure(leg.get("departure_time"))}
+        {**(public_local_leg(leg) if airline == "southwest" else leg), "wocl_departure": is_wocl_departure(leg.get("departure_time"))}
         for leg in pairing.get("legs", []) or []
     ]
     result = {
@@ -1219,7 +1247,7 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
         "item_type": "pairing",
         "match_level": level,
         "display_label": terminology.singular,
-        "original_display": block,
+        "original_display": _southwest_local_display(pairing) if airline == "southwest" else block,
         "operations": pairing.get("operations"),
         "sequence_days": pairing.get("sequence_days"),
         "duty_period_count": pairing.get("duty_period_count", len(duty_counts)),
@@ -1322,6 +1350,13 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
                 "eligibility": result.get("eligibility_result"),
                 "rejection_reason": "; ".join(result.get("eligibility_violations") or []) or None,
             } if airline == "american" else None,
+            "southwest_time_normalization": [
+                {
+                    "departure": leg.get("departure_time_provenance"),
+                    "arrival": leg.get("arrival_time_provenance"),
+                }
+                for leg in pairing.get("legs", [])
+            ] if airline == "southwest" else None,
         }
     return result
 
@@ -1432,7 +1467,7 @@ def score_southwest_line(line: dict[str, Any], pairing_scores: dict[str, dict[st
     result = {
         "pairing": line["id"], "item_type": "line", "score": 0.0,
         "package_id": line_package_id,
-        "dates": line.get("work_dates") or [], "cities": cities, "touched_cities": touched, "preferred_aircraft": sorted(set(a for item in members for a in item.get("preferred_aircraft", []))),
+        "dates": line.get("work_dates") or list(dict.fromkeys(d for item in members for d in item.get("dates", []))), "cities": cities, "touched_cities": touched, "preferred_aircraft": sorted(set(a for item in members for a in item.get("preferred_aircraft", []))),
         "redeye": "WOCL departure" if redeye_legs else "none", "redeye_legs": redeye_legs,
         "deadheads": sum(x.get("deadheads", 0) for x in members), "transfers": sorted(set(t for x in members for t in x.get("transfers", []))),
         "calendar_conflicts": conflicts,
@@ -1446,7 +1481,8 @@ def score_southwest_line(line: dict[str, Any], pairing_scores: dict[str, dict[st
         "tfp_per_day_away": line.get("tfp_per_day_away"),
         "layovers": layovers, "legs": [leg for item in members for leg in item.get("legs", [])], "pairing_ids": line["pairing_ids"],
         "duty_legs": duty_legs, "first_day_legs": duty_legs[0] if duty_legs else 0, "last_day_legs": duty_legs[-1] if duty_legs else 0,
-        "match_level": "fair", "display_label": get_airline_terminology("southwest").singular, "original_display": line.get("block", ""),
+        "match_level": "fair", "display_label": get_airline_terminology("southwest").singular,
+        "original_display": "\n\n".join(item.get("original_display", "") for item in members if item.get("original_display")),
         "airline": "southwest", "data_quality": "complete",
     }
     result.update(rank_southwest_line(line, members, profile))

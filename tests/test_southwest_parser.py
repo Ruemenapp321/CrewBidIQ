@@ -1,6 +1,7 @@
 from app.parsers import southwest
 
-SAMPLE = """XA28  MO          PILOTS      REPORT AT 7:05            EFFECTIVE Aug 10-Aug 31
+SAMPLE = """SCHEDULE PERIOD: AUG 1, 2026 - AUG 31, 2026 POSITION: FO
+XA28  MO          PILOTS      REPORT AT 7:05            EFFECTIVE Aug 10-Aug 31
   DAY       FLT  EQP DEPARTS  ARRIVES    BLK  BLK DUTY  CR   LAYOVER     M
   MO        2468 700 LAX 0805 OAK 0925   1:20           1.50
   MO        3001 700 OAK 1005 SAN 1130   1:25           1.60
@@ -34,4 +35,5 @@ def test_parses_southwest_pairing():
     assert row["tfp_per_duty_period"] == "6.60"
     assert row["tfp_per_day_away"] == "9.90"
     assert row["tafb"] == "32:00"
-    assert row["release"] == "1435"
+    assert row["checkin"] == "0505"
+    assert row["release"] == "1235"
