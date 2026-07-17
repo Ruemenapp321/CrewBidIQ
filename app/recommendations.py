@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable
 
+from app.canonical import canonical_value
 from app.destinations import destination_matches
 
 
@@ -86,8 +87,15 @@ def evaluate_recommendation(result: dict[str, Any], profile: dict[str, Any]) -> 
     compromises: list[str] = []
     violations: list[str] = []
     neutral: list[str] = []
-    trip_length = int(result.get("trip_length") or 0)
-    cities = [str(city).upper() for city in result.get("cities", [])]
+    trip_length = int(canonical_value(result, "trip_length_days", result.get("trip_length") or 0) or 0)
+    has_canonical = isinstance(result.get("canonical_trip"), dict)
+    cities = [
+        str(layover.get("airport") or layover.get("city") or "").upper()
+        for layover in (canonical_value(result, "layovers", []) or [])
+        if layover.get("airport") or layover.get("city")
+    ]
+    if not cities and not has_canonical:
+        cities = [str(city).upper() for city in result.get("cities", [])]
     duty_legs = [int(value) for value in result.get("duty_legs", [])]
 
     if result.get("data_quality") == "incomplete":

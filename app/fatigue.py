@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.canonical import canonical_value
+
 
 LEVELS = ((10, "Very High"), (6, "High"), (3, "Moderate"), (0, "Low"))
 
@@ -25,7 +27,14 @@ def _duration_hours(value: Any) -> float | None:
 
 def build_fatigue_index(item: dict[str, Any]) -> dict[str, Any]:
     """Assess schedule-driven fatigue risk without making a FAR 117 legality claim."""
-    legs = list(item.get("legs") or [])
+    canonical_legs = canonical_value(item, "ordered_legs", []) or []
+    legs = [
+        {
+            "departure_time": leg.get("local_departure_time"),
+            "arrival_time": leg.get("local_arrival_time"),
+        }
+        for leg in canonical_legs
+    ] if canonical_legs else list(item.get("legs") or [])
     duty_counts = [int(value) for value in item.get("duty_legs") or []]
     departures = [_clock_minutes(leg.get("departure_time")) for leg in legs]
     arrivals = [_clock_minutes(leg.get("arrival_time")) for leg in legs]
@@ -65,7 +74,7 @@ def build_fatigue_index(item: dict[str, Any]) -> dict[str, Any]:
         contributing.append("Long duty combined with a high leg count")
 
     rest_hours = [
-        hours for layover in item.get("layovers") or []
+        hours for layover in (canonical_value(item, "layovers", []) or [])
         if (hours := _duration_hours(layover.get("duration"))) is not None
     ]
     if rest_hours and min(rest_hours) < 10:

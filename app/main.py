@@ -25,6 +25,7 @@ from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from app.airlines import airline_terminology_payload, get_airline_terminology
 from app.airports import coterminal_group_for_airport, coterminal_payload, expand_airports
+from app.canonical import attach_canonical_trip, canonical_presentation_record, public_canonical_trip
 from app.destinations import is_transcontinental, taxonomy_payload
 from app.fatigue import build_fatigue_index
 from app.labs import labs_enabled, router as labs_router
@@ -43,7 +44,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR / "data"))
 UPLOAD_DIR = DATA_DIR / "uploads"
 DB_PATH = DATA_DIR / "pairingiq.db"
-PARSER_CACHE_VERSION = "2026-07-17.1"
+PARSER_CACHE_VERSION = "2026-07-17.2"
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_PARSE_SECONDS = int(os.environ.get("MAX_PARSE_SECONDS", "600"))
 
@@ -191,7 +192,7 @@ def bind_pairings_to_package(pairings: list[dict[str, Any]], package_id: str) ->
         rotation = str(pairing.get("rotation_number") or pairing.get("id") or "").upper()
         pairing["package_id"] = package_id
         pairing["inventory_key"] = f"{package_id}:{rotation}"
-        bound.append(pairing)
+        bound.append(attach_canonical_trip(pairing, package_id))
     return bound
 
 
@@ -679,7 +680,7 @@ def consolidate_pairings(pairings: list[dict[str, Any]]) -> list[dict[str, Any]]
                 }
                 for record in records
             ]
-        consolidated.append(selected)
+        consolidated.append(attach_canonical_trip(selected, str(selected.get("package_id") or "legacy-package")))
     return consolidated
 
 
@@ -893,6 +894,9 @@ def classify_redeye(pairing: dict[str, Any]) -> str:
 
 
 def pairing_duty_count(pairing: dict[str, Any]) -> int:
+    canonical = pairing.get("canonical_trip") or {}
+    if _canonical_count := canonical.get("duty_period_count"):
+        return int(_canonical_count)
     duty_labels: list[str] = []
     for leg in pairing.get("legs", []) or []:
         if leg.get("deadhead"):
@@ -905,7 +909,8 @@ def pairing_duty_count(pairing: dict[str, Any]) -> int:
 
 def pairing_trip_length(pairing: dict[str, Any]) -> int:
     """Return elapsed trip days, which may exceed the number of flying duties."""
-    normalized_length = pairing.get("sequence_days") or pairing.get("trip_days")
+    canonical = pairing.get("canonical_trip") or {}
+    normalized_length = canonical.get("trip_length_days") or pairing.get("trip_length_days") or pairing.get("sequence_days") or pairing.get("trip_days")
     if str(normalized_length or "").isdigit() and int(normalized_length) > 0:
         return int(normalized_length)
     duty_labels: list[str] = []
@@ -1019,6 +1024,8 @@ def _southwest_local_display(pairing: dict[str, Any]) -> str:
 
 
 def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
+    pairing = canonical_presentation_record(pairing)
+    canonical_trip = public_canonical_trip(pairing["canonical_trip"])
     block = pairing["block"]
     upper = block.upper()
     airline = airline_for_pairing(pairing)
@@ -1200,7 +1207,18 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
         for leg in pairing.get("legs", []) or []
     ]
     result = {
-        "pairing": pairing["id"],
+        "id": canonical_trip["id"],
+        "pairing": canonical_trip["source_trip_number"],
+        "source_trip_number": canonical_trip["source_trip_number"],
+        "canonical_trip_id": canonical_trip["id"],
+        "canonical_trip": canonical_trip,
+        "terminology": canonical_trip["terminology"],
+        "ordered_events": canonical_trip["ordered_events"],
+        "ordered_legs": canonical_trip["ordered_legs"],
+        "duty_days": canonical_trip["duty_days"],
+        "hotels": canonical_trip["hotels"],
+        "pay_breakdown": canonical_trip["pay_breakdown"],
+        "tfp": canonical_trip["tfp"],
         "score": round(score, 1),
         "dates": dates,
         "cities": cities,
@@ -1218,25 +1236,26 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
         "reasons": reasons,
         "parser": pairing.get("parser", "generic"),
         "parser_confidence": pairing.get("parser_confidence", pairing.get("confidence", 0)),
-        "package_id": pairing.get("package_id"),
-        "inventory_key": pairing.get("inventory_key"),
-        "source_page": pairing.get("source_page") or pairing.get("source_pdf_page"),
-        "source_section": pairing.get("source_section"),
+        "package_id": canonical_trip["package_id"],
+        "inventory_key": canonical_trip["id"],
+        "source_page": canonical_trip["source_page"],
+        "source_section": canonical_trip["source_section"],
         "page_classification": pairing.get("page_classification"),
         "package_base": pairing.get("package_base"),
         "package_fleet": pairing.get("package_fleet"),
         "rotation_number": pairing.get("rotation_number") or pairing.get("id"),
-        "bidable_inventory_confirmed": pairing.get("bidable_inventory_confirmed") is True,
+        "bidable_inventory_confirmed": canonical_trip["bidable_inventory_confirmed"],
         "data_quality": "incomplete" if data_issues else "complete",
         "data_issues": data_issues,
         "credit": pairing.get("credit"),
-        "tafb": pairing.get("tafb"),
+        "tafb": canonical_trip["tafb"],
         "checkin": pairing.get("checkin"),
         "release": pairing.get("release"),
         "layovers": pairing.get("layovers", []),
         "legs": result_legs,
         "duty_legs": duty_counts,
-        "trip_length": trip_length,
+        "trip_length": canonical_trip["trip_length_days"],
+        "trip_length_days": canonical_trip["trip_length_days"],
         "trip_length_preference_active": bool(ranked_lengths),
         "trip_length_match": bool(ranked_lengths and length_rank is not None),
         "trip_length_priority": ranked_lengths,
@@ -1445,12 +1464,18 @@ def score_southwest_line(line: dict[str, Any], pairing_scores: dict[str, dict[st
     line_package_id = str(line.get("package_id") or (next(iter(package_ids)) if len(package_ids) == 1 else "") or "legacy-package")
     if package_ids != {""} and (len(package_ids) != 1 or line_package_id not in package_ids):
         raise RuntimeError("Package isolation check rejected a Southwest line with mixed pairing sources.")
-    cities = list(dict.fromkeys(c for item in members for c in item.get("cities", [])))
+    canonical_trips = [item["canonical_trip"] for item in members if item.get("canonical_trip")]
+    cities = list(dict.fromkeys(
+        str(layover.get("airport") or layover.get("city"))
+        for trip in canonical_trips
+        for layover in trip.get("layovers", [])
+        if layover.get("airport") or layover.get("city")
+    ))
     layovers = []
-    for item in members:
-        for layover in item.get("layovers", []):
-            key = (layover.get("city"), layover.get("duration"))
-            if key not in [(x.get("city"), x.get("duration")) for x in layovers]:
+    for trip in canonical_trips:
+        for layover in trip.get("layovers", []):
+            key = (layover.get("airport"), layover.get("duration"), layover.get("after_duty_day"))
+            if key not in [(x.get("airport"), x.get("duration"), x.get("after_duty_day")) for x in layovers]:
                 layovers.append(layover)
     reasons = []
     for item in members:
@@ -1465,8 +1490,15 @@ def score_southwest_line(line: dict[str, Any], pairing_scores: dict[str, dict[st
         for leg in item.get("redeye_legs", [])
     ]
     result = {
+        "id": f"{line_package_id}:LINE:{line['id']}",
         "pairing": line["id"], "item_type": "line", "score": 0.0,
         "package_id": line_package_id,
+        "canonical_trip_ids": [trip["id"] for trip in canonical_trips],
+        "canonical_trips": canonical_trips,
+        "ordered_events": [event for trip in canonical_trips for event in trip.get("ordered_events", [])],
+        "ordered_legs": [leg for trip in canonical_trips for leg in trip.get("ordered_legs", [])],
+        "duty_days": [day for trip in canonical_trips for day in trip.get("duty_days", [])],
+        "hotels": [hotel for trip in canonical_trips for hotel in trip.get("hotels", [])],
         "dates": line.get("work_dates") or list(dict.fromkeys(d for item in members for d in item.get("dates", []))), "cities": cities, "touched_cities": touched, "preferred_aircraft": sorted(set(a for item in members for a in item.get("preferred_aircraft", []))),
         "redeye": "WOCL departure" if redeye_legs else "none", "redeye_legs": redeye_legs,
         "deadheads": sum(x.get("deadheads", 0) for x in members), "transfers": sorted(set(t for x in members for t in x.get("transfers", []))),

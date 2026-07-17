@@ -1,0 +1,104 @@
+[
+  {
+    "id": "D100",
+    "package_id": "pkg-delta",
+    "airline": "delta",
+    "base": "ATL",
+    "fleet": "320",
+    "bid_month": "2026-08",
+    "block": "#D100 ATL MCO BOS ATL",
+    "legs": [
+      {"day": "A", "deadhead": false, "flight": "100", "departure": "ATL", "departure_time": "0800", "arrival": "MCO", "arrival_time": "0930", "aircraft": "320"},
+      {"day": "A", "deadhead": false, "flight": "101", "departure": "MCO", "departure_time": "1030", "arrival": "BOS", "arrival_time": "1330", "aircraft": "320"},
+      {"day": "B", "deadhead": false, "flight": "102", "departure": "BOS", "departure_time": "0800", "arrival": "ATL", "arrival_time": "1100", "aircraft": "320"}
+    ],
+    "layovers": [{"city": "BOS", "duration": "18:30", "hotel": "BOSTON HOTEL"}],
+    "trip_credit": "15:00",
+    "edp": "0:30",
+    "hol": "0:00",
+    "sit": "0:15",
+    "additional_pay": "0:45",
+    "total_pay": "15:45",
+    "raw_pay_tokens": ["30EDP", "15SIT"],
+    "unresolved_pay_tokens": [],
+    "tafb": "31:00",
+    "operating_dates": ["2026-08-10"],
+    "source_page": 12,
+    "source_section": "MASTER PAIRINGS",
+    "bidable_inventory_confirmed": true,
+    "parser_confidence": 0.98
+  },
+  {
+    "id": "A200",
+    "package_id": "pkg-american",
+    "airline": "american",
+    "base": "DFW",
+    "fleet": "737",
+    "block": "SEQ A200 DFW MIA DFW",
+    "legs": [
+      {"day": "1", "deadhead": false, "flight": "200", "departure": "DFW", "departure_time": "0900", "arrival": "MIA", "arrival_time": "1230", "aircraft": "737"},
+      {"day": "3", "deadhead": true, "flight": "201", "departure": "MIA", "departure_time": "1500", "arrival": "DFW", "arrival_time": "1730", "aircraft": "737"}
+    ],
+    "layovers": [{"city": "MIA", "duration": "25.30", "hotel": "MIAMI HOTEL", "transportation_provider": "HOTEL SHUTTLE"}],
+    "sequence_days": 3,
+    "calendar_span_days": 3,
+    "duty_period_count": 2,
+    "total_pay": "11:30",
+    "tafb": "56.30",
+    "start_dates": ["2026-08-12"],
+    "source_pdf_page": 20,
+    "fleet_section": "DFW 737",
+    "bidable_inventory_confirmed": true,
+    "confidence": 0.96
+  },
+  {
+    "id": "S300",
+    "package_id": "pkg-southwest",
+    "airline": "southwest",
+    "block": "S300 source Herb schedule",
+    "legs": [
+      {
+        "day": "MO",
+        "deadhead": false,
+        "flight": "300",
+        "departure": "LAX",
+        "arrival": "DEN",
+        "source_departure_time_herb": "0800",
+        "source_arrival_time_herb": "1100",
+        "departure_time": "0600",
+        "arrival_time": "1000",
+        "departure_normalized_utc_timestamp": "2026-07-13T13:00:00+00:00",
+        "arrival_normalized_utc_timestamp": "2026-07-13T16:00:00+00:00",
+        "departure_local_event_timezone": "America/Los_Angeles",
+        "arrival_local_event_timezone": "America/Denver",
+        "event_date": "2026-07-13",
+        "aircraft": "737"
+      }
+    ],
+    "layovers": [],
+    "pairing_tfp": "6.50",
+    "tfp_per_duty_period": "6.50",
+    "tfp_per_day_away": "6.50",
+    "tafb": "08:00",
+    "checkin": "0530",
+    "release": "1030",
+    "bidable_inventory_confirmed": true,
+    "confidence": 0.97
+  },
+  {
+    "id": "G400",
+    "package_id": "pkg-generic",
+    "airline": "generic",
+    "base": "SEA",
+    "block": "PAIRING G400 SEA PDX SEA",
+    "legs": [
+      {"day": "1", "deadhead": false, "flight": "400", "departure": "SEA", "departure_time": "0700", "arrival": "PDX", "arrival_time": "0800", "aircraft": "E75"},
+      {"day": "1", "deadhead": false, "flight": "401", "departure": "PDX", "departure_time": "0900", "arrival": "SEA", "arrival_time": "1000", "aircraft": "E75"}
+    ],
+    "layovers": [],
+    "credit": "05:00",
+    "tafb": "05:30",
+    "bidable_inventory_confirmed": true,
+    "confidence": 0.8
+  }
+]

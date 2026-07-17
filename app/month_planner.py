@@ -4,6 +4,8 @@ import re
 from statistics import mean
 from typing import Any
 
+from app.canonical import canonical_value, model_from_item
+
 
 def _number(value: Any) -> float | None:
     if value in (None, ""):
@@ -18,11 +20,19 @@ def _occurrences(item: dict[str, Any]) -> int:
     explicit = item.get("operations")
     if explicit not in (None, ""):
         return max(int(explicit), 0)
-    dates = item.get("operating_dates") or item.get("dates") or []
+    dates = canonical_value(item, "operating_dates", item.get("dates") or []) or []
     return len(dates) if dates else 1
 
 
 def _trip_value(item: dict[str, Any]) -> float | None:
+    model = model_from_item(item)
+    pay = model.get("pay_breakdown") or {}
+    tfp = model.get("tfp") or {}
+    for value in (pay.get("total_pay"), tfp.get("monthly_tfp"), tfp.get("pairing_tfp"), pay.get("trip_credit")):
+        if (parsed := _number(value)) is not None:
+            return parsed
+    if isinstance(item.get("canonical_trip"), dict):
+        return None
     for key in ("total_pay", "monthly_tfp", "pairing_tfp", "trip_credit", "credit"):
         if (parsed := _number(item.get(key))) is not None:
             return parsed
@@ -36,7 +46,7 @@ def _pool(name: str, items: list[dict[str, Any]]) -> dict[str, Any]:
         "unique_trip_count": len(items),
         "occurrence_count": sum(_occurrences(item) for item in items),
         "average_trip_value": round(mean(values), 2) if values else None,
-        "trip_ids": [str(item.get("pairing")) for item in items],
+        "trip_ids": [str(model_from_item(item).get("id") or item.get("id") or item.get("pairing")) for item in items],
     }
 
 

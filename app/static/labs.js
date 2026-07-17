@@ -50,6 +50,11 @@ function readJson(key, fallback = null) {
   catch (_) { return fallback; }
 }
 
+function tripModel(item) { return item?.canonical_trip || null; }
+function tripLayovers(item) { return tripModel(item)?.layovers || item?.layovers || []; }
+function tripPayBreakdown(item) { return tripModel(item)?.pay_breakdown || item?.pay_breakdown || { trip_credit: item?.trip_credit ?? item?.credit, total_pay: item?.total_pay }; }
+function tripTfp(item) { return tripModel(item)?.tfp || item?.tfp || { pairing_tfp: item?.pairing_tfp }; }
+
 function airlineName(value) {
   return ({ auto: 'Auto-detecting', delta: 'Delta Air Lines', american: 'American Airlines', southwest: 'Southwest Airlines', generic: 'Other airline' })[value] || value || 'Airline unavailable';
 }
@@ -61,10 +66,10 @@ function payGoalLabel() {
 }
 
 function resultPay(item) {
-  const airline = item.airline || sessionJob?.airline;
-  if (airline === 'southwest') return { label: item.item_type === 'line' ? 'Line TFP' : 'Pairing TFP', value: item.item_type === 'line' ? item.line_tfp : item.pairing_tfp };
-  if (airline === 'delta' || airline === 'american') return { label: 'Total Pay', value: item.total_pay };
-  return { label: 'Credit', value: item.credit };
+  const airline = item.airline || sessionJob?.airline, pay = tripPayBreakdown(item), tfp = tripTfp(item);
+  if (airline === 'southwest') return { label: item.item_type === 'line' ? 'Line TFP' : 'Pairing TFP', value: item.item_type === 'line' ? item.line_tfp : tfp.pairing_tfp };
+  if (airline === 'delta' || airline === 'american') return { label: 'Total Pay', value: pay.total_pay ?? item.total_pay };
+  return { label: 'Credit', value: pay.trip_credit };
 }
 
 function inferredBidMonth(filename = '') {
@@ -240,7 +245,7 @@ function matchLabel(item) {
 
 function recommendationCards(results) {
   return results.slice(0, 8).map((item, index) => {
-    const layovers = (item.layovers || []).map(layover => layover.city).join(', ') || 'No overnights';
+    const layovers = tripLayovers(item).map(layover => layover.airport || layover.city).join(', ') || 'No overnights';
     const reasons = (item.matched_preferences || item.reasons || []).slice(0, 3);
     const pay = resultPay(item);
     return `<article class="labs-recommendation">

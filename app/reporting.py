@@ -12,6 +12,7 @@ from reportlab.lib.units import inch
 from reportlab.platypus import PageBreak, Paragraph, Preformatted, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from app.airlines import get_airline_terminology
+from app.canonical import canonical_value, model_from_item
 
 
 LABELS = {"excellent": "★★★★★ Excellent", "strong": "★★★★ Strong", "good": "★★★ Good", "fair": "★★ Fair", "low": "★ Low"}
@@ -30,28 +31,44 @@ def _cell(value: Any, style: ParagraphStyle) -> Paragraph:
 
 
 def _pay_rows(item: dict[str, Any], airline: str) -> list[list[Any]]:
+    model = model_from_item(item)
+    legacy_components = item.get("pay_components") or {}
+    pay = {
+        "trip_credit": item.get("trip_credit") or item.get("credit"),
+        "edp": item.get("edp", legacy_components.get("EDP")),
+        "hol": item.get("hol", legacy_components.get("HOL")),
+        "sit": item.get("sit", legacy_components.get("SIT")),
+        "additional_pay": item.get("additional_pay"),
+        "total_pay": item.get("total_pay"),
+        "unresolved_pay_tokens": item.get("unresolved_pay_tokens") or [],
+        **(model.get("pay_breakdown") or item.get("pay_breakdown") or {}),
+    }
+    tfp = {
+        key: item.get(key)
+        for key in ("pairing_tfp", "line_tfp", "monthly_tfp", "carry_out_tfp", "tfp_per_duty_period", "tfp_per_day_away")
+    } | (model.get("tfp") or item.get("tfp") or {})
     if airline == "southwest":
         label = "Line TFP" if item.get("item_type") == "line" else "Pairing TFP"
-        value = item.get("line_tfp") if item.get("item_type") == "line" else item.get("pairing_tfp")
+        value = item.get("line_tfp") if item.get("item_type") == "line" else tfp.get("pairing_tfp", item.get("pairing_tfp"))
         return [
             [label, value],
             ["Carry-out TFP", item.get("carry_out_tfp")],
-            ["TFP per duty period", item.get("tfp_per_duty_period")],
-            ["TFP per day away", item.get("tfp_per_day_away")],
+            ["TFP per duty period", tfp.get("tfp_per_duty_period", item.get("tfp_per_duty_period"))],
+            ["TFP per day away", tfp.get("tfp_per_day_away", item.get("tfp_per_day_away"))],
         ]
     if airline == "delta":
-        rows = [["Trip Credit", item.get("trip_credit") or item.get("credit")], ["Additional Pay", item.get("additional_pay")]]
-        components = item.get("pay_components") or {}
-        rows.extend([[label, components[label]] for label in ("EDP", "HOL", "SIT") if label in components])
-        rows.append(["Total Pay", item.get("total_pay")])
-        unresolved = item.get("unresolved_pay_tokens") or []
+        rows = [["Trip Credit", pay.get("trip_credit")], ["Additional Pay", pay.get("additional_pay")]]
+        components = {"EDP": pay.get("edp"), "HOL": pay.get("hol"), "SIT": pay.get("sit")}
+        rows.extend([[label, components[label]] for label in ("EDP", "HOL", "SIT") if components[label] is not None])
+        rows.append(["Total Pay", pay.get("total_pay")])
+        unresolved = pay.get("unresolved_pay_tokens") or []
         unknown = item.get("unknown_pay_components") or {}
         if unresolved or unknown:
             rows.append(["Unmapped source pay", ", ".join(unresolved) or ", ".join(f"{label} {value}" for label, value in unknown.items())])
         return rows
     if airline == "american":
-        return [["Total Pay", item.get("total_pay")]]
-    return [["Credit", item.get("credit")]]
+        return [["Total Pay", pay.get("total_pay", item.get("total_pay"))]]
+    return [["Credit", pay.get("trip_credit", item.get("credit"))]]
 
 
 def build_bid_report(results: list[dict[str, Any]], profile: dict[str, Any], airline: str, filename: str) -> bytes:
@@ -85,6 +102,14 @@ def build_bid_report(results: list[dict[str, Any]], profile: dict[str, Any], air
             story += [Paragraph(f"{index}. {item.get('display_label', terminology.singular)} {item.get('pairing')} — Near Match", styles["Heading2"]), Paragraph("; ".join(item.get("eligibility_violations") or ["Review required criteria."]), styles["BodyText"]), Spacer(1, 8)]
 
     for index, item in enumerate(results[:25], 1):
+        model = model_from_item(item)
+        item = {
+            **item,
+            "trip_length": model.get("trip_length_days", item.get("trip_length")),
+            "tafb": model.get("tafb", item.get("tafb")),
+            "layovers": canonical_value(item, "layovers", []),
+            "operating_dates": canonical_value(item, "operating_dates", []),
+        }
         item_terminology = get_airline_terminology(item.get("airline") or airline)
         story += [PageBreak(), Paragraph(f"{item.get('display_label', item_terminology.singular)} {item.get('pairing')}", styles["Heading1"]), Paragraph(_match_label(item), styles["Heading2"])]
         equipment = ", ".join(item.get("aircraft_display_names") or item.get("equipment_codes", [])) or "—"

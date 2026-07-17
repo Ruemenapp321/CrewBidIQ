@@ -5,6 +5,7 @@ import re
 from datetime import datetime
 from typing import Any
 
+from app.canonical import canonical_value
 from app.recommendations import length_rule_matches
 
 
@@ -45,7 +46,17 @@ def _time(value: Any) -> str | None:
 
 
 def _matching_layovers(results: list[dict[str, Any]], city: str) -> int:
-    return sum(city in {str(value).upper() for value in result.get("cities", [])} for result in results)
+    return sum(
+        city in {
+            str(value.get("airport") or value.get("city") or "").upper()
+            for value in (canonical_value(result, "layovers", []) or [])
+        }
+        for result in results
+    )
+
+
+def _result_length(result: dict[str, Any]) -> int:
+    return int(canonical_value(result, "trip_length_days", result.get("trip_length") or len(result.get("duty_legs", []))) or 0)
 
 
 def _request(
@@ -137,7 +148,7 @@ def build_navblue_layers(
     shape_requests: list[dict[str, Any]] = []
     ordered_lengths = _list(profile.get("trip_length_priority"))
     lengths = sorted({int(value) for value in _list(profile.get("preferred_trip_lengths")) if value.isdigit()})
-    result_length = lambda result: int(result.get("trip_length") or len(result.get("duty_legs", [])))
+    result_length = _result_length
     if ordered_lengths:
         for rule in ordered_lengths:
             matches = sum(length_rule_matches(result_length(result), rule) for result in results)

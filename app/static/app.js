@@ -164,6 +164,17 @@ async function loadLatestJob() {
 }
 
 function esc(value) { return String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+function tripModel(item) { return item?.canonical_trip || null; }
+function tripLegs(item) {
+  const normalized = tripModel(item)?.ordered_legs || item?.ordered_legs;
+  if (normalized?.length) return normalized;
+  return (item?.legs || []).map((leg, index) => ({ sequence_index: index + 1, duty_day_index: leg.duty_day_index, origin: leg.departure, destination: leg.arrival, operating_or_deadhead: leg.deadhead ? 'deadhead' : 'operating', flight_number: leg.flight, equipment: leg.aircraft, local_departure_time: leg.departure_time, local_arrival_time: leg.arrival_time }));
+}
+function tripLayovers(item) { return tripModel(item)?.layovers || item?.layovers || []; }
+function tripLength(item) { return tripModel(item)?.trip_length_days ?? item?.trip_length_days ?? item?.trip_length; }
+function tripOperatingDates(item) { return tripModel(item)?.operating_dates || item?.operating_dates || item?.dates || []; }
+function tripPay(item) { return tripModel(item)?.pay_breakdown || item?.pay_breakdown || { trip_credit: item?.trip_credit ?? item?.credit, edp: item?.edp, hol: item?.hol, sit: item?.sit, additional_pay: item?.additional_pay, total_pay: item?.total_pay, raw_pay_tokens: item?.raw_pay_tokens || [], unresolved_pay_tokens: item?.unresolved_pay_tokens || [] }; }
+function tripTfp(item) { return tripModel(item)?.tfp || item?.tfp || { pairing_tfp: item?.pairing_tfp, line_tfp: item?.line_tfp, monthly_tfp: item?.monthly_tfp, carry_out_tfp: item?.carry_out_tfp, tfp_per_duty_period: item?.tfp_per_duty_period, tfp_per_day_away: item?.tfp_per_day_away }; }
 function rating(item) { if (item.match_label) { const classes = { exact: 'excellent', strong: 'strong', partial: 'fair', near: 'low' }; return [item.match_label, classes[item.match_class] || 'fair']; } const level = item.match_level || 'fair', labels = { excellent: '★★★★★ Excellent', strong: '★★★★ Strong', good: '★★★ Good', fair: '★★ Fair', low: '★ Low' }; return [labels[level] || labels.fair, level]; }
 function fatigueRisk(item) { const fatigue = item.fatigue_index; if (!fatigue) return ['Fatigue Index · Insufficient Data', 'neutral']; const classes = { Low: 'neutral', Moderate: 'good', High: 'fair', 'Very High': 'low', 'Insufficient Data': 'neutral' }; return [`Fatigue Index · ${fatigue.level}`, classes[fatigue.level] || 'neutral']; }
 function fatigueDetails(item) { const fatigue = item.fatigue_index; if (!fatigue) return ''; const factors = (fatigue.contributing_factors || []).map(esc).join('; ') || 'No elevated schedule factors detected'; const mitigating = (fatigue.mitigating_factors || []).map(esc).join('; ') || 'None identified'; return `<p><strong>Fatigue Index:</strong> ${esc(fatigue.level)} (${esc(fatigue.confidence)} confidence)</p><p><strong>Contributing factors:</strong> ${factors}</p><p><strong>Mitigating factors:</strong> ${mitigating}</p><p><strong>Legality:</strong> ${esc(fatigue.legality_assessment)}</p>`; }
@@ -172,36 +183,38 @@ function scheduleConflictDetails(item) { const analysis = item.schedule_conflict
 function redeyeSummary(item) { const count = (item.redeye_legs || []).length; return count ? `${count} WOCL departure${count === 1 ? '' : 's'} (02:00–05:59 local)` : 'None'; }
 function resultAirline(item) { return item.airline || $('airlineChoice').value || 'generic'; }
 function payPresentation(item) {
-  const airline = resultAirline(item), legs = (item.duty_legs || []).join(' · ') || '—';
+  const airline = resultAirline(item), legs = (item.duty_legs || []).join(' · ') || '—', payBreakdown = tripPay(item), tfp = tripTfp(item);
+  item = { ...item, total_pay: payBreakdown.total_pay ?? item.total_pay, additional_pay: payBreakdown.additional_pay ?? item.additional_pay };
   if (airline === 'southwest') {
     const line = item.item_type === 'line';
+    const pairingTfp = tfp.pairing_tfp ?? item.pairing_tfp;
     return {
-      snapshotLabel: line ? 'Line TFP' : 'Pairing TFP', snapshotValue: line ? item.line_tfp : item.pairing_tfp,
-      metrics: [[line ? 'Line TFP' : 'Pairing TFP', line ? item.line_tfp : item.pairing_tfp], ['Carry-out TFP', line ? item.carry_out_tfp : null], ['TFP / duty period', item.tfp_per_duty_period], ['TFP / day away', item.tfp_per_day_away]],
-      detail: `<p><strong>${line ? 'Monthly TFP' : 'Pairing TFP'}:</strong> ${esc((line ? item.monthly_tfp : item.pairing_tfp) || 'N/A')}</p>${line ? `<p><strong>Carry-out TFP:</strong> ${esc(item.carry_out_tfp ?? 'N/A')}</p>` : ''}<p><strong>TFP per duty period:</strong> ${esc(item.tfp_per_duty_period || 'N/A')}</p><p><strong>TFP per day away:</strong> ${esc(item.tfp_per_day_away || 'N/A')}</p>`
+      snapshotLabel: line ? 'Line TFP' : 'Pairing TFP', snapshotValue: line ? item.line_tfp : pairingTfp,
+      metrics: [[line ? 'Line TFP' : 'Pairing TFP', line ? item.line_tfp : pairingTfp], ['Carry-out TFP', line ? item.carry_out_tfp : null], ['TFP / duty period', tfp.tfp_per_duty_period ?? item.tfp_per_duty_period], ['TFP / day away', tfp.tfp_per_day_away ?? item.tfp_per_day_away]],
+      detail: `<p><strong>${line ? 'Monthly TFP' : 'Pairing TFP'}:</strong> ${esc((line ? item.monthly_tfp : pairingTfp) || 'N/A')}</p>${line ? `<p><strong>Carry-out TFP:</strong> ${esc(item.carry_out_tfp ?? 'N/A')}</p>` : ''}<p><strong>TFP per duty period:</strong> ${esc(tfp.tfp_per_duty_period ?? item.tfp_per_duty_period ?? 'N/A')}</p><p><strong>TFP per day away:</strong> ${esc(tfp.tfp_per_day_away ?? item.tfp_per_day_away ?? 'N/A')}</p>`
     };
   }
   if (airline === 'delta') {
-    const components = item.pay_components || {};
-    const rows = ['EDP', 'HOL', 'SIT'].filter(label => Object.prototype.hasOwnProperty.call(components, label)).map(label => `<p><strong>${label}:</strong> ${esc(components[label])}</p>`).join('');
-    const unknown = (item.unresolved_pay_tokens || []).join(', ') || Object.entries(item.unknown_pay_components || {}).map(([label, value]) => `${label} ${value}`).join(', ');
+    const components = { EDP: payBreakdown.edp, HOL: payBreakdown.hol, SIT: payBreakdown.sit };
+    const rows = ['EDP', 'HOL', 'SIT'].filter(label => components[label] != null).map(label => `<p><strong>${label}:</strong> ${esc(components[label])}</p>`).join('');
+    const unknown = (payBreakdown.unresolved_pay_tokens || item.unresolved_pay_tokens || []).join(', ') || Object.entries(item.unknown_pay_components || {}).map(([label, value]) => `${label} ${value}`).join(', ');
     return {
-      snapshotLabel: 'Total Pay', snapshotValue: item.total_pay,
-      metrics: [['Total Pay', item.total_pay], ['Trip Credit', item.trip_credit || item.credit], ['Additional Pay', item.additional_pay], ['Total pay / duty day', item.total_pay_per_duty_day]],
-      detail: `<p><strong>Trip Credit:</strong> ${esc(item.trip_credit || item.credit || 'N/A')}</p><p><strong>Additional Pay:</strong> ${esc(item.additional_pay ?? 'N/A')}</p>${rows}<p><strong>Total Pay:</strong> ${esc(item.total_pay ?? 'N/A')}</p>${unknown ? `<p><strong>Unmapped source pay:</strong> ${esc(unknown)}</p>` : ''}`
+      snapshotLabel: 'Total Pay', snapshotValue: payBreakdown.total_pay,
+      metrics: [['Total Pay', item.total_pay], ['Trip Credit', payBreakdown.trip_credit], ['Additional Pay', item.additional_pay], ['Total pay / duty day', item.total_pay_per_duty_day]],
+      detail: `<p><strong>Trip Credit:</strong> ${esc(payBreakdown.trip_credit || 'N/A')}</p><p><strong>Additional Pay:</strong> ${esc(payBreakdown.additional_pay ?? 'N/A')}</p>${rows}<p><strong>Total Pay:</strong> ${esc(payBreakdown.total_pay ?? 'N/A')}</p>${unknown ? `<p><strong>Unmapped source pay:</strong> ${esc(unknown)}</p>` : ''}`
     };
   }
   if (airline === 'american') {
     return {
-      snapshotLabel: 'Total Pay', snapshotValue: item.total_pay,
-      metrics: [['Total Pay', item.total_pay], ['TAFB', item.tafb], ['Legs by duty day', legs], ['Total pay / duty day', item.total_pay_per_duty_day]],
-      detail: `<p><strong>Total Pay:</strong> ${esc(item.total_pay ?? 'N/A')}</p>`
+      snapshotLabel: 'Total Pay', snapshotValue: payBreakdown.total_pay,
+      metrics: [['Total Pay', payBreakdown.total_pay], ['TAFB', tripModel(item)?.tafb ?? item.tafb], ['Legs by duty day', legs], ['Total pay / duty day', item.total_pay_per_duty_day]],
+      detail: `<p><strong>Total Pay:</strong> ${esc(payBreakdown.total_pay ?? 'N/A')}</p>`
     };
   }
-  return { snapshotLabel: 'Credit', snapshotValue: item.credit, metrics: [['Credit', item.credit], ['TAFB', item.tafb], ['Legs by duty day', legs], ['First / Last', `${item.first_day_legs ?? '—'} / ${item.last_day_legs ?? '—'}`]], detail: `<p><strong>Credit:</strong> ${esc(item.credit || 'N/A')}</p>` };
+  return { snapshotLabel: 'Credit', snapshotValue: payBreakdown.trip_credit, metrics: [['Credit', payBreakdown.trip_credit], ['TAFB', tripModel(item)?.tafb ?? item.tafb], ['Legs by duty day', legs], ['First / Last', `${item.first_day_legs ?? '—'} / ${item.last_day_legs ?? '—'}`]], detail: `<p><strong>Credit:</strong> ${esc(payBreakdown.trip_credit || 'N/A')}</p>` };
 }
 function metricStrip(metrics) { return `<div class="metric-strip">${metrics.map(([label, value]) => `<div><span>${esc(label)}</span><strong>${esc(value ?? '—')}</strong></div>`).join('')}</div>`; }
-function timeline(item) { const legs = item.legs || []; if (!legs.length) return '<p class="muted">Detailed legs are not available for this item.</p>'; return `<div class="timeline">${legs.map((leg, i) => { const equipmentName = leg.aircraft_display_name || (leg.aircraft ? (item.equipment_mapping_status === 'raw_unmapped' ? `AA EQ ${leg.aircraft}` : leg.aircraft) : ''); const equipment = equipmentName ? ` · ${esc(equipmentName)}` : ''; const wocl = leg.wocl_departure ? ' · WOCL departure' : ''; return `<div class="timeline-leg"><span>${i + 1}</span><div><strong>${esc(leg.departure)} ${esc(leg.departure_time)} → ${esc(leg.arrival)} ${esc(leg.arrival_time)}</strong><small>${leg.deadhead ? 'Deadhead' : 'Operating'}${leg.flight ? ` · Flight ${esc(leg.flight)}` : ''}${equipment}${wocl}</small></div></div>`; }).join('')}</div>`; }
+function timeline(item) { const legs = tripLegs(item); if (!legs.length) return '<p class="muted">Detailed legs are not available for this item.</p>'; return `<div class="timeline">${legs.map((leg, i) => { const sourceLeg = (item.legs || [])[i] || {}; const equipmentName = sourceLeg.aircraft_display_name || (leg.equipment ? (item.equipment_mapping_status === 'raw_unmapped' ? `AA EQ ${leg.equipment}` : leg.equipment) : ''); const equipment = equipmentName ? ` · ${esc(equipmentName)}` : ''; const wocl = sourceLeg.wocl_departure ? ' · WOCL departure' : ''; return `<div class="timeline-leg"><span>${leg.sequence_index || i + 1}</span><div><strong>${esc(leg.origin)} ${esc(leg.local_departure_time)} → ${esc(leg.destination)} ${esc(leg.local_arrival_time)}</strong><small>${leg.operating_or_deadhead === 'deadhead' ? 'Deadhead' : 'Operating'}${leg.flight_number ? ` · Flight ${esc(leg.flight_number)}` : ''}${equipment}${wocl}</small></div></div>`; }).join('')}</div>`; }
 function renderBreakdown(id, rows, key, suffix = '') {
   const target = $(id); const values = rows || [];
   if (!values.length) { target.innerHTML = '<p class="muted">Not supplied in this package.</p>'; return; }
@@ -226,6 +239,15 @@ function explanationList(title, values, fallback = '') {
 function appendResultCards(items, wrap, term) {
   wrap.innerHTML = '';
   items.forEach((item, index) => {
+    const model = tripModel(item), normalizedLayovers = tripLayovers(item);
+    item = {
+      ...item,
+      layovers: normalizedLayovers,
+      cities: normalizedLayovers.map(value => value.airport || value.city).filter(Boolean),
+      trip_length: tripLength(item),
+      operating_dates: tripOperatingDates(item),
+      tafb: model?.tafb ?? item.tafb,
+    };
     const [label, cls] = rating(item), [rec, recCls] = fatigueRisk(item), layovers = (item.layovers || []).map(x => `${x.city}${x.duration ? ` ${x.duration}` : ''}`).join(', ') || 'No overnights', conflicts = item.calendar_conflicts || [], pay = payPresentation(item);
     const matched = item.matched_preferences || (item.reasons || []).slice(0, 6);
     const explanations = `${explanationList(item.eligible === false ? 'Closest fit' : 'Matched preferences', matched, 'No strong preference signals were detected.')}${explanationList('Compromises', item.compromises)}${explanationList('Requirements not met', item.eligibility_violations)}${explanationList('Trip facts', item.neutral_attributes)}${item.pay_explanation ? explanationList('Pay ranking', [item.pay_explanation]) : ''}`;
