@@ -28,7 +28,7 @@ from app.airports import coterminal_group_for_airport, coterminal_payload, expan
 from app.canonical import attach_canonical_trip, canonical_presentation_record, public_canonical_trip
 from app.destinations import is_transcontinental, taxonomy_payload
 from app.fatigue import build_fatigue_index
-from app.labs import labs_enabled, router as labs_router
+from app.labs import flight_deck_preview_enabled, labs_enabled, router as labs_router
 from app.month_planner import build_month_plan
 from app.navblue import build_navblue_layers
 from app.pay import pay_minutes_per_duty_day, pay_priority_value, tfp_per_day_away, tfp_ratio
@@ -349,7 +349,7 @@ INDEX_HTML = r"""
       <section class="results-section" id="resultsPanel">
         <div class="results-header">
           <div><span class="kicker">YOUR RESULTS</span><h2 id="resultsTitle">Recommended rotations</h2><p id="summary">Load sample results or analyze a bid package.</p></div>
-          <div class="results-actions"><select id="resultLimit"><option value="25">Top 25</option><option value="50">Top 50</option><option value="100">Top 100</option><option value="all">All</option></select><a id="csvLink" class="secondary button disabled" href="#">PDF report</a>__CONTINUE_LABS__</div>
+          <div class="results-actions"><select id="resultLimit"><option value="25">Top 25</option><option value="50">Top 50</option><option value="100">Top 100</option><option value="all">All</option></select><a id="csvLink" class="secondary button disabled" href="#">PDF report</a>__CONTINUE_LABS____FLIGHT_DECK_LINK__</div>
         </div>
         <div class="snapshot" id="snapshot">
           <div><span>Top match</span><strong id="snapshotMatch">—</strong></div>
@@ -519,6 +519,11 @@ def classic_html(page: str) -> str:
         if enabled
         else ""
     )
+    flight_deck_link = (
+        '<a class="flight-deck-link button" href="/labs/flight-deck">Try Flight Deck Preview</a>'
+        if page == "results" and enabled and flight_deck_preview_enabled()
+        else ""
+    )
     if enabled:
         mobile_nav = (
             '<nav class="bottom-nav three" aria-label="Primary navigation">'
@@ -540,6 +545,7 @@ def classic_html(page: str) -> str:
         "__RESULTS_ACTIVE__": results_active,
         "__LABS_SWITCH__": labs_switch,
         "__CONTINUE_LABS__": continue_labs,
+        "__FLIGHT_DECK_LINK__": flight_deck_link,
         "__MOBILE_NAV__": mobile_nav,
     }
     html = INDEX_HTML

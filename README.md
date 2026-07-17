@@ -23,8 +23,14 @@ CrewBidIQ Classic remains the default experience at `/`, with direct Classic res
 - `/labs/recommendations`
 - `/labs/preview`
 - `/labs/plan`
+- `/labs/flight-deck`
+- `/labs/flight-deck/trip/:tripId`
+- `/labs/flight-deck/shortlist`
+- `/labs/flight-deck/compare`
 
 Set `LABS_ENABLED=true` to enable the Labs routes and navigation. Any other value hides Labs from Classic and returns 404 for Labs routes.
+
+Flight Deck Preview is additionally gated by `FLIGHT_DECK_PREVIEW_ENABLED=true`. It reuses the active Classic/Labs package and never requires a second upload.
 
 Identical PDF packages are parsed once and stored in the managed SQLite parser cache. Pilot preferences are not part of the cache; reranking always uses the current user's selections.
 
