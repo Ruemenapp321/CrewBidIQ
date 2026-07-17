@@ -52,7 +52,7 @@ def test_report_uses_match_fatigue_and_hold_outlook_language():
         "eligible": True, "match_class": "exact", "matched_preferences": ["Trip length is 4 days"],
         "compromises": [], "eligibility_violations": [], "neutral_attributes": ["4 duty periods"],
         "fatigue_index": {"level": "Moderate", "confidence": "High", "contributing_factors": ["One WOCL departure"], "mitigating_factors": ["Long rest"]},
-        "hold_outlook": {"outlook": "Competitive", "confidence": "Low", "estimate_basis": "Inventory-based estimate only"},
+        "hold_outlook": {"likelihood": "Moderate", "outlook": "Moderate", "desirability": "High", "confidence": "Low", "estimate_basis": "Inventory-based estimate only", "factors": ["Four published occurrences"]},
         "original_display": "SEQ 4004", "layovers": [], "duty_legs": [1, 1, 1, 1],
     }
     payload = build_bid_report([result], {}, "american", "AA AUG 2026.pdf")
@@ -61,4 +61,6 @@ def test_report_uses_match_fatigue_and_hold_outlook_language():
     document.close()
     assert "Exact Match" in text
     assert "Fatigue Index" in text
+    assert "Desirability" in text
+    assert "Likelihood of Holding" in text
     assert "Inventory-based estimate only" in text

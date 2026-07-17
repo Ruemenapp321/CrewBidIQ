@@ -216,7 +216,7 @@ def test_trip_briefing_has_airline_titles_and_all_required_sections():
     ):
         assert f"<h2>{section}</h2>" in script
     assert "Exact match explanation" in script
-    assert 'src="/static/flight-deck.js?v=0004"' in labs
+    assert 'src="/static/flight-deck.js?v=0005"' in labs
 
 
 def test_trip_briefing_reads_trip_facts_from_confirmed_canonical_models_only():
@@ -262,11 +262,32 @@ def test_trip_briefing_preserves_source_provenance_and_safe_missing_states():
         "No canonical layovers are available",
         "A normalized pay or TFP breakdown is unavailable",
         "Confirmed bidable source provenance is unavailable",
-        "No Flight Deck fatigue assessment is available",
-        "No holding assessment is available",
+        "Fatigue Index is unavailable",
+        "Holding estimate is unavailable",
         "No commute plan is available",
     ):
         assert missing_state in script
+
+
+def test_trip_briefing_consumes_explainable_fatigue_and_holding_assessments():
+    script = (ROOT / "app" / "static" / "flight-deck.js").read_text(encoding="utf-8")
+    briefing = script.split("function fatigueAssessment", 1)[1].split("function originalAirlineTrip", 1)[0]
+
+    for field in (
+        "item?.fatigue_index",
+        "fatigue.contributing_factors",
+        "fatigue.mitigating_factors",
+        "fatigue.missing_data_warning",
+        "fatigue.legality_assessment",
+        "item?.hold_outlook",
+        "holding.desirability",
+        "holding.likelihood",
+        "holding.factors",
+        "holding.missing_data_warning",
+        "Inventory-based estimate only",
+    ):
+        assert field in briefing
+    assert "holding.probability" not in briefing
 
 
 def test_trip_briefing_layout_is_responsive_on_desktop_and_mobile():
@@ -384,7 +405,7 @@ def test_flight_deck_loads_local_leaflet_and_coordinates_before_map_code(monkeyp
     assert page.status_code == 200
     assert '/static/vendor/leaflet/leaflet.css?v=1.9.4' in page.text
     assert page.text.index('/static/airport-coordinates.js?v=20260716') < page.text.index('/static/vendor/leaflet/leaflet.js?v=1.9.4')
-    assert page.text.index('/static/vendor/leaflet/leaflet.js?v=1.9.4') < page.text.index('/static/flight-deck.js?v=0004')
+    assert page.text.index('/static/vendor/leaflet/leaflet.js?v=1.9.4') < page.text.index('/static/flight-deck.js?v=0005')
     assert "/static/airport-coordinates.js" not in results_page.text
     assert "/static/vendor/leaflet/leaflet.js" not in results_page.text
     assert (ROOT / "app" / "static" / "vendor" / "leaflet" / "leaflet.js").is_file()

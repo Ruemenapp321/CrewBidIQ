@@ -3,7 +3,8 @@ from __future__ import annotations
 from typing import Any
 
 
-OUTLOOKS = ("More likely", "Competitive", "Less likely", "Aspirational", "Insufficient data")
+HOLD_LEVELS = ("Very High", "High", "Moderate", "Low", "Very Low", "Insufficient Data")
+DESIRABILITY_LEVELS = ("Very High", "High", "Moderate", "Low", "Very Low", "Insufficient Data")
 
 
 def build_seniority_context(values: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -34,6 +35,53 @@ def build_seniority_context(values: dict[str, Any] | None) -> dict[str, Any] | N
     }
 
 
+def _occurrences(item: dict[str, Any]) -> int:
+    raw = item.get("operations")
+    if raw in (None, ""):
+        raw = len(item.get("operating_dates") or item.get("dates") or [])
+    try:
+        return max(0, int(raw or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _desirability(item: dict[str, Any]) -> tuple[str, list[str]]:
+    match_class = str(item.get("match_class") or item.get("match_level") or "").strip().lower()
+    hard_failures = item.get("hard_failures") or item.get("near_match_reasons") or []
+    matches = item.get("matched_preferences") or []
+    compromises = item.get("compromises") or []
+    factors: list[str] = []
+    if hard_failures or match_class.startswith("near"):
+        level = "Low"
+        factors.append("The trip does not satisfy one or more stated hard preferences")
+    elif match_class.startswith("exact"):
+        level = "Very High"
+        factors.append("The trip satisfies all stated hard preferences")
+    elif match_class.startswith("strong"):
+        level = "High"
+        factors.append("The trip is a strong match for the stated preferences")
+    elif match_class.startswith("partial"):
+        level = "Moderate"
+        factors.append("The trip is a partial match for the stated preferences")
+    elif matches or compromises:
+        level = "High" if matches and not compromises else "Moderate"
+        factors.append("Desirability reflects the stated preference matches and compromises")
+    else:
+        level = "Insufficient Data"
+        factors.append("No preference-based match class is available")
+
+    fatigue = item.get("fatigue_index") or {}
+    try:
+        max_legs = max([int(value) for value in item.get("duty_legs") or []] or [0])
+    except (TypeError, ValueError):
+        max_legs = 0
+    if fatigue.get("level") in {"High", "Very High"} or max_legs >= 4:
+        if level in {"Very High", "High", "Moderate", "Insufficient Data"}:
+            level = "Low"
+        factors.append("High fatigue exposure or workload reduces assessed desirability")
+    return level, factors
+
+
 def estimate_hold_outlook(
     item: dict[str, Any],
     seniority: dict[str, Any] | None = None,
@@ -41,33 +89,82 @@ def estimate_hold_outlook(
     monthly_inventory: int | None = None,
     prior_award_data: bool = False,
 ) -> dict[str, Any]:
-    occurrences = int(item.get("operations") or len(item.get("operating_dates") or item.get("dates") or []))
-    desirable = bool(item.get("matched_preferences"))
-    evidence = [f"{occurrences} published occurrence{'s' if occurrences != 1 else ''}"] if occurrences else []
+    """Estimate holdability without inventing an award probability."""
+    occurrences = _occurrences(item)
+    desirability, desirability_factors = _desirability(item)
+    factors: list[str] = []
+    missing: list[str] = []
+    score = 0
+
+    if occurrences:
+        factors.append(f"{occurrences} published occurrence{'s' if occurrences != 1 else ''} in the active package")
+        if occurrences >= 8:
+            score += 2
+        elif occurrences >= 4:
+            score += 1
+        elif occurrences == 1:
+            score -= 2
+        else:
+            score -= 1
+    else:
+        missing.append("published occurrences for this trip")
+
     if seniority:
         senior_to = float(seniority["percent_senior_to"])
-        evidence.append(seniority["wording"][0])
-        if occurrences >= 8 and senior_to >= 60:
-            outlook = "More likely"
-        elif occurrences >= 4 and senior_to >= 35:
-            outlook = "Competitive"
-        elif occurrences <= 1 and senior_to < 35:
-            outlook = "Aspirational"
-        else:
-            outlook = "Less likely"
-    elif occurrences:
-        outlook = "Competitive" if occurrences >= 8 else ("Less likely" if occurrences >= 3 else "Aspirational")
+        factors.append(seniority["wording"][0])
+        if senior_to >= 75:
+            score += 2
+        elif senior_to >= 50:
+            score += 1
+        elif senior_to < 20:
+            score -= 2
+        elif senior_to < 40:
+            score -= 1
     else:
-        outlook = "Insufficient data"
-    if desirable:
-        evidence.append("Matches desirable trip attributes, which may increase demand")
+        missing.append("category seniority")
+
+    if desirability in {"Very Low", "Low"}:
+        score += 1 if desirability == "Low" else 2
+        factors.append("Lower assessed desirability may reduce demand")
+    elif desirability in {"High", "Very High"}:
+        score -= 1 if desirability == "High" else 2
+        factors.append("Higher assessed desirability may increase demand")
+
     if monthly_inventory:
-        evidence.append(f"Compared with {monthly_inventory} trips in the monthly inventory")
-    confidence = "High" if prior_award_data and seniority else ("Moderate" if seniority and occurrences else "Low")
+        factors.append(f"The active package contains {monthly_inventory} trips")
+    else:
+        missing.append("active-package inventory count")
+
+    if not prior_award_data:
+        missing.append("validated historical award data")
+
+    if not occurrences:
+        likelihood = "Insufficient Data"
+    elif score >= 4:
+        likelihood = "Very High"
+    elif score >= 2:
+        likelihood = "High"
+    elif score >= 0:
+        likelihood = "Moderate"
+    elif score >= -2:
+        likelihood = "Low"
+    else:
+        likelihood = "Very Low"
+
+    confidence = "High" if prior_award_data and seniority and occurrences else (
+        "Moderate" if seniority and occurrences else "Low"
+    )
+    warning = f"Missing or unavailable data: {', '.join(dict.fromkeys(missing))}." if missing else None
+    basis = "Historical award data" if prior_award_data else "Inventory-based estimate only"
     return {
-        "outlook": outlook,
+        "likelihood": likelihood,
+        "outlook": likelihood,
+        "desirability": desirability,
+        "desirability_factors": desirability_factors,
         "confidence": confidence,
-        "evidence": evidence,
-        "estimate_basis": "Historical award data" if prior_award_data else "Inventory-based estimate only",
+        "factors": factors,
+        "evidence": factors,
+        "estimate_basis": basis,
+        "missing_data_warning": warning,
         "probability": None,
     }

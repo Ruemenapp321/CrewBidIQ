@@ -1551,8 +1551,14 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
         result["pay_explanation"] = None
     result["fatigue_index"] = build_fatigue_index(result)
     result["seniority_context"] = build_seniority_context(profile.get("seniority_context"))
-    result["hold_outlook"] = estimate_hold_outlook(result, result["seniority_context"])
     result.update(evaluate_recommendation(result, profile))
+    result["hold_outlook"] = estimate_hold_outlook(
+        result,
+        result["seniority_context"],
+        monthly_inventory=profile.get("_monthly_inventory_count"),
+    )
+    if isinstance(result.get("ranking_components"), dict):
+        result["ranking_components"]["seniority_or_holding"] = result["hold_outlook"]
     if os.environ.get("RECOMMENDATION_DEBUG_ENABLED", "false").lower() == "true":
         result["recommendation_debug"] = {
             "parser": result.get("parser"),
@@ -1731,7 +1737,14 @@ def score_southwest_line(line: dict[str, Any], pairing_scores: dict[str, dict[st
     result["match_level"] = match_level(result["score"], conflicts)
     result["fatigue_index"] = build_fatigue_index(result)
     result["seniority_context"] = build_seniority_context(profile.get("seniority_context"))
-    result["hold_outlook"] = estimate_hold_outlook(result, result["seniority_context"])
+    result["hold_outlook"] = estimate_hold_outlook(
+        result,
+        result["seniority_context"],
+        monthly_inventory=profile.get("_monthly_inventory_count"),
+    )
+    if isinstance(result.get("ranking_components"), dict):
+        result["ranking_components"]["fatigue"] = result["fatigue_index"]
+        result["ranking_components"]["seniority_or_holding"] = result["hold_outlook"]
     conflict_events = profile.get("fixed_events") or []
     if conflict_events:
         result["schedule_conflict_analysis"] = optimize_schedule_conflicts(
@@ -1838,12 +1851,14 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
             if not pairings:
                 raise RuntimeError("No confirmed bidable Southwest pairings were available for recommendation input.")
             update_job(job_id, progress=72, message=f"Matching {len(pairings)} pairings to offered lines")
-            scored_pairings = {p["id"]: score_pairing(p, profile) for p in pairings}
+            pairing_profile = {**profile, "_monthly_inventory_count": len(pairings)}
+            scored_pairings = {p["id"]: score_pairing(p, pairing_profile) for p in pairings}
             lines = parse_southwest_lines(lines_text, set(scored_pairings))
             if not lines:
                 raise RuntimeError("No Southwest lines could be matched to the pairing IDs. Confirm that the correct Pairings and Lines ZIP files were uploaded.")
             lines = [{**line, "package_id": package_id} for line in lines]
-            results = [score_southwest_line(line, scored_pairings, profile) for line in lines]
+            line_profile = {**profile, "_monthly_inventory_count": len(lines)}
+            results = [score_southwest_line(line, scored_pairings, line_profile) for line in lines]
             item_label = "lines"
         else:
             cache_key = parser_cache_key(paths[0], airline)
@@ -1880,7 +1895,8 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
             if profile.get("bid_fleets") and not eligible_pairings:
                 raise RuntimeError("No pairings matched the selected bid fleet. Check the fleet code and run the package again.")
             update_job(job_id, state="ranking", current_stage="building_recommendations", progress=75, message=f"Scoring {len(eligible_pairings)} pairings")
-            results = [score_pairing(pairing, profile) for pairing in eligible_pairings]
+            scoring_profile = {**profile, "_monthly_inventory_count": len(pairings)}
+            results = [score_pairing(pairing, scoring_profile) for pairing in eligible_pairings]
             item_label = "pairings"
         update_job(job_id, state="ranking", current_stage="building_recommendations", progress=85, message=f"Building recommendation data for {len(results)} records")
         sort_results(results, package_id)
@@ -2311,14 +2327,17 @@ def rescore_job(job_id: str, profile_json: str = Form(...), package_id: str | No
         pairings = filter_pairings_for_profile(pairings, {})
         if not pairings:
             raise HTTPException(409, "No confirmed bidable Southwest pairings are available. Upload the package again.")
-        scored_pairings = {pairing["id"]: score_pairing(pairing, profile) for pairing in pairings}
+        pairing_profile = {**profile, "_monthly_inventory_count": len(pairings)}
+        scored_pairings = {pairing["id"]: score_pairing(pairing, pairing_profile) for pairing in pairings}
         lines = [{**line, "package_id": active_package_id} for line in source.get("lines") or []]
-        results = [score_southwest_line(line, scored_pairings, profile) for line in lines]
+        line_profile = {**profile, "_monthly_inventory_count": len(lines)}
+        results = [score_southwest_line(line, scored_pairings, line_profile) for line in lines]
     else:
         eligible_pairings = filter_pairings_for_profile(pairings, profile)
         if profile.get("bid_fleets") and not eligible_pairings:
             raise HTTPException(400, "No pairings matched the selected bid fleet. Check the fleet code.")
-        results = [score_pairing(pairing, profile) for pairing in eligible_pairings]
+        scoring_profile = {**profile, "_monthly_inventory_count": len(pairings)}
+        results = [score_pairing(pairing, scoring_profile) for pairing in eligible_pairings]
     sort_results(results, active_package_id)
     package_records(results, active_package_id)
     update_job(job_id, results_json=json.dumps(results), profile_json=json.dumps(profile), message=f"Preferences updated: {len(results)} recommendations reranked")

@@ -43,6 +43,23 @@ def test_delta_nyc_coterminal_group_expands_to_three_airports():
     assert expand_airports("american", ["NYC"]) == ["NYC"]
 
 
+def test_scored_results_include_shared_explainable_assessments():
+    result = score_pairing(pairing(), {
+        "prefer_operate": False,
+        "_monthly_inventory_count": 25,
+        "seniority_context": {"category_seniority": 200, "category_population": 1000},
+    })
+
+    assert result["fatigue_index"]["level"] in {"Low", "Moderate", "High", "Very High", "Insufficient Data"}
+    assert "contributing_factors" in result["fatigue_index"]
+    assert "mitigating_factors" in result["fatigue_index"]
+    assert result["hold_outlook"]["likelihood"] in {"Very High", "High", "Moderate", "Low", "Very Low", "Insufficient Data"}
+    assert result["hold_outlook"]["desirability"] in {"Very High", "High", "Moderate", "Low", "Very Low", "Insufficient Data"}
+    assert result["hold_outlook"]["probability"] is None
+    assert result["hold_outlook"]["estimate_basis"] == "Inventory-based estimate only"
+    assert result["ranking_components"]["seniority_or_holding"] == result["hold_outlook"]
+
+
 def test_start_airport_preferences_apply_to_coterminal_group_and_avoid_wins():
     preferred = score_pairing(pairing(start="LGA"), {"preferred_start_airports": ["NYC"], "prefer_operate": False})
     avoided = score_pairing(pairing(start="LGA"), {

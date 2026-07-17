@@ -767,6 +767,41 @@ function recommendationSection(item) {
     ${failures.length ? `<div class="fd-briefing-detail fd-warning"><h3>Hard failures</h3>${detailList(failures)}</div>` : ''}`;
 }
 
+function fatigueAssessment(item) {
+  const fatigue = item?.fatigue_index;
+  if (!fatigue || typeof fatigue !== 'object') {
+    return '<p class="fd-missing">Fatigue Index is unavailable because the normalized schedule data is incomplete.</p>';
+  }
+  const factors = uniqueDetails(fatigue.contributing_factors || []);
+  const mitigations = uniqueDetails(fatigue.mitigating_factors || []);
+  return `<div class="fd-fact-grid">
+      ${metric('Fatigue Index', fatigue.level || 'Insufficient Data')}
+      ${metric('Confidence', fatigue.confidence || 'Low')}
+      ${metric('FAR Legality', fatigue.legality_assessment || 'Not assessed separately')}
+    </div>
+    <div class="fd-briefing-detail"><h3>Contributing factors</h3>${detailList(factors, 'No elevated schedule factors were identified from the available data.')}</div>
+    <div class="fd-briefing-detail"><h3>Mitigating factors</h3>${detailList(mitigations, 'No mitigating factors were confirmed from the available data.')}</div>
+    ${fatigue.missing_data_warning ? `<div class="fd-briefing-detail fd-warning"><h3>Missing data</h3><p>${escapeHtml(fatigue.missing_data_warning)}</p></div>` : ''}`;
+}
+
+function holdingAssessment(item) {
+  const holding = item?.hold_outlook;
+  if (!holding || typeof holding !== 'object') {
+    return '<p class="fd-missing">Holding estimate is unavailable because active-package inventory data is incomplete.</p>';
+  }
+  const factors = uniqueDetails(holding.factors || holding.evidence || []);
+  const desirabilityFactors = uniqueDetails(holding.desirability_factors || []);
+  return `<div class="fd-fact-grid">
+      ${metric('Desirability', holding.desirability || 'Insufficient Data')}
+      ${metric('Likelihood of Holding', holding.likelihood || holding.outlook || 'Insufficient Data')}
+      ${metric('Confidence', holding.confidence || 'Low')}
+      ${metric('Estimate Basis', holding.estimate_basis || 'Inventory-based estimate only')}
+    </div>
+    <div class="fd-briefing-detail"><h3>Factors used</h3>${detailList(factors, 'No trip-specific holding factors are available.')}</div>
+    <div class="fd-briefing-detail"><h3>Desirability factors</h3>${detailList(desirabilityFactors, 'Preference-based desirability could not be assessed.')}</div>
+    ${holding.missing_data_warning ? `<div class="fd-briefing-detail fd-warning"><h3>Missing data</h3><p>${escapeHtml(holding.missing_data_warning)}</p></div>` : ''}`;
+}
+
 function originalAirlineTrip(models) {
   if (!models.length) return '<p class="fd-missing">Confirmed bidable source provenance is unavailable.</p>';
   return models.map(model => {
@@ -804,8 +839,8 @@ function tripBriefingPage() {
       <section class="surface fd-briefing-section fd-briefing-wide"><span class="fd-section-number">04</span><span class="fd-trip-flow-label">Trip Flow</span><h2>Duty-Day Summary</h2><div class="fd-trip-flow">${tripFlow(models)}</div></section>
       <section class="surface fd-briefing-section fd-briefing-wide"><span class="fd-section-number">05</span><h2>Layovers and Hotels</h2>${layoversAndHotels(models)}</section>
       <section class="surface fd-briefing-section"><span class="fd-section-number">06</span><h2>Pay or TFP Breakdown</h2>${payOrTfpBreakdown(model)}</section>
-      <section class="surface fd-briefing-section fd-placeholder"><span class="fd-section-number">07</span><h2>Fatigue</h2><p>No Flight Deck fatigue assessment is available for this trip.</p></section>
-      <section class="surface fd-briefing-section fd-placeholder"><span class="fd-section-number">08</span><h2>Likelihood of Holding</h2><p>No holding assessment is available for this trip.</p></section>
+      <section class="surface fd-briefing-section"><span class="fd-section-number">07</span><h2>Fatigue</h2>${fatigueAssessment(item)}</section>
+      <section class="surface fd-briefing-section"><span class="fd-section-number">08</span><h2>Likelihood of Holding</h2>${holdingAssessment(item)}</section>
       <section class="surface fd-briefing-section fd-placeholder"><span class="fd-section-number">09</span><h2>Commute Planner</h2><p>No commute plan is available for this trip.</p></section>
       <section class="surface fd-briefing-section fd-briefing-wide"><span class="fd-section-number">10</span><h2>Recommendation</h2>${recommendationSection(item)}</section>
       <section class="surface fd-briefing-section fd-briefing-wide"><span class="fd-section-number">11</span><h2>Original Airline Trip</h2>${originalAirlineTrip(models)}</section>
