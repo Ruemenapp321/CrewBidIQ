@@ -15,7 +15,7 @@ function profile() {
   return {
     elite_cities: csv($('eliteCities').value), secondary_cities: csv($('secondaryCities').value), small_cities: [], penalty_cities: csv($('penaltyCities').value),
     base_airport: $('baseAirport').value.trim().toUpperCase(), bid_fleets: $('airlineChoice').value === 'american' ? csv($('bidFleets').value) : [], preferred_start_airports: csv($('preferredStartAirports').value), avoid_start_airports: csv($('avoidStartAirports').value),
-    preferred_aircraft: csv($('preferredAircraft').value), preferred_trip_lengths: csv($('preferredTripLengths').value), max_deadheads: num('maxDeadheads'), max_transfers: num('maxTransfers'),
+    preferred_aircraft: csv($('preferredAircraft').value), trip_length_priority: csv($('preferredTripLengths').value), preferred_trip_lengths: csv($('preferredTripLengths').value), max_deadheads: num('maxDeadheads'), max_transfers: num('maxTransfers'),
     max_legs_per_day: num('maxLegsPerDay'), max_first_day_legs: num('maxFirstDayLegs'), max_last_day_legs: num('maxLastDayLegs'), min_layover_hours: num('minLayoverHours'), max_legs_after_redeye: num('maxLegsAfterRedeye'),
     required_days_off: csv($('requiredDaysOff').value), preferred_days_off: csv($('preferredDaysOff').value), holiday_dates: csv($('holidayDates').value), preferred_weekdays: csv($('preferredWeekdays').value),
     earliest_report_minutes: mins($('earliestReport').value, null), latest_release_minutes: mins($('latestRelease').value, null), prefer_weekends_off: $('preferWeekendsOff').checked,
@@ -25,7 +25,7 @@ function profile() {
     weights: { elite: num('wElite'), secondary: num('wSecondary'), small: num('wSmall'), penalty: num('wPenalty'), aircraft: num('wAircraft'), pure: num('wPure'), transfer: num('wTransfer'), deadhead: num('wDeadhead'), start_preferred: num('wStartPreferred'), start_avoid: num('wStartAvoid'), required_conflict: num('wRequiredConflict'), preferred_conflict: num('wPreferredConflict'), holiday_conflict: num('wHolidayConflict'), early_report: num('wEarlyReport'), late_release: num('wLateRelease') }
   };
 }
-function applySaved() { try { const p = JSON.parse(localStorage.getItem('crewbidiqProfile') || 'null'); if (!p) return; const map = { eliteCities: p.elite_cities, secondaryCities: p.secondary_cities, penaltyCities: p.penalty_cities, preferredAircraft: p.preferred_aircraft, preferredTripLengths: p.preferred_trip_lengths, baseAirport: p.base_airport, bidFleets: p.bid_fleets, preferredStartAirports: p.preferred_start_airports, avoidStartAirports: p.avoid_start_airports, requiredDaysOff: p.required_days_off, preferredDaysOff: p.preferred_days_off, holidayDates: p.holiday_dates, preferredWeekdays: p.preferred_weekdays, payPriority: p.pay_priority }; Object.entries(map).forEach(([id, value]) => { if ($(id) && value && (id !== 'payPriority' || Array.from($(id).options).some(option => option.value === value))) $(id).value = Array.isArray(value) ? value.join(',') : value; }); } catch (_) {} }
+function applySaved() { try { const p = JSON.parse(localStorage.getItem('crewbidiqProfile') || 'null'); if (!p) return; const map = { eliteCities: p.elite_cities, secondaryCities: p.secondary_cities, penaltyCities: p.penalty_cities, preferredAircraft: p.preferred_aircraft, preferredTripLengths: p.trip_length_priority || p.preferred_trip_lengths, baseAirport: p.base_airport, bidFleets: p.bid_fleets, preferredStartAirports: p.preferred_start_airports, avoidStartAirports: p.avoid_start_airports, requiredDaysOff: p.required_days_off, preferredDaysOff: p.preferred_days_off, holidayDates: p.holiday_dates, preferredWeekdays: p.preferred_weekdays, payPriority: p.pay_priority }; Object.entries(map).forEach(([id, value]) => { if ($(id) && value && (id !== 'payPriority' || Array.from($(id).options).some(option => option.value === value))) $(id).value = Array.isArray(value) ? value.join(',') : value; }); } catch (_) {} }
 function setJob(show, status = '', progress = 0, message = '') { $('jobPanel').classList.toggle('hidden', !show); $('jobStatus').textContent = status; $('jobPercent').textContent = `${progress}%`; $('progressFill').style.width = `${progress}%`; $('jobMessage').textContent = message; }
 function showError(message) { $('errorBox').textContent = message; $('errorBox').classList.remove('hidden'); }
 function clearError() { $('errorBox').classList.add('hidden'); }
@@ -55,6 +55,8 @@ function updatePayPriority(airline) {
     ['', 'Quality of life first'], ['monthly_tfp', 'High TFP'], ['tfp_per_duty_period', 'TFP per duty period'], ['tfp_per_day_away', 'TFP efficiency']
   ] : airline === 'delta' ? [
     ['', 'Quality of life first'], ['trip_credit', 'Trip Credit'], ['total_pay', 'Total Pay'], ['additional_pay', 'Additional Pay'], ['credit_per_duty_day', 'Credit per duty day'], ['total_pay_per_duty_day', 'Total pay per duty day']
+  ] : airline === 'american' ? [
+    ['', 'Quality of life first'], ['total_pay', 'Total Pay'], ['total_pay_per_duty_day', 'Total pay per duty day']
   ] : [];
   field.classList.toggle('hidden', !options.length);
   select.innerHTML = options.map(([value, label]) => `<option value="${value}">${label}</option>`).join('');
@@ -141,8 +143,11 @@ async function loadLatestJob() {
 }
 
 function esc(value) { return String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
-function rating(item) { const level = item.match_level || 'fair', labels = { excellent: '★★★★★ Excellent', strong: '★★★★ Strong', good: '★★★ Good', fair: '★★ Fair', low: '★ Low' }; return [labels[level] || labels.fair, level]; }
-function fatigueRisk(item) { return (!item.redeye || item.redeye === 'none') ? ['No WOCL departure', 'neutral'] : ['WOCL · Fatigue risk', 'low']; }
+function rating(item) { if (item.match_label) { const classes = { exact: 'excellent', strong: 'strong', partial: 'fair', near: 'low' }; return [item.match_label, classes[item.match_class] || 'fair']; } const level = item.match_level || 'fair', labels = { excellent: '★★★★★ Excellent', strong: '★★★★ Strong', good: '★★★ Good', fair: '★★ Fair', low: '★ Low' }; return [labels[level] || labels.fair, level]; }
+function fatigueRisk(item) { const fatigue = item.fatigue_index; if (!fatigue) return ['Fatigue Index · Insufficient Data', 'neutral']; const classes = { Low: 'neutral', Moderate: 'good', High: 'fair', 'Very High': 'low', 'Insufficient Data': 'neutral' }; return [`Fatigue Index · ${fatigue.level}`, classes[fatigue.level] || 'neutral']; }
+function fatigueDetails(item) { const fatigue = item.fatigue_index; if (!fatigue) return ''; const factors = (fatigue.contributing_factors || []).map(esc).join('; ') || 'No elevated schedule factors detected'; const mitigating = (fatigue.mitigating_factors || []).map(esc).join('; ') || 'None identified'; return `<p><strong>Fatigue Index:</strong> ${esc(fatigue.level)} (${esc(fatigue.confidence)} confidence)</p><p><strong>Contributing factors:</strong> ${factors}</p><p><strong>Mitigating factors:</strong> ${mitigating}</p><p><strong>Legality:</strong> ${esc(fatigue.legality_assessment)}</p>`; }
+function holdDetails(item) { const outlook = item.hold_outlook; if (!outlook) return ''; const seniority = item.seniority_context; return `${seniority ? `<p><strong>Seniority context:</strong> ${seniority.wording.map(esc).join(' ')}</p>` : ''}<p><strong>Hold outlook:</strong> ${esc(outlook.outlook)} (${esc(outlook.confidence)} confidence)</p><p><strong>Estimate basis:</strong> ${esc(outlook.estimate_basis)}</p>`; }
+function scheduleConflictDetails(item) { const analysis = item.schedule_conflict_analysis; if (!analysis) return ''; return `<p><strong>${esc(analysis.display_label)}:</strong> ${esc(analysis.conflict_value)}</p><p><strong>Detected schedule overlaps:</strong> ${esc((analysis.overlaps || []).map(value => `${value.event_type}: ${value.dates.join(', ')}`).join('; ') || 'None')}</p>`; }
 function redeyeSummary(item) { const count = (item.redeye_legs || []).length; return count ? `${count} WOCL departure${count === 1 ? '' : 's'} (02:00–05:59 local)` : 'None'; }
 function resultAirline(item) { return item.airline || $('airlineChoice').value || 'generic'; }
 function payPresentation(item) {
@@ -165,6 +170,13 @@ function payPresentation(item) {
       detail: `<p><strong>Trip Credit:</strong> ${esc(item.trip_credit || item.credit || 'N/A')}</p><p><strong>Additional Pay:</strong> ${esc(item.additional_pay ?? 'N/A')}</p>${rows}<p><strong>Total Pay:</strong> ${esc(item.total_pay ?? 'N/A')}</p>${unknown ? `<p><strong>Unmapped source pay:</strong> ${esc(unknown)}</p>` : ''}`
     };
   }
+  if (airline === 'american') {
+    return {
+      snapshotLabel: 'Total Pay', snapshotValue: item.total_pay,
+      metrics: [['Total Pay', item.total_pay], ['TAFB', item.tafb], ['Legs by duty day', legs], ['Total pay / duty day', item.total_pay_per_duty_day]],
+      detail: `<p><strong>Total Pay:</strong> ${esc(item.total_pay ?? 'N/A')}</p>`
+    };
+  }
   return { snapshotLabel: 'Credit', snapshotValue: item.credit, metrics: [['Credit', item.credit], ['TAFB', item.tafb], ['Legs by duty day', legs], ['First / Last', `${item.first_day_legs ?? '—'} / ${item.last_day_legs ?? '—'}`]], detail: `<p><strong>Credit:</strong> ${esc(item.credit || 'N/A')}</p>` };
 }
 function metricStrip(metrics) { return `<div class="metric-strip">${metrics.map(([label, value]) => `<div><span>${esc(label)}</span><strong>${esc(value ?? '—')}</strong></div>`).join('')}</div>`; }
@@ -185,12 +197,19 @@ function renderSynopsis() {
   renderBreakdown('synopsisFleets', bidSynopsis.fleets, 'fleet');
   renderBreakdown('synopsisLayovers', bidSynopsis.layover_cities, 'city');
 }
-function render() {
-  const limit = $('resultLimit').value, shown = limit === 'all' ? allResults : allResults.slice(0, Number(limit)), wrap = $('results'), term = terminology(); wrap.innerHTML = '';
-  shown.forEach((item, index) => {
-    const [label, cls] = rating(item), [rec, recCls] = fatigueRisk(item), layovers = (item.layovers || []).map(x => `${x.city}${x.duration ? ` ${x.duration}` : ''}`).join(', ') || 'No overnights', reasons = (item.reasons || []).slice(0, 6), conflicts = item.calendar_conflicts || [], pay = payPresentation(item);
-    const card = document.createElement('article'); card.className = 'result-card';
-    card.innerHTML = `<div class="rank-badge">${index + 1}</div><div class="result-main"><div class="result-top"><div><span class="item-label">${esc(item.display_label || term.single)}</span><h3>${esc(item.pairing)}</h3></div><span class="match-pill ${cls}">${label}</span></div>${metricStrip(pay.metrics)}<div class="status-row"><span class="status ${recCls}">${esc(rec)}</span><span class="status neutral">Overnights: ${esc(layovers)}</span>${conflicts.length ? `<span class="status low">${conflicts.length} conflict${conflicts.length > 1 ? 's' : ''}</span>` : '<span class="status excellent">No conflicts</span>'}</div><details><summary>${esc(term.details)}</summary><div class="detail-grid"><div><h4>Why it matched</h4><ul>${(reasons.length ? reasons : ['No strong preference signals were detected.']).map(x => `<li>${esc(x)}</li>`).join('')}${item.pay_explanation ? `<li>${esc(item.pay_explanation)} (pay ranking)</li>` : ''}</ul></div><div><h4>Summary</h4><p><strong>Trip length:</strong> ${esc(item.trip_length ? `${item.trip_length} days` : 'N/A')}</p><p><strong>Duty periods:</strong> ${esc((item.duty_legs || []).length || 'N/A')}</p><p><strong>Legs by duty day:</strong> ${esc((item.duty_legs || []).join(' · ') || 'N/A')}</p><p><strong>Layovers:</strong> ${esc((item.cities || []).join(', ') || 'None')}</p>${item.equipment_codes?.length ? `<p><strong>Equipment:</strong> ${esc((item.aircraft_display_names?.length ? item.aircraft_display_names : item.equipment_codes).join(', '))}</p>` : ''}<p><strong>Deadheads:</strong> ${esc(item.deadheads || 0)}</p><p><strong>Redeyes:</strong> ${esc(redeyeSummary(item))}</p><p><strong>Operating dates:</strong> ${esc((item.operating_dates || item.dates || []).join(', ') || 'Not available')}</p><p><strong>TAFB:</strong> ${esc(item.tafb || 'N/A')}</p>${pay.detail}<p><strong>Conflicts:</strong> ${esc(conflicts.join('; ') || 'None')}</p></div></div><details class="timeline-details"><summary>Timeline and duty legs</summary>${timeline(item)}</details><details class="operating-cities"><summary>All operating cities</summary><p>${esc((item.touched_cities || []).join(', ') || 'Not available')}</p></details><details class="original-display"><summary>${esc(term.viewOriginal)}</summary><pre>${esc(item.original_display || 'Not available')}</pre></details></details></div>`;
+function explanationList(title, values, fallback = '') {
+  const rows = (values || []).filter(Boolean);
+  if (!rows.length && !fallback) return '';
+  return `<div class="explanation-group"><h5>${esc(title)}</h5><ul>${(rows.length ? rows : [fallback]).map(value => `<li>${esc(value)}</li>`).join('')}</ul></div>`;
+}
+function appendResultCards(items, wrap, term) {
+  wrap.innerHTML = '';
+  items.forEach((item, index) => {
+    const [label, cls] = rating(item), [rec, recCls] = fatigueRisk(item), layovers = (item.layovers || []).map(x => `${x.city}${x.duration ? ` ${x.duration}` : ''}`).join(', ') || 'No overnights', conflicts = item.calendar_conflicts || [], pay = payPresentation(item);
+    const matched = item.matched_preferences || (item.reasons || []).slice(0, 6);
+    const explanations = `${explanationList(item.eligible === false ? 'Closest fit' : 'Matched preferences', matched, 'No strong preference signals were detected.')}${explanationList('Compromises', item.compromises)}${explanationList('Requirements not met', item.eligibility_violations)}${explanationList('Trip facts', item.neutral_attributes)}${item.pay_explanation ? explanationList('Pay ranking', [item.pay_explanation]) : ''}`;
+    const card = document.createElement('article'); card.className = `result-card${item.eligible === false ? ' near-result-card' : ''}`;
+    card.innerHTML = `<div class="rank-badge">${index + 1}</div><div class="result-main"><div class="result-top"><div><span class="item-label">${esc(item.display_label || term.single)}</span><h3>${esc(item.pairing)}</h3></div><span class="match-pill ${cls}">${esc(label)}</span></div>${metricStrip(pay.metrics)}<div class="status-row"><span class="status ${recCls}">${esc(rec)}</span><span class="status neutral">Overnights: ${esc(layovers)}</span>${conflicts.length ? `<span class="status low">${conflicts.length} conflict${conflicts.length > 1 ? 's' : ''}</span>` : '<span class="status excellent">No conflicts</span>'}</div><details><summary>${esc(term.details)}</summary><div class="detail-grid"><div><h4>${item.eligible === false ? 'What would need to change' : 'Why it matched'}</h4>${explanations}</div><div><h4>Summary</h4><p><strong>Trip length:</strong> ${esc(item.trip_length ? `${item.trip_length} days` : 'N/A')}</p><p><strong>Duty periods:</strong> ${esc((item.duty_legs || []).length || 'N/A')}</p><p><strong>Legs by duty day:</strong> ${esc((item.duty_legs || []).join(' · ') || 'N/A')}</p><p><strong>Layovers:</strong> ${esc((item.cities || []).join(', ') || 'None')}</p>${item.equipment_codes?.length ? `<p><strong>Equipment:</strong> ${esc((item.aircraft_display_names?.length ? item.aircraft_display_names : item.equipment_codes).join(', '))}</p>` : ''}<p><strong>Deadheads:</strong> ${esc(item.deadheads || 0)}</p><p><strong>Redeyes:</strong> ${esc(redeyeSummary(item))}</p>${fatigueDetails(item)}<p><strong>Operating dates:</strong> ${esc((item.operating_dates || item.dates || []).join(', ') || 'Not available')}</p><p><strong>TAFB:</strong> ${esc(item.tafb || 'N/A')}</p>${pay.detail}${holdDetails(item)}${scheduleConflictDetails(item)}<p><strong>Conflicts:</strong> ${esc(conflicts.join('; ') || 'None')}</p></div></div><details class="timeline-details"><summary>Timeline and duty legs</summary>${timeline(item)}</details><details class="operating-cities"><summary>All operating cities</summary><p>${esc((item.touched_cities || []).join(', ') || 'Not available')}</p></details><details class="original-display"><summary>${esc(term.viewOriginal)}</summary><pre>${esc(item.original_display || 'Not available')}</pre></details></details></div>`;
     const statusRow = card.querySelector('.status-row');
     if (item.start_airport) statusRow.insertAdjacentHTML('beforeend', `<span class="status neutral">Starts ${esc(item.start_airport)}</span>`);
     if (item.fleet) statusRow.insertAdjacentHTML('beforeend', `<span class="status neutral">Fleet ${esc(item.fleet)}</span>`);
@@ -201,8 +220,17 @@ function render() {
     card.querySelector('.result-main').appendChild(reportButton);
     wrap.appendChild(card);
   });
-  if (!shown.length) wrap.innerHTML = '<div class="empty-state">Your ranked results will appear here.</div>';
-  if (allResults.length) { const top = allResults[0], topPay = payPresentation(top), [topRating] = rating(top), [topFatigue] = fatigueRisk(top); $('summary').textContent = `${term.analyzed}: ${allResults.length} · showing ${shown.length}. Ratings reflect your selected preferences.`; $('snapshotMatch').textContent = topRating; $('snapshotPayLabel').textContent = topPay.snapshotLabel; $('snapshotCredit').textContent = topPay.snapshotValue || '—'; $('snapshotLength').textContent = top.trip_length ? `${top.trip_length}-day` : (top.duty_legs && top.duty_legs.length ? `${top.duty_legs.length}-day` : '—'); $('snapshotFatigue').textContent = topFatigue; }
+}
+function render() {
+  const limit = $('resultLimit').value, count = limit === 'all' ? Number.MAX_SAFE_INTEGER : Number(limit), term = terminology();
+  const eligible = allResults.filter(item => item.eligible !== false), near = allResults.filter(item => item.eligible === false);
+  const shown = eligible.slice(0, count), nearShown = near.slice(0, Math.min(count, 25));
+  appendResultCards(shown, $('results'), term);
+  if (!shown.length) $('results').innerHTML = `<div class="empty-state">${near.length ? 'No trips met every hard requirement. Review Near Matches below.' : 'Your ranked results will appear here.'}</div>`;
+  $('nearMatchesPanel').classList.toggle('hidden', !near.length);
+  appendResultCards(nearShown, $('nearResults'), term);
+  const top = shown[0] || nearShown[0];
+  if (top) { const topPay = payPresentation(top), [topRating] = rating(top), [topFatigue] = fatigueRisk(top); $('summary').textContent = `${term.analyzed}: ${allResults.length} · ${eligible.length} eligible · ${near.length} near matches.`; $('snapshotMatch').textContent = topRating; $('snapshotPayLabel').textContent = topPay.snapshotLabel; $('snapshotCredit').textContent = topPay.snapshotValue || '—'; $('snapshotLength').textContent = top.trip_length ? `${top.trip_length}-day` : (top.duty_legs && top.duty_legs.length ? `${top.duty_legs.length}-day` : '—'); $('snapshotFatigue').textContent = topFatigue; }
 }
 
 $('resultLimit').addEventListener('change', render);

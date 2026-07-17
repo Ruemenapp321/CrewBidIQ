@@ -5,6 +5,8 @@ import re
 from datetime import datetime
 from typing import Any
 
+from app.recommendations import length_rule_matches
+
 
 def _list(value: Any) -> list[str]:
     if value is None:
@@ -46,8 +48,22 @@ def _matching_layovers(results: list[dict[str, Any]], city: str) -> int:
     return sum(city in {str(value).upper() for value in result.get("cities", [])} for result in results)
 
 
-def _request(text: str, reason: str, matches: int | None = None) -> dict[str, Any]:
-    payload: dict[str, Any] = {"request": text, "reason": reason}
+def _request(
+    text: str,
+    reason: str,
+    matches: int | None = None,
+    *,
+    interface_category: str = "Pairings",
+    preference_type: str | None = None,
+    values: list[str] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "request": text,
+        "reason": reason,
+        "interface_category": interface_category,
+        "preference_type": preference_type or text.split(" If ", 1)[0],
+        "values": values or [],
+    }
     if matches is not None:
         payload["matching_trip_count"] = matches
     return payload
@@ -59,12 +75,13 @@ def build_navblue_layers(
     filename: str = "",
 ) -> dict[str, Any]:
     """Build a pilot-reviewable NavBlue PBS request order from CrewBidIQ preferences."""
+    airline = str(profile.get("airline") or "").lower()
     layers: list[dict[str, Any]] = []
     layers.append({"number": 1, "title": "Start Pairing Group", "requests": []})
     hard_requests: list[dict[str, Any]] = []
     for value in _list(profile.get("required_days_off")):
         day = _navblue_date(value, filename)
-        hard_requests.append(_request(f"Prefer Off Date {day}", f"Protect required day off {day}."))
+        hard_requests.append(_request(f"Prefer Off Date {day}", f"Protect required day off {day}.", interface_category="Days Off", preference_type="Prefer Off", values=[day]))
     if hard_requests:
         layers.append({"number": len(layers) + 1, "title": "Protect non-negotiables", "requests": hard_requests})
 
@@ -87,6 +104,23 @@ def build_navblue_layers(
             f"Avoid Pairings If Pairing Check-Out Time After > {latest}",
             f"Avoid releases later than {latest}.",
         ))
+    if airline == "delta" and (profile.get("must_avoid_redeye") or profile.get("allow_productive_redeye") is False):
+        avoid_requests.append(_request(
+            "Avoid Pairings If Redeye",
+            "Avoid pairings with a WOCL departure.",
+            sum(result.get("redeye") != "none" for result in results),
+            preference_type="Avoid Pairings",
+            values=["Redeye"],
+        ))
+    if airline == "delta" and profile.get("hard_max_legs_per_day") not in (None, ""):
+        limit = int(profile["hard_max_legs_per_day"])
+        avoid_requests.append(_request(
+            f"Avoid Pairings If Legs Per Duty Period > {limit}",
+            f"Protect the hard maximum of {limit} operating legs per duty period.",
+            sum(max(result.get("duty_legs") or [0]) > limit for result in results),
+            preference_type="Avoid Pairings",
+            values=[f"Legs per Duty Period greater than {limit}"],
+        ))
     if avoid_requests:
         layers.append({"number": len(layers) + 1, "title": "Remove poor fits", "requests": avoid_requests})
 
@@ -101,9 +135,27 @@ def build_navblue_layers(
         layers.append({"number": len(layers) + 1, "title": "Award highest priorities", "requests": priority_requests})
 
     shape_requests: list[dict[str, Any]] = []
+    ordered_lengths = _list(profile.get("trip_length_priority"))
     lengths = sorted({int(value) for value in _list(profile.get("preferred_trip_lengths")) if value.isdigit()})
     result_length = lambda result: int(result.get("trip_length") or len(result.get("duty_legs", [])))
-    if len(lengths) == 1:
+    if ordered_lengths:
+        for rule in ordered_lengths:
+            matches = sum(length_rule_matches(result_length(result), rule) for result in results)
+            if rule.endswith("+"):
+                request_text = f"Award Pairings If Pairing Length >= {rule[:-1]} Days"
+            elif "-" in rule or "–" in rule:
+                low, high = re.split(r"[-–]", rule, maxsplit=1)
+                request_text = f"Award Pairings If Pairing Length Between {low} Days And {high} Days"
+            else:
+                request_text = f"Award Pairings If Pairing Length = {rule} Days"
+            shape_requests.append(_request(
+                request_text,
+                f"Use ranked trip-length choice {rule} in this order.",
+                matches,
+                preference_type="Award Pairings",
+                values=[rule],
+            ))
+    elif len(lengths) == 1:
         length = lengths[0]
         matches = sum(result_length(result) == length for result in results)
         shape_requests.append(_request(
@@ -138,8 +190,24 @@ def build_navblue_layers(
         "Confirm each request is available in your airline's NavBlue configuration before submitting.",
         "CrewBidIQ does not submit these requests to NavBlue; this is a pilot-reviewed draft.",
     ]
-    if profile.get("max_legs_per_day") not in (None, ""):
+    if profile.get("max_legs_per_day") not in (None, "") and airline != "delta":
         warnings.append("Maximum legs per duty day needs airline-specific NavBlue keyword confirmation and was not emitted automatically.")
-    if profile.get("allow_productive_redeye") is False or profile.get("avoid_final_redeye"):
+    if (profile.get("allow_productive_redeye") is False or profile.get("avoid_final_redeye")) and airline != "delta":
         warnings.append("Redeye handling needs airline-specific NavBlue keyword confirmation and was not emitted automatically.")
-    return {"layers": layers, "warnings": warnings, "request_count": sum(len(layer["requests"]) for layer in layers)}
+    ordering = 0
+    for index, layer in enumerate(layers):
+        relaxed = None if index <= 1 else f"Broadens beyond: {layers[index - 1]['title']}"
+        for request in layer["requests"]:
+            ordering += 1
+            request["ordering"] = ordering
+            request["explanation"] = request["reason"]
+            request["relaxed_from_previous"] = relaxed
+        if layer["requests"]:
+            layer["next_action"] = "Else Start Next Bid Group" if index < len(layers) - 1 else "Review and submit manually in NAVBLUE/PBS"
+    return {
+        "layers": layers,
+        "warnings": warnings,
+        "request_count": ordering,
+        "submission_mode": "pilot_review_only",
+        "airline_scope": airline or "generic_navblue",
+    }

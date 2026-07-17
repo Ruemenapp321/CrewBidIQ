@@ -65,3 +65,31 @@ def test_navblue_length_counts_elapsed_trip_days_not_duty_periods():
         if "Pairing Length" in request["request"]
     )
     assert length_request["matching_trip_count"] == 1
+
+
+def test_navblue_checklist_includes_entry_fields_order_and_manual_submission_warning():
+    plan = build_navblue_layers(
+        {"airline": "delta", "trip_length_priority": ["4", "3"], "must_avoid_redeye": True},
+        [{"trip_length": 4, "redeye": "none", "cities": []}],
+        "ATL AUG 2026.pdf",
+    )
+    requests = [request for layer in plan["layers"] for request in layer["requests"]]
+    assert requests[0]["interface_category"] == "Pairings"
+    assert requests[0]["preference_type"] == "Avoid Pairings"
+    assert [request["ordering"] for request in requests] == list(range(1, len(requests) + 1))
+    assert plan["submission_mode"] == "pilot_review_only"
+    assert any("does not submit" in warning for warning in plan["warnings"])
+
+
+def test_navblue_ordered_trip_lengths_remain_in_user_order():
+    plan = build_navblue_layers(
+        {"trip_length_priority": ["6+", "5", "4", "3", "2", "1"]},
+        [{"trip_length": 6, "cities": []}, {"trip_length": 5, "cities": []}],
+    )
+    length_requests = [
+        request["values"][0]
+        for layer in plan["layers"]
+        for request in layer["requests"]
+        if "Pairing Length" in request["request"]
+    ]
+    assert length_requests == ["6+", "5", "4", "3", "2", "1"]

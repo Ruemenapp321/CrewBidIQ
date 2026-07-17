@@ -1,5 +1,7 @@
 import json
 
+import fitz
+
 from fastapi.testclient import TestClient
 
 from app.main import app, db
@@ -36,7 +38,27 @@ def test_legacy_csv_url_returns_pdf_for_cached_clients():
 def test_report_uses_airline_specific_pay_labels_and_delta_breakdown():
     southwest = _pay_rows({"item_type": "line", "line_tfp": "90.18", "carry_out_tfp": "8.30", "tfp_per_duty_period": "6.94"}, "southwest")
     delta = _pay_rows({"trip_credit": "21:24", "additional_pay": "1:08", "pay_components": {"EDP": "0:57", "SIT": "0:11"}, "total_pay": "22:32"}, "delta")
+    american = _pay_rows({"total_pay": "12:14", "raw_total_pay": "12.14"}, "american")
     assert [row[0] for row in southwest] == ["Line TFP", "Carry-out TFP", "TFP per duty period", "TFP per day away"]
     assert all(row[0] != "Credit" for row in southwest)
     assert [row[0] for row in delta] == ["Trip Credit", "Additional Pay", "EDP", "SIT", "Total Pay"]
     assert delta[-1][1] == "22:32"
+    assert american == [["Total Pay", "12:14"]]
+
+
+def test_report_uses_match_fatigue_and_hold_outlook_language():
+    result = {
+        "pairing": "4004", "display_label": "Sequence", "match_label": "Exact Match",
+        "eligible": True, "match_class": "exact", "matched_preferences": ["Trip length is 4 days"],
+        "compromises": [], "eligibility_violations": [], "neutral_attributes": ["4 duty periods"],
+        "fatigue_index": {"level": "Moderate", "confidence": "High", "contributing_factors": ["One WOCL departure"], "mitigating_factors": ["Long rest"]},
+        "hold_outlook": {"outlook": "Competitive", "confidence": "Low", "estimate_basis": "Inventory-based estimate only"},
+        "original_display": "SEQ 4004", "layovers": [], "duty_legs": [1, 1, 1, 1],
+    }
+    payload = build_bid_report([result], {}, "american", "AA AUG 2026.pdf")
+    document = fitz.open(stream=payload, filetype="pdf")
+    text = "\n".join(page.get_text() for page in document)
+    document.close()
+    assert "Exact Match" in text
+    assert "Fatigue Index" in text
+    assert "Inventory-based estimate only" in text

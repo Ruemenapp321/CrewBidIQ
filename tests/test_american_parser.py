@@ -1,5 +1,5 @@
 from app.parsers import american
-from app.main import detect_airports, detect_layover_cities
+from app.main import detect_airports, detect_layover_cities, score_pairing
 
 
 SAMPLE = """<<<CREWBIDIQ_PAGE:8>>>
@@ -46,6 +46,40 @@ TTL 10.15 0.00 10.15 11.45
 """
 
 
+MULTI_DAY_SAMPLE = """<<<CREWBIDIQ_PAGE:30>>>
+AMERICAN AIRLINES
+AUGUST 2026
+DAY --DEPARTURE-- ---ARRIVAL--- GRND/ REST/
+DP D/A EQ FLT# STA DLCL/DHBT ML STA ALCL/AHBT BLOCK SYNTH TPAY DUTY TAFB FDP CALENDAR 08/01-08/30
+LAX 787
+SEQ 703 1 OPS POSN FO MO TU WE TH FR SA SU
+RPT 0800/0800
+1 1/1 78 100 LAX 0900/0900 D JFK 1700/1400 5.00
+RLS 1730/1430 5.00 0.00 5.00 9.30 9.00
+JFK HOTEL 15.00
+RPT 0830/0530
+2 2/3 78 101 JFK 0930/0630 D LAX 1200/1200 5.30
+RLS 1230/1230 5.30 0.00 5.30 8.00 7.30
+TTL 10.30 0.00 10.30 52.30
+LAX 787
+SEQ 705 1 OPS POSN FO MO TU WE TH FR SA SU
+RPT 2200/2200
+1 1/3 78 200 LAX 2300/2300 D SYD 0700/1400 15.00
+RLS 0730/1430 15.00 0.00 15.00 16.30 16.00
+SYD HOTEL 24.00
+RPT 2100/0400
+2 4/5 78 201 SYD 2200/0500 D LAX 1800/1800 14.00
+RLS 1830/1830 14.00 0.00 14.00 15.30 15.00
+TTL 29.00 0.00 29.00 96.30
+LAX 787
+SEQ 706 1 OPS POSN FO MO TU WE TH FR SA SU
+RPT 2300/2300
+1 1/2 78 300 LAX 2350/2350 D JFK 0020/2120 5.30
+RLS 0050/2150 5.30 0.00 5.30 1.50 1.20
+TTL 5.30 0.00 5.30 1.50
+"""
+
+
 def test_detects_aa_cockpit_sequence_package():
     assert american.detect(SAMPLE) >= 0.9
 
@@ -65,6 +99,9 @@ def test_parses_duties_deadheads_layovers_totals_and_dates():
     assert row["legs"][0]["departure_home_time"] == "0957"
     assert row["layovers"] == [{"city": "MIA", "duration": "11.42", "hotel": "MIAMI AIRPORT MARRIOTT", "hotel_phone": "305-649-5000", "transportation_provider": "SHUTTLE SUPER SHUTTLE", "transportation_phone": "305-555-0100"}]
     assert row["credit"] == "12.14"
+    assert row["raw_total_pay"] == "12.14"
+    assert row["total_pay"] == "12:14"
+    assert row["source_total_pay_label"] == "TPAY"
     assert row["tafb"] == "30.37"
     assert row["equipment_codes"] == ["92", "83", "26"]
     assert row["equipment_mapping_status"] == "raw_unmapped"
@@ -78,6 +115,8 @@ def test_parses_duties_deadheads_layovers_totals_and_dates():
     assert row["duty_periods"][0]["release_local"] == "2113"
     assert row["duty_periods"][0]["release_home_base"] == "1813"
     assert row["duty_periods"][0]["trip_pay"] == "6.05"
+    assert row["duty_periods"][0]["raw_tpay"] == "6.05"
+    assert row["duty_periods"][0]["total_pay"] == "6:05"
     assert "SEQ 520  2 OPS" in row["block"]
 
 
@@ -89,6 +128,12 @@ def test_parses_relief_position_qualifier_and_date_line_days():
     assert row["legs"][0]["departure_day"] == 1
     assert row["legs"][0]["arrival_day"] == 3
     assert row["start_dates"] == ["2026-08-15"]
+    assert row["sequence_days"] == 4
+    assert row["calendar_span_days"] == 4
+    assert row["duty_period_count"] == 2
+    assert row["overnight_count"] == 1
+    assert row["first_report"] == "2155"
+    assert row["final_release"] == "0705"
 
 
 def test_layovers_are_distinct_from_all_operating_cities():
@@ -111,3 +156,41 @@ def test_tracks_fleet_changes_and_long_haul_source_page():
 def test_intro_pages_do_not_create_false_sequences():
     intro = """AMERICAN AIRLINES\nAUGUST 2026\nSEQUENCE CONSTRUCTION NOTES\nPOSN CA FO\nSYNTH TPAY TAFB\n"""
     assert american.parse(intro) == []
+
+
+def test_american_tpay_total_is_exposed_and_rankable_as_total_pay():
+    pairing = american.parse(SAMPLE)[0]
+    result = score_pairing(pairing, {"pay_priority": "total_pay", "prefer_operate": False})
+    assert result["total_pay"] == "12:14"
+    assert result["raw_total_pay"] == "12.14"
+    assert result["total_pay_per_duty_day"] == "6:07"
+    assert result["pay_explanation"] == "Total Pay: 12:14"
+    assert "pay_components" not in result
+
+
+def test_american_three_and_five_day_sequences_use_calendar_span_not_duty_count():
+    rows = {row["id"]: row for row in american.parse(MULTI_DAY_SAMPLE)}
+    assert rows["703"]["sequence_days"] == 3
+    assert rows["703"]["duty_period_count"] == 2
+    assert rows["705"]["sequence_days"] == 5
+    assert rows["705"]["duty_period_count"] == 2
+    assert rows["705"]["total_flight_segments"] == 2
+    assert rows["705"]["normalization_diagnostics"]["length_basis"] == "report_to_release_calendar_span"
+
+
+def test_american_after_midnight_release_uses_arrival_day_without_double_counting():
+    row = next(row for row in american.parse(MULTI_DAY_SAMPLE) if row["id"] == "706")
+    assert row["sequence_days"] == 2
+    assert row["first_report_day"] == 1
+    assert row["final_release_day"] == 2
+
+
+def test_american_scoring_uses_sequence_days_and_keeps_all_lengths_without_default_limit():
+    parsed = american.parse(SAMPLE + "\n" + MULTI_DAY_SAMPLE)
+    results = [score_pairing(row, {"prefer_operate": False}) for row in parsed]
+    assert {result["trip_length"] for result in results} >= {2, 3, 4, 5}
+    five_day = next(row for row in parsed if row["id"] == "705")
+    exact = score_pairing(five_day, {"preferred_trip_lengths": ["5"], "prefer_operate": False})
+    assert exact["trip_length"] == 5
+    assert exact["trip_length_match"] is True
+    assert "Matches your preferred 5-day trip length" in exact["reasons"]

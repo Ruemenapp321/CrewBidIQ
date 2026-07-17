@@ -5,6 +5,7 @@ import unicodedata
 from typing import Any
 
 from app.airlines import decode_equipment, get_aircraft_display_name
+from app.pay import format_pay_minutes, parse_clock_minutes
 
 from .base import Leg, Pairing
 
@@ -143,8 +144,49 @@ def _totals(line: str) -> tuple[str | None, str | None, str | None, str | None]:
 
 def _duty_values(line: str) -> dict[str, str | None]:
     values = re.findall(r"\b\d{1,3}\.\d{2}\b", line)
-    names = ("block", "synthetic", "trip_pay", "duty", "fdp")
-    return {name: values[index] if index < len(values) else None for index, name in enumerate(names)}
+    names = ("block", "synthetic", "raw_tpay", "duty", "fdp")
+    parsed = {name: values[index] if index < len(values) else None for index, name in enumerate(names)}
+    parsed["total_pay"] = format_pay_minutes(parse_clock_minutes(parsed["raw_tpay"]))
+    parsed["trip_pay"] = parsed["raw_tpay"]  # Backward-compatible raw source alias.
+    return parsed
+
+
+def _clock_minutes(value: str | None) -> int | None:
+    token = str(value or "").strip()
+    if not re.fullmatch(r"\d{4}", token):
+        return None
+    hours, minutes = int(token[:2]), int(token[2:])
+    if hours > 23 or minutes > 59:
+        return None
+    return hours * 60 + minutes
+
+
+def _annotate_duty_calendar_days(duty_periods: list[dict[str, Any]]) -> tuple[int | None, int | None]:
+    """Infer report/release day offsets from AA D/A markers and local clocks."""
+    first_report_day: int | None = None
+    final_release_day: int | None = None
+    for duty in duty_periods:
+        legs = duty.get("legs") or []
+        if not legs:
+            continue
+        first_leg, last_leg = legs[0], legs[-1]
+        report_day = int(first_leg["departure_day"])
+        report_minutes = _clock_minutes(duty.get("report_local"))
+        departure_minutes = _clock_minutes(first_leg.get("departure_time"))
+        if report_minutes is not None and departure_minutes is not None and report_minutes > departure_minutes:
+            report_day -= 1
+
+        release_day = int(last_leg["arrival_day"])
+        release_minutes = _clock_minutes(duty.get("release_local"))
+        arrival_minutes = _clock_minutes(last_leg.get("arrival_time"))
+        if release_minutes is not None and arrival_minutes is not None and release_minutes < arrival_minutes:
+            release_day += 1
+
+        duty["report_day"] = report_day
+        duty["release_day"] = release_day
+        first_report_day = report_day if first_report_day is None else min(first_report_day, report_day)
+        final_release_day = release_day if final_release_day is None else max(final_release_day, release_day)
+    return first_report_day, final_release_day
 
 
 def _build_sequence(current: dict[str, Any], month: int | None, year: int | None) -> dict[str, Any]:
@@ -158,7 +200,7 @@ def _build_sequence(current: dict[str, Any], month: int | None, year: int | None
     active_duty: dict[str, Any] | None = None
     pending_layover: dict[str, Any] | None = None
     awaiting_layover = False
-    block_total = synthetic_total = trip_pay_total = tafb = None
+    block_total = synthetic_total = raw_total_pay = tafb = None
 
     for line in lines[1:]:
         report = REPORT.match(line)
@@ -196,7 +238,7 @@ def _build_sequence(current: dict[str, Any], month: int | None, year: int | None
             continue
         total = TOTAL.match(line)
         if total:
-            block_total, synthetic_total, trip_pay_total, tafb = _totals(total.group(1))
+            block_total, synthetic_total, raw_total_pay, tafb = _totals(total.group(1))
             awaiting_layover = False
             continue
         leg = LEG.match(line)
@@ -256,15 +298,29 @@ def _build_sequence(current: dict[str, Any], month: int | None, year: int | None
                 pending_layover.update(transport)
 
     dates = _calendar_dates(lines, month, year)
+    first_report_day, final_release_day = _annotate_duty_calendar_days(duty_periods)
+    leg_days = [
+        day
+        for leg in leg_details
+        for day in (int(leg["departure_day"]), int(leg["arrival_day"]))
+    ]
+    span_start_candidates = leg_days + ([first_report_day] if first_report_day is not None else [])
+    span_end_candidates = leg_days + ([final_release_day] if final_release_day is not None else [])
+    calendar_span_days = (
+        max(span_end_candidates) - min(span_start_candidates) + 1
+        if span_start_candidates and span_end_candidates else len(duty_periods)
+    )
+    sequence_days = max(calendar_span_days, 1) if legs else 0
     positions, qualifiers, position_text = _positions(current["position_text"])
     raw = "\n".join(current.get("raw_lines") or lines).strip()
-    confidence = 0.98 if legs and trip_pay_total and len(dates) == current["operations"] else (0.92 if legs else 0.55)
+    total_pay = format_pay_minutes(parse_clock_minutes(raw_total_pay))
+    confidence = 0.98 if legs and total_pay and len(dates) == current["operations"] else (0.92 if legs else 0.55)
     pairing = Pairing(
         pairing_id=current["id"],
         raw=raw,
         legs=legs,
         layovers=[],
-        credit=trip_pay_total,
+        credit=raw_total_pay,  # Legacy API alias; pilot-facing AA output uses total_pay.
         tafb=tafb,
         checkin=reports[0]["local"] if reports else None,
         release=releases[-1]["local"] if releases else None,
@@ -294,14 +350,33 @@ def _build_sequence(current: dict[str, Any], month: int | None, year: int | None
             "source_pdf_page": current.get("source_pdf_page"),
             "block_total": block_total,
             "synthetic_total": synthetic_total,
-            "trip_pay_total": trip_pay_total,
+            "trip_pay_total": raw_total_pay,
+            "raw_total_pay": raw_total_pay,
+            "total_pay": total_pay,
+            "source_total_pay_label": "TPAY" if raw_total_pay else None,
             "equipment_codes": equipment_codes,
             "aircraft_display_names": [get_aircraft_display_name("american", code) for code in equipment_codes],
             "equipment_mapping_status": mapping_status,
             "duty_reports": reports,
             "duty_releases": releases,
             "duty_periods": duty_periods,
+            "sequence_days": sequence_days,
+            "duty_period_count": len(duty_periods),
+            "overnight_count": len(layovers),
+            "calendar_span_days": calendar_span_days,
+            "first_report": reports[0]["local"] if reports else None,
+            "first_report_day": first_report_day,
+            "final_release": releases[-1]["local"] if releases else None,
+            "final_release_day": final_release_day,
             "total_flight_segments": len(leg_details),
+            "normalization_diagnostics": {
+                "raw_sequence_id": current["id"],
+                "parsed_sequence_days": sequence_days,
+                "duty_period_count": len(duty_periods),
+                "first_report": reports[0]["local"] if reports else None,
+                "final_release": releases[-1]["local"] if releases else None,
+                "length_basis": "report_to_release_calendar_span",
+            },
         }
     )
     return pairing

@@ -25,17 +25,24 @@ from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from app.airlines import airline_terminology_payload, get_airline_terminology
 from app.airports import coterminal_group_for_airport, coterminal_payload, expand_airports
+from app.destinations import is_transcontinental, taxonomy_payload
+from app.fatigue import build_fatigue_index
 from app.labs import labs_enabled, router as labs_router
+from app.month_planner import build_month_plan
 from app.navblue import build_navblue_layers
 from app.pay import pay_minutes_per_duty_day, pay_priority_value, tfp_per_day_away, tfp_ratio
 from app.parsers import select_parser
+from app.recommendations import evaluate_recommendation, length_priority, length_score_contribution
 from app.reporting import build_bid_report
+from app.seniority import build_seniority_context, estimate_hold_outlook
+from app.southwest_planning import optimize_schedule_conflicts, rank_southwest_line
+from app.trip_intent import interpret_trip_intent, trip_intent_profile
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR / "data"))
 UPLOAD_DIR = DATA_DIR / "uploads"
 DB_PATH = DATA_DIR / "pairingiq.db"
-PARSER_CACHE_VERSION = "2026-07-16.3"
+PARSER_CACHE_VERSION = "2026-07-16.4"
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_PARSE_SECONDS = int(os.environ.get("MAX_PARSE_SECONDS", "600"))
 
@@ -233,7 +240,7 @@ INDEX_HTML = r"""
           <label>Highest-priority layovers<input id="eliteCities" placeholder="SAN, HNL, BOS"></label>
           <label>Preferred layovers<input id="secondaryCities" placeholder="SEA, PDX, MIA"></label>
           <label>Avoid layovers<input id="penaltyCities" placeholder="DFW, IAH"></label>
-          <label>Preferred trip lengths<input id="preferredTripLengths" placeholder="2, 3, 4"></label>
+          <label>Trip length priority (best to least)<input id="preferredTripLengths" placeholder="6+, 5, 4, 3, 2, 1"><small>Order matters. This is a preference, not an automatic hard filter.</small></label>
           <label>Earliest report<input id="earliestReport" type="time"></label>
           <label>Latest release<input id="latestRelease" type="time"></label>
           <label>Base / co-terminal group<input id="baseAirport" placeholder="ATL or NYC"></label>
@@ -293,6 +300,10 @@ INDEX_HTML = r"""
           <div><span>Fatigue</span><strong id="snapshotFatigue">—</strong></div>
         </div>
         <div id="results" class="ranked-list"><div class="empty-state"><span>✈</span><strong>No results yet</strong><p>Your ranked rotations will appear here.</p></div></div>
+        <section id="nearMatchesPanel" class="near-matches hidden">
+          <div class="near-matches-heading"><div><span class="kicker">CLOSEST AVAILABLE</span><h3>Near Matches</h3><p>These trips miss at least one requirement. CrewBidIQ shows exactly what must be relaxed.</p></div></div>
+          <div id="nearResults" class="ranked-list"></div>
+        </section>
       </section>
 
       <section id="guide" class="surface guide-panel hidden">
@@ -327,7 +338,7 @@ INDEX_HTML = r"""
               <li><strong>Highest-priority layovers:</strong> gives a dominant positive preference to sequences that overnight in those cities. A required-day conflict can still place one lower.</li>
               <li><strong>Preferred layovers:</strong> gives a smaller positive preference to desirable overnight cities.</li>
               <li><strong>Avoid layovers:</strong> lowers sequences that overnight in those cities. Airports merely touched while operating are not treated as layovers.</li>
-              <li><strong>Preferred trip lengths:</strong> favors the listed number of duty days, such as 2, 3, or 4.</li>
+              <li><strong>Trip length priority:</strong> ranks trip lengths from best to least, such as 6+, 5, 4, 3, 2, 1. It remains a soft preference unless you explicitly make a length required in Labs.</li>
               <li><strong>Minimum layover hours:</strong> lowers a result for each overnight shorter than the entered minimum.</li>
             </ul>
           </article>
@@ -372,8 +383,8 @@ INDEX_HTML = r"""
         <div class="guide-grid">
           <article class="guide-card">
             <h4>Rating and rank</h4>
-            <p><strong>★★★★★ Excellent, ★★★★ Strong, ★★★ Good, ★★ Fair, and ★ Low</strong> summarize how closely each result follows your preferences. The internal score orders the list; the stars are the pilot-facing summary. A required-day conflict always produces Low.</p>
-            <p><strong>Why it matched</strong> names the preference signals, workload limits, and conflicts that affected the recommendation so you can understand the rank.</p>
+            <p><strong>Exact Match, Strong Match, and Partial Match</strong> describe eligible trips. <strong>Near Match</strong> is shown separately when a trip misses a hard requirement.</p>
+            <p><strong>Why it matched</strong> separates matched preferences, compromises, and neutral trip facts. Near Matches list the exact requirement that would need to be relaxed.</p>
           </article>
 
           <article class="guide-card">
@@ -382,9 +393,10 @@ INDEX_HTML = r"""
               <li><strong>Top match:</strong> rating of the first recommendation.</li>
               <li><strong>Southwest TFP:</strong> Trips for Pay is shown as Pairing TFP or Line TFP. Carry-out TFP and TFP efficiency remain separate.</li>
               <li><strong>Delta Total Pay:</strong> Trip Credit plus confidently parsed EDP, HOL, and SIT. Missing or unsupported components are never assumed to be zero.</li>
+              <li><strong>American Total Pay:</strong> the bottom total printed in the package's TPAY column. The original TPAY value remains preserved with the sequence.</li>
               <li><strong>Other-airline credit:</strong> airline-provided trip or sequence credit when available. Total Pay appears only after that airline's pay rules are defined.</li>
               <li><strong>TAFB:</strong> total time away from base.</li>
-              <li><strong>Trip length:</strong> number of parsed duty periods.</li>
+              <li><strong>Trip length:</strong> elapsed trip days represented by the airline package. Flying duty periods are shown separately.</li>
               <li><strong>Fatigue risk:</strong> flags flight legs departing during WOCL (02:00 through 05:59 local).</li>
               <li><strong>Legs by duty day:</strong> working flight segments in each RPT-to-RLS duty period; deadheads are counted separately.</li>
             </ul>
@@ -501,6 +513,25 @@ def airline_terminology() -> dict[str, dict[str, str]]:
 @app.get("/api/airlines/coterminals")
 def airline_coterminals() -> dict[str, dict[str, list[str]]]:
     return coterminal_payload()
+
+
+@app.get("/api/destinations")
+def destinations() -> dict[str, Any]:
+    return {"groups": taxonomy_payload()}
+
+
+@app.post("/api/trip-intent")
+def parse_trip_intent(payload: dict[str, Any]) -> dict[str, Any]:
+    intent = interpret_trip_intent(str(payload.get("text") or ""))
+    return {"intent": intent, "profile": trip_intent_profile(intent)}
+
+
+@app.post("/api/seniority-context")
+def seniority_context(payload: dict[str, Any]) -> dict[str, Any]:
+    context = build_seniority_context(payload)
+    if context is None:
+        raise HTTPException(400, "Enter a valid category position and category population.")
+    return context
 
 
 def extract_text(
@@ -826,6 +857,9 @@ def pairing_duty_count(pairing: dict[str, Any]) -> int:
 
 def pairing_trip_length(pairing: dict[str, Any]) -> int:
     """Return elapsed trip days, which may exceed the number of flying duties."""
+    normalized_length = pairing.get("sequence_days") or pairing.get("trip_days")
+    if str(normalized_length or "").isdigit() and int(normalized_length) > 0:
+        return int(normalized_length)
     duty_labels: list[str] = []
     for leg in pairing.get("legs", []) or []:
         label = str(leg.get("day") or "1").strip().upper()
@@ -881,17 +915,18 @@ def build_bid_synopsis(pairings: list[dict[str, Any]]) -> dict[str, Any]:
 def sort_results(results: list[dict[str, Any]]) -> None:
     def key(item: dict[str, Any]) -> tuple[Any, ...]:
         complete = item.get("data_quality") != "incomplete"
-        hard_conflict = any(
-            str(value).startswith("Required off:") for value in item.get("calendar_conflicts", [])
-        )
+        eligible = bool(item.get("eligible", True))
+        match_order = {"exact": 3, "strong": 2, "partial": 1, "near": 0}
+        length_preference = bool(item.get("trip_length_preference_active"))
+        length_rank = item.get("length_priority_rank")
+        length_order = 0 if not length_preference else -(int(length_rank) if length_rank is not None else 10_000)
         pay_preference = bool(item.get("pay_priority"))
         pay_value = item.get("pay_priority_value")
-        length_preference = bool(item.get("trip_length_preference_active"))
-        preferred_length_match = not length_preference or bool(item.get("trip_length_match"))
         return (
             complete,
-            not hard_conflict,
-            preferred_length_match,
+            eligible,
+            length_order,
+            match_order.get(str(item.get("match_class")), 0),
             pay_preference and pay_value is not None,
             pay_value if pay_preference and pay_value is not None else float("-inf"),
             item.get("score", 0),
@@ -1046,10 +1081,14 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
         duty_counts[duty_labels.index(day)] += 1
 
     trip_length = pairing_trip_length(pairing)
-    preferred_lengths = {int(x) for x in list_field(profile.get("preferred_trip_lengths")) if x.isdigit()}
-    if trip_length and trip_length in preferred_lengths:
-        score += 18
-        reasons.append(f"Matches your preferred {trip_length}-day trip length")
+    ranked_lengths = length_priority(profile)
+    length_points, length_rank, length_reason = length_score_contribution(trip_length, profile)
+    score += length_points
+    if length_rank is not None:
+        if profile.get("trip_length_priority"):
+            reasons.append(length_reason)
+        else:
+            reasons.append(f"Matches your preferred {trip_length}-day trip length")
     limits = (("max_legs_per_day", max(duty_counts, default=0), "maximum legs in a duty day"), ("max_first_day_legs", duty_counts[0] if duty_counts else 0, "first-day legs"), ("max_last_day_legs", duty_counts[-1] if duty_counts else 0, "last-day legs"))
     for key, actual, label in limits:
         limit = profile.get(key)
@@ -1104,9 +1143,11 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
         "legs": result_legs,
         "duty_legs": duty_counts,
         "trip_length": trip_length,
-        "trip_length_preference_active": bool(preferred_lengths),
-        "trip_length_match": bool(preferred_lengths and trip_length in preferred_lengths),
-        "preferred_trip_lengths": sorted(preferred_lengths),
+        "trip_length_preference_active": bool(ranked_lengths),
+        "trip_length_match": bool(ranked_lengths and length_rank is not None),
+        "trip_length_priority": ranked_lengths,
+        "length_priority_rank": length_rank,
+        "preferred_trip_lengths": ranked_lengths,
         "first_day_legs": duty_counts[0] if duty_counts else 0,
         "last_day_legs": duty_counts[-1] if duty_counts else 0,
         "item_type": "pairing",
@@ -1114,6 +1155,12 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
         "display_label": terminology.singular,
         "original_display": block,
         "operations": pairing.get("operations"),
+        "sequence_days": pairing.get("sequence_days"),
+        "duty_period_count": pairing.get("duty_period_count", len(duty_counts)),
+        "overnight_count": pairing.get("overnight_count", len(pairing.get("layovers", []))),
+        "calendar_span_days": pairing.get("calendar_span_days"),
+        "first_report": pairing.get("first_report") or pairing.get("checkin"),
+        "final_release": pairing.get("final_release") or pairing.get("release"),
         "operating_dates": pairing.get("operating_dates") or dates,
         "positions": pairing.get("positions", []),
         "fleet": pairing.get("fleet"),
@@ -1125,6 +1172,13 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
         "source_pdf_page": pairing.get("source_pdf_page"),
         "total_flight_segments": pairing.get("total_flight_segments", len(pairing.get("legs", []))),
         "aircraft_display_names": pairing.get("aircraft_display_names", []),
+        "duty_periods": pairing.get("duty_periods", []),
+        "transcontinental": is_transcontinental(result_legs),
+        "long_haul": any(
+            (float(str(leg.get("block") or "0").replace(":", ".")) >= 6.0)
+            for leg in result_legs
+            if re.fullmatch(r"\d{1,2}[.:]\d{2}", str(leg.get("block") or ""))
+        ),
     }
     if airline == "southwest":
         result.update({
@@ -1142,6 +1196,13 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
             "raw_total_pay": pairing.get("raw_total_pay"),
             "unknown_pay_components": pairing.get("unknown_pay_components"),
             "credit_per_duty_day": pay_minutes_per_duty_day(pairing.get("trip_credit") or pairing.get("credit"), len(duty_counts)),
+            "total_pay_per_duty_day": pay_minutes_per_duty_day(pairing.get("total_pay"), len(duty_counts)),
+        })
+    elif airline == "american" and pairing.get("total_pay") is not None:
+        result.update({
+            "total_pay": pairing.get("total_pay"),
+            "raw_total_pay": pairing.get("raw_total_pay"),
+            "source_total_pay_label": pairing.get("source_total_pay_label"),
             "total_pay_per_duty_day": pay_minutes_per_duty_day(pairing.get("total_pay"), len(duty_counts)),
         })
 
@@ -1163,6 +1224,22 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
         result["pay_explanation"] = f"{labels.get(preference, preference)}: {result.get(preference)}"
     else:
         result["pay_explanation"] = None
+    result.update(evaluate_recommendation(result, profile))
+    result["fatigue_index"] = build_fatigue_index(result)
+    result["seniority_context"] = build_seniority_context(profile.get("seniority_context"))
+    result["hold_outlook"] = estimate_hold_outlook(result, result["seniority_context"])
+    if os.environ.get("RECOMMENDATION_DEBUG_ENABLED", "false").lower() == "true":
+        result["recommendation_debug"] = {
+            "parser": result.get("parser"),
+            "parser_confidence": result.get("parser_confidence"),
+            "normalization": pairing.get("normalization_diagnostics"),
+            "eligibility_result": result.get("eligibility_result"),
+            "eligibility_violations": result.get("eligibility_violations"),
+            "trip_length": trip_length,
+            "trip_length_priority": ranked_lengths,
+            "length_priority_rank": length_rank,
+            "length_score_contribution": length_points,
+        }
     return result
 
 
@@ -1256,7 +1333,7 @@ def score_southwest_line(line: dict[str, Any], pairing_scores: dict[str, dict[st
     reasons = []
     for item in members:
         reasons.extend(item.get("reasons", []))
-    score = round(sum(x["score"] for x in members) / len(members), 1)
+    profile = profile or {}
     conflicts = sorted(set(c for x in members for c in x.get("calendar_conflicts", [])))
     touched = list(dict.fromkeys(c for item in members for c in item.get("touched_cities", [])))
     duty_legs = [count for item in members for count in item.get("duty_legs", [])]
@@ -1266,8 +1343,8 @@ def score_southwest_line(line: dict[str, Any], pairing_scores: dict[str, dict[st
         for leg in item.get("redeye_legs", [])
     ]
     result = {
-        "pairing": line["id"], "item_type": "line", "score": score,
-        "dates": [], "cities": cities, "touched_cities": touched, "preferred_aircraft": sorted(set(a for item in members for a in item.get("preferred_aircraft", []))),
+        "pairing": line["id"], "item_type": "line", "score": 0.0,
+        "dates": line.get("work_dates") or [], "cities": cities, "touched_cities": touched, "preferred_aircraft": sorted(set(a for item in members for a in item.get("preferred_aircraft", []))),
         "redeye": "WOCL departure" if redeye_legs else "none", "redeye_legs": redeye_legs,
         "deadheads": sum(x.get("deadheads", 0) for x in members), "transfers": sorted(set(t for x in members for t in x.get("transfers", []))),
         "calendar_conflicts": conflicts,
@@ -1281,10 +1358,22 @@ def score_southwest_line(line: dict[str, Any], pairing_scores: dict[str, dict[st
         "tfp_per_day_away": line.get("tfp_per_day_away"),
         "layovers": layovers, "legs": [leg for item in members for leg in item.get("legs", [])], "pairing_ids": line["pairing_ids"],
         "duty_legs": duty_legs, "first_day_legs": duty_legs[0] if duty_legs else 0, "last_day_legs": duty_legs[-1] if duty_legs else 0,
-        "match_level": match_level(score, conflicts), "display_label": get_airline_terminology("southwest").singular, "original_display": line.get("block", ""),
+        "match_level": "fair", "display_label": get_airline_terminology("southwest").singular, "original_display": line.get("block", ""),
         "airline": "southwest", "data_quality": "complete",
     }
-    preference = str((profile or {}).get("pay_priority") or "")
+    result.update(rank_southwest_line(line, members, profile))
+    result["match_level"] = match_level(result["score"], conflicts)
+    result["fatigue_index"] = build_fatigue_index(result)
+    result["seniority_context"] = build_seniority_context(profile.get("seniority_context"))
+    result["hold_outlook"] = estimate_hold_outlook(result, result["seniority_context"])
+    conflict_events = profile.get("fixed_events") or []
+    if conflict_events:
+        result["schedule_conflict_analysis"] = optimize_schedule_conflicts(
+            result,
+            conflict_events,
+            str(profile.get("conflict_mode") or "protect"),
+        )
+    preference = str(profile.get("pay_priority") or "")
     result["pay_priority"] = preference or None
     result["pay_priority_value"] = pay_priority_value(result, preference)
     labels = {"monthly_tfp": "Monthly TFP", "tfp_per_duty_period": "TFP per duty period", "tfp_per_day_away": "TFP efficiency"}
@@ -1634,10 +1723,24 @@ def navblue_plan(job_id: str, profile: dict[str, Any]):
     row = get_job(job_id)
     if not row or row["status"] != "complete":
         raise HTTPException(404, "Completed analysis not found")
+    if row["airline"] == "southwest":
+        raise HTTPException(400, "Southwest line bidding is not a NAVBLUE/PBS workflow.")
     results = json.loads(row["results_json"] or "[]")
     stored_profile = json.loads(row["profile_json"] or "{}")
-    merged_profile = {**stored_profile, **(profile or {})}
+    merged_profile = {**stored_profile, **(profile or {}), "airline": row["airline"]}
     return build_navblue_layers(merged_profile, results, row["filename"] or "")
+
+
+@app.post("/api/jobs/{job_id}/month-plan")
+def month_plan(job_id: str, intent: dict[str, Any]):
+    if not labs_enabled():
+        raise HTTPException(404, "CrewBidIQ Labs is not enabled")
+    row = get_job(job_id)
+    if not row or row["status"] != "complete":
+        raise HTTPException(404, "Completed analysis not found")
+    results = json.loads(row["results_json"] or "[]")
+    stored_profile = json.loads(row["profile_json"] or "{}")
+    return build_month_plan({**stored_profile, **(intent or {})}, results)
 
 
 @app.post("/api/jobs/{job_id}/diagnostic.json")

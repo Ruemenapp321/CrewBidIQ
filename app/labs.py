@@ -11,6 +11,10 @@ def labs_enabled() -> bool:
     return os.environ.get("LABS_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def southwest_line_ranker_enabled() -> bool:
+    return os.environ.get("SOUTHWEST_LINE_RANKER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
 LABS_HTML = r"""
 <!doctype html>
 <html lang="en" data-theme="dark">
@@ -30,7 +34,7 @@ LABS_HTML = r"""
       <a href="/labs/build" class="nav-link" data-labs-route="/labs/build"><span>Build My Bid</span></a>
       <a href="/labs/recommendations" class="nav-link" data-labs-route="/labs/recommendations"><span>Recommendations</span></a>
       <a href="/labs/preview" class="nav-link" data-labs-route="/labs/preview"><span>Bid Pool Preview</span></a>
-      <a href="/labs/southwest" class="nav-link" data-labs-route="/labs/southwest"><span>Southwest Tools</span></a>
+      __SOUTHWEST_LINK__
       <a href="/labs/plan" class="nav-link" data-labs-route="/labs/plan"><span>Bid Plan</span></a>
     </nav>
     <a class="labs-return" href="/">Return to Classic</a>
@@ -70,7 +74,13 @@ LABS_HTML = r"""
 def labs_page(page: str) -> HTMLResponse:
     if not labs_enabled():
         raise HTTPException(404, "CrewBidIQ Labs is not enabled")
-    return HTMLResponse(LABS_HTML.replace("__LABS_PAGE__", page))
+    if page == "southwest" and not southwest_line_ranker_enabled():
+        raise HTTPException(404, "Southwest Line Ranker is not enabled")
+    southwest_link = (
+        '<a href="/labs/southwest" class="nav-link" data-labs-route="/labs/southwest"><span>Southwest Tools</span></a>'
+        if southwest_line_ranker_enabled() else ""
+    )
+    return HTMLResponse(LABS_HTML.replace("__LABS_PAGE__", page).replace("__SOUTHWEST_LINK__", southwest_link))
 
 
 @router.get("/labs", response_class=HTMLResponse)

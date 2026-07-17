@@ -85,6 +85,17 @@ def test_all_labs_routes_share_one_feature_gated_shell(monkeypatch):
         assert 'type="file"' not in response.text
 
 
+def test_southwest_line_ranker_has_independent_feature_flag(monkeypatch):
+    monkeypatch.setenv("LABS_ENABLED", "true")
+    monkeypatch.setenv("SOUTHWEST_LINE_RANKER_ENABLED", "false")
+    with TestClient(app) as client:
+        labs = client.get("/labs")
+        southwest = client.get("/labs/southwest")
+    assert labs.status_code == 200
+    assert 'href="/labs/southwest"' not in labs.text
+    assert southwest.status_code == 404
+
+
 def test_labs_uses_the_classic_job_keys_and_shared_upload_endpoint():
     with TestClient(app) as client:
         script = client.get("/static/labs.js")

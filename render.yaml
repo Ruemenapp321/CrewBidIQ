@@ -16,3 +16,5 @@ services:
         value: /var/data
       - key: LABS_ENABLED
         value: "true"
+      - key: SOUTHWEST_LINE_RANKER_ENABLED
+        value: "true"
