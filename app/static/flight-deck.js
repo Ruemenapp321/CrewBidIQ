@@ -6,6 +6,7 @@ const activeJobKey = 'crewbidiqActiveJob';
 const activePackageKey = 'crewbidiqActivePackage';
 const shortlistKey = 'crewbidiqShortlist';
 const comparisonKey = 'crewbidiqComparison';
+const flightDeckSessionKey = 'crewbidiqFlightDeckSession';
 const packageStateKeys = [shortlistKey, comparisonKey, 'crewbidiqPbsPool', 'crewbidiqCommuteAssessments', 'crewbidiqExports'];
 
 let sessionJob = null;
@@ -25,6 +26,7 @@ let filterState = {
   savedTrips: false,
 };
 let sortMode = 'best';
+let selectionNotice = '';
 
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, character => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -41,6 +43,15 @@ function currentJobId() {
 
 function activePackageId() {
   return localStorage.getItem(activePackageKey);
+}
+
+function flightDeckSessionId() {
+  let value = localStorage.getItem('crewbidiqAnalysisSession') || localStorage.getItem(flightDeckSessionKey);
+  if (!value) {
+    value = globalThis.crypto?.randomUUID?.() || `flight-deck-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    localStorage.setItem(flightDeckSessionKey, value);
+  }
+  return value;
 }
 
 function clearPackageDependentState(nextPackageId = '') {
@@ -63,20 +74,55 @@ function acceptPackageResponse(body) {
 
 function packageScopedIds(key) {
   const stored = readJson(key, null);
-  if (!stored || stored.package_id !== activePackageId() || !Array.isArray(stored.trip_ids)) return [];
-  return stored.trip_ids;
+  const expectedPackage = activePackageId(), expectedSession = flightDeckSessionId();
+  if (!stored) return [];
+  if (stored.package_id !== expectedPackage || stored.session_id !== expectedSession || !Array.isArray(stored.trip_ids)) {
+    localStorage.removeItem(key);
+    return [];
+  }
+  return [...new Set(stored.trip_ids.map(value => String(value || '')).filter(Boolean))];
 }
 
 function savePackageScopedIds(key, tripIds) {
   const packageId = activePackageId();
   if (!packageId) return;
-  localStorage.setItem(key, JSON.stringify({ package_id: packageId, trip_ids: [...new Set(tripIds)] }));
+  localStorage.setItem(key, JSON.stringify({
+    package_id: packageId,
+    session_id: flightDeckSessionId(),
+    trip_ids: [...new Set(tripIds)],
+    updated_at: new Date().toISOString(),
+  }));
 }
 
 function togglePackageScopedId(key, tripId, maximum = Infinity) {
+  if (!resultRecords().some(item => tripId === tripIdForRecord(item))) return false;
   const ids = packageScopedIds(key);
-  const next = ids.includes(tripId) ? ids.filter(id => id !== tripId) : [...ids, tripId].slice(-maximum);
+  if (!ids.includes(tripId) && ids.length >= maximum) {
+    selectionNotice = `Compare supports up to ${maximum} trips. Remove one before adding another.`;
+    return false;
+  }
+  const next = ids.includes(tripId) ? ids.filter(id => id !== tripId) : [...ids, tripId];
   savePackageScopedIds(key, next);
+  selectionNotice = '';
+  return true;
+}
+
+function tripIdForRecord(item) { return tripId(item); }
+
+function movePackageScopedId(key, tripIdValue, direction) {
+  const ids = packageScopedIds(key), index = ids.indexOf(tripIdValue), target = index + direction;
+  if (index < 0 || target < 0 || target >= ids.length) return false;
+  [ids[index], ids[target]] = [ids[target], ids[index]];
+  savePackageScopedIds(key, ids);
+  return true;
+}
+
+function removePackageScopedId(key, tripIdValue) {
+  const ids = packageScopedIds(key);
+  if (!ids.includes(tripIdValue)) return false;
+  savePackageScopedIds(key, ids.filter(id => id !== tripIdValue));
+  selectionNotice = '';
+  return true;
 }
 
 function canonicalTrips(item) { return item?.canonical_trip ? [item.canonical_trip] : (item?.canonical_trips || []); }
@@ -193,6 +239,108 @@ function maximumLegsPerDutyDay(item) {
   return Math.ceil(tripLegs(item).length / dutyCount);
 }
 
+function comparisonModels(item) { return canonicalTrips(item).filter(model => model && model.package_id === activePackageId()); }
+function comparisonLegs(item) { return comparisonModels(item).flatMap(model => Array.isArray(model.ordered_legs) ? model.ordered_legs : []); }
+function comparisonDutyDays(item) { return comparisonModels(item).flatMap(model => Array.isArray(model.duty_days) ? model.duty_days : []); }
+function comparisonLayovers(item) { return comparisonModels(item).flatMap(model => Array.isArray(model.layovers) ? model.layovers : []); }
+function comparisonDutyPeriodCount(item) {
+  const models = comparisonModels(item);
+  return models.reduce((total, model) => total + Number(model.duty_period_count || (model.duty_days || []).length || 0), 0) || null;
+}
+function comparisonMaximumLegs(item) {
+  const duties = comparisonDutyDays(item);
+  return duties.length ? Math.max(...duties.map(day => (day.ordered_legs || []).length), 0) : maximumLegsPerDutyDay(item);
+}
+function comparisonDeadheads(item) { return comparisonLegs(item).filter(leg => String(leg.operating_or_deadhead || '').toLowerCase() === 'deadhead').length; }
+function comparisonLayoverLabel(item) {
+  const airports = comparisonLayovers(item).map(layoverAirport).filter(Boolean);
+  return airports.length ? `${airports.length} · ${airports.join(' · ')}` : 'None';
+}
+function preferredDestinations(item) {
+  const preferred = preferredAirports();
+  const destinations = comparisonLegs(item).map(leg => String(leg.destination || '').toUpperCase()).filter(Boolean);
+  return [...new Set(destinations.filter(airport => preferred.has(airport)))];
+}
+function savedProfile() {
+  const classic = readJson('crewbidiqProfile', {}) || {}, draft = readJson('crewbidiqLabsDraft', {}) || {};
+  const split = value => String(value || '').split(',').map(item => item.trim()).filter(Boolean);
+  const minutes = value => { if (!value) return null; const [hours, mins] = String(value).split(':').map(Number); return hours * 60 + mins; };
+  return {
+    ...classic,
+    ...(draft.interpretedProfile || {}),
+    trip_length_priority: draft.tripLengths ? split(draft.tripLengths) : (classic.trip_length_priority || classic.preferred_trip_lengths || []),
+    preferred_trip_lengths: draft.tripLengths ? split(draft.tripLengths) : (classic.preferred_trip_lengths || []),
+    max_legs_per_day: draft.maxLegs || classic.max_legs_per_day,
+    earliest_report_minutes: draft.earliestReport ? minutes(draft.earliestReport) : (classic.earliest_report_minutes ?? null),
+    latest_release_minutes: draft.latestRelease ? minutes(draft.latestRelease) : (classic.latest_release_minutes ?? null),
+  };
+}
+function preferredTripLengths() {
+  const profile = savedProfile();
+  const values = profile.trip_length_priority || profile.preferred_trip_lengths || [];
+  return new Set((Array.isArray(values) ? values : String(values).split(',')).map(Number).filter(value => value > 0));
+}
+function comparisonPriorityKeys() {
+  const profile = savedProfile(), raw = profile.priority_order || [];
+  const values = (Array.isArray(raw) ? raw : String(raw).split(',')).map(value => String(value).trim().toLowerCase().replace(/[^a-z0-9]+/g, '_')).filter(Boolean);
+  if (profile.pay_priority) values.push('pay');
+  if (preferredTripLengths().size) values.push('trip_length');
+  if (preferredAirports().size) values.push('preferred_destinations');
+  if (profile.max_legs_per_day != null) values.push('maximum_legs');
+  if (profile.earliest_report_minutes != null) values.push('report');
+  if (profile.latest_release_minutes != null) values.push('release');
+  return new Set(values);
+}
+function durationMinutes(value) {
+  const match = String(value ?? '').trim().match(/^(\d+)(?::|\.)(\d{1,2})$/);
+  if (match) return Number(match[1]) * 60 + Number(match[2]);
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+function selectedPayMetric(item) {
+  const airline = tripAirline(item), profile = savedProfile(), pay = tripPay(item), tfp = tripTfp(item);
+  if (airline === 'southwest') return { label: 'TFP', value: tfp.pairing_tfp ?? item?.line_tfp };
+  if (profile.pay_priority === 'trip_credit') return { label: 'Trip Credit', value: pay.trip_credit };
+  if (airline === 'delta' || pay.total_pay !== null && pay.total_pay !== undefined) return { label: 'Total Pay', value: pay.total_pay };
+  return { label: 'Trip Credit', value: pay.trip_credit };
+}
+function comparisonStrengths(item, records) {
+  const strengths = [], profile = savedProfile(), priorities = comparisonPriorityKeys(), days = tripDayValues(item), preferredLengths = preferredTripLengths();
+  if (matchClass(item) === 'exact') strengths.push('Meets every hard requirement');
+  if (days.some(day => preferredLengths.has(day))) strengths.push('Matches a preferred trip length');
+  const destinations = preferredDestinations(item);
+  if (destinations.length) strengths.push(`Includes preferred ${destinations.join(' · ')}`);
+  const maximum = comparisonMaximumLegs(item);
+  if (profile.max_legs_per_day != null && maximum <= Number(profile.max_legs_per_day)) strengths.push(`Within ${profile.max_legs_per_day} legs per duty day`);
+  const report = clockMinutes(eventTime(item, 'report'));
+  if (profile.earliest_report_minutes != null && report >= Number(profile.earliest_report_minutes)) strengths.push('Meets the selected report-time preference');
+  const release = clockMinutes(eventTime(item, 'release'));
+  if (profile.latest_release_minutes != null && release <= Number(profile.latest_release_minutes)) strengths.push('Meets the selected release-time preference');
+  if (profile.pay_priority) {
+    const selected = selectedPayMetric(item), value = durationMinutes(selected.value);
+    const values = records.map(record => durationMinutes(selectedPayMetric(record).value)).filter(candidate => candidate !== null);
+    if (value !== null && values.length > 1 && value === Math.max(...values)) strengths.push(`Highest selected ${selected.label}`);
+  }
+  const lowestSelected = (key, label, getter) => {
+    if (!priorities.has(key)) return;
+    const value = getter(item), values = records.map(getter).filter(candidate => candidate !== null && Number.isFinite(candidate));
+    if (value !== null && values.length > 1 && value === Math.min(...values)) strengths.push(`Lowest selected ${label}`);
+  };
+  lowestSelected('tafb', 'TAFB', record => durationMinutes(tripTafb(record)));
+  lowestSelected('duty_periods', 'duty-period count', record => comparisonDutyPeriodCount(record));
+  lowestSelected('total_legs', 'total-leg count', record => comparisonLegs(record).length);
+  lowestSelected('deadheads', 'deadhead count', record => comparisonDeadheads(record));
+  return [...new Set(strengths)];
+}
+
+function recordsForStoredIds(key) {
+  const records = new Map(resultRecords().map(item => [tripId(item), item]));
+  const ids = packageScopedIds(key), selected = ids.map(id => records.get(id)).filter(Boolean);
+  const validIds = selected.map(item => tripId(item));
+  if (validIds.length !== ids.length) savePackageScopedIds(key, validIds);
+  return selected;
+}
+
 function resultRecords() {
   if (!sessionJob || sessionJob.status !== 'complete') return [];
   const packageId = activePackageId();
@@ -264,12 +412,13 @@ function metric(label, value, className = '') {
   return `<div class="fd-metric ${className}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(displayValue(value))}</strong></div>`;
 }
 
-function airlinePayMetrics(item) {
+function airlinePayMetrics(item, highlight = false) {
   const airline = tripAirline(item), pay = tripPay(item), tfp = tripTfp(item);
-  const metrics = [];
-  if (airline === 'delta' && pay.total_pay !== null && pay.total_pay !== undefined) metrics.push(metric('Total Pay', pay.total_pay, 'fd-pay-primary'));
-  if (airline !== 'southwest' && pay.trip_credit !== null && pay.trip_credit !== undefined) metrics.push(metric('Trip Credit', pay.trip_credit));
-  if (airline === 'southwest') metrics.push(metric('TFP', tfp.pairing_tfp ?? item?.line_tfp));
+  const metrics = [], priorityClass = highlight ? 'fd-priority-metric' : '';
+  if (airline === 'delta' && pay.total_pay !== null && pay.total_pay !== undefined) metrics.push(metric('Total Pay', pay.total_pay, `fd-pay-primary ${priorityClass}`));
+  if (airline === 'american' && pay.total_pay !== null && pay.total_pay !== undefined) metrics.push(metric('Total Pay', pay.total_pay, `fd-pay-primary ${priorityClass}`));
+  if (airline !== 'southwest' && pay.trip_credit !== null && pay.trip_credit !== undefined) metrics.push(metric('Trip Credit', pay.trip_credit, priorityClass));
+  if (airline === 'southwest') metrics.push(metric('TFP', tfp.pairing_tfp ?? item?.line_tfp, priorityClass));
   return metrics.join('');
 }
 
@@ -344,24 +493,81 @@ function emptyState(title, description) {
 }
 
 function selectionDock() {
-  const shortlistCount = packageScopedIds(shortlistKey).length;
-  const compareCount = packageScopedIds(comparisonKey).length;
+  const shortlistCount = recordsForStoredIds(shortlistKey).length;
+  const compareCount = recordsForStoredIds(comparisonKey).length;
   return `<div class="fd-selection-dock"><a href="/labs/flight-deck/shortlist">Shortlist <strong>${shortlistCount}</strong></a><a href="/labs/flight-deck/compare">Compare <strong>${compareCount}</strong></a></div>`;
 }
 
 function shortlistPage() {
-  const ids = new Set(packageScopedIds(shortlistKey));
-  const records = resultRecords().filter(item => ids.has(tripId(item)));
+  const records = recordsForStoredIds(shortlistKey);
+  const saved = records.map((item, index) => `<div class="fd-shortlist-item" data-shortlist-position="${index + 1}">
+    <div class="fd-shortlist-order"><span>Position ${index + 1}</span><button type="button" data-action="shortlist-up" data-trip-id="${escapeHtml(tripId(item))}" ${index === 0 ? 'disabled' : ''}>Move up</button><button type="button" data-action="shortlist-down" data-trip-id="${escapeHtml(tripId(item))}" ${index === records.length - 1 ? 'disabled' : ''}>Move down</button><button type="button" data-action="shortlist-remove" data-trip-id="${escapeHtml(tripId(item))}">Remove</button></div>
+    ${resultCard(item, index + 1)}
+  </div>`).join('');
   return `${pageHero('SAVED TRIPS', 'Shortlist', 'Saved trips remain scoped to this active bid package.')}${packageSummary()}
-    <section class="fd-saved-list">${records.length ? records.map((item, index) => resultCard(item, index + 1)).join('') : emptyState('Your shortlist is empty', 'Add trips from Flight Deck results to keep them here.')}</section>${selectionDock()}`;
+    <section class="fd-saved-list">${saved || emptyState('Your shortlist is empty', 'Add trips from Flight Deck results to keep them here.')}</section>${selectionDock()}`;
+}
+
+function comparisonMetric(label, value, highlighted = false) { return metric(label, value, highlighted ? 'fd-priority-metric' : ''); }
+function comparisonDetail(label, values, emptyLabel) {
+  const details = uniqueDetails(values);
+  return `<div class="fd-compare-detail"><h3>${escapeHtml(label)}</h3>${details.length ? `<ul>${details.map(value => `<li>${escapeHtml(value)}</li>`).join('')}</ul>` : `<p>${escapeHtml(emptyLabel)}</p>`}</div>`;
+}
+function assessmentValue(value, placeholder) {
+  if (!value) return placeholder;
+  if (typeof value === 'string') return value;
+  return value.level || value.label || value.summary || placeholder;
+}
+function compareCard(item, records) {
+  const profile = savedProfile(), priorities = comparisonPriorityKeys(), preferredLengths = preferredTripLengths(), strengths = comparisonStrengths(item, records);
+  const matched = uniqueDetails(item.matched_preferences || []), compromises = uniqueDetails(item.compromises || []);
+  const destinations = preferredDestinations(item), totalLegs = comparisonLegs(item).length, maximumLegs = comparisonMaximumLegs(item);
+  const maximumMeets = profile.max_legs_per_day != null && maximumLegs <= Number(profile.max_legs_per_day);
+  const reportMeets = profile.earliest_report_minutes != null && clockMinutes(eventTime(item, 'report')) >= Number(profile.earliest_report_minutes);
+  const releaseMeets = profile.latest_release_minutes != null && clockMinutes(eventTime(item, 'release')) <= Number(profile.latest_release_minutes);
+  return `<article class="surface fd-compare-card" data-compare-trip-id="${escapeHtml(tripId(item))}">
+    <header><div><span>${escapeHtml(terminology(item))}</span><h2>${escapeHtml(sourceNumber(item))}</h2><p class="fd-route">${escapeHtml(simplifiedRoute(item))}</p></div><span class="fd-match fd-match-${matchClass(item)}">${escapeHtml(matchLabel(item))}</span></header>
+    ${strengths.length ? `<div class="fd-priority-strengths"><strong>Strengths for your priorities</strong>${strengths.map(value => `<span>${escapeHtml(value)}</span>`).join('')}</div>` : '<p class="fd-neutral-note">No additional saved-priority strengths were identified.</p>'}
+    <div class="fd-compare-metrics">
+      ${comparisonMetric('Match Class', matchLabel(item), matchClass(item) === 'exact')}
+      ${comparisonMetric('Trip Length', tripLengthLabel(item), tripDayValues(item).some(day => preferredLengths.has(day)))}
+      ${airlinePayMetrics(item, priorities.has('pay'))}
+      ${comparisonMetric('TAFB', tripTafb(item), strengths.includes('Lowest selected TAFB'))}
+      ${comparisonMetric('Duty Periods', comparisonDutyPeriodCount(item), strengths.includes('Lowest selected duty-period count'))}
+      ${comparisonMetric('Total Legs', totalLegs, strengths.includes('Lowest selected total-leg count'))}
+      ${comparisonMetric('Max Legs / Duty Day', maximumLegs, maximumMeets)}
+      ${comparisonMetric('Deadheads', comparisonDeadheads(item), strengths.includes('Lowest selected deadhead count'))}
+      ${comparisonMetric('Layovers', comparisonLayoverLabel(item), destinations.length > 0)}
+      ${comparisonMetric('Report', eventTime(item, 'report'), reportMeets)}
+      ${comparisonMetric('Release', eventTime(item, 'release'), releaseMeets)}
+      ${comparisonMetric('Preferred Destinations', destinations.join(' · ') || 'None', destinations.length > 0)}
+    </div>
+    <div class="fd-compare-details">
+      ${comparisonDetail('Exact matched preferences', matched, 'No exact matched preferences were recorded.')}
+      ${comparisonDetail('Compromises', compromises, 'No compromises were recorded.')}
+      ${comparisonDetail('Assessments', [
+        `Fatigue: ${assessmentValue(item.fatigue_index, 'Not available (placeholder)')}`,
+        `Likelihood of Holding: ${assessmentValue(item.hold_outlook, 'Not available (placeholder)')}`,
+        `Commute: ${assessmentValue(item.commute_assessment, 'Not available (placeholder)')}`,
+      ], 'Assessments are unavailable.')}
+    </div>
+    <footer><a class="text-button button" href="/labs/flight-deck/trip/${encodeURIComponent(tripId(item))}">Open ${escapeHtml(terminology(item))} Briefing</a><button type="button" data-action="compare-remove" data-trip-id="${escapeHtml(tripId(item))}">Remove from Compare</button></footer>
+  </article>`;
 }
 
 function comparePage() {
-  const ids = new Set(packageScopedIds(comparisonKey));
-  const records = resultRecords().filter(item => ids.has(tripId(item)));
-  const cards = records.map(item => `<article class="surface fd-compare-card"><span>${escapeHtml(terminology(item))}</span><h2>${escapeHtml(sourceNumber(item))}</h2><p class="fd-route">${escapeHtml(simplifiedRoute(item))}</p><div class="fd-compare-metrics">${metric('Match', matchLabel(item))}${metric('Trip Length', tripLengthLabel(item))}${airlinePayMetrics(item)}${metric('TAFB', tripTafb(item))}${metric('Report', eventTime(item, 'report'))}${metric('Release', eventTime(item, 'release'))}</div><button type="button" data-action="compare" data-trip-id="${escapeHtml(tripId(item))}">Remove</button></article>`).join('');
-  return `${pageHero('SIDE BY SIDE', 'Compare Trips', 'Compare normalized trip facts from one active bid package.')}${packageSummary()}
-    <section class="fd-compare-grid">${cards || emptyState('No trips selected', 'Choose up to four trips from Flight Deck results.')}</section>${selectionDock()}`;
+  const records = recordsForStoredIds(comparisonKey).slice(0, 4);
+  const selected = new Set(records.map(tripId));
+  const available = recordsForStoredIds(shortlistKey).filter(item => !selected.has(tripId(item)));
+  const needed = Math.max(0, 2 - records.length);
+  const status = records.length >= 2
+    ? `${records.length} trips selected. Compare each trip against your saved priorities; no universal winner is declared.`
+    : `Select ${needed} more trip${needed === 1 ? '' : 's'} to compare. You can compare two to four trips.`;
+  const cards = records.map(item => compareCard(item, records)).join('');
+  const picker = available.length && records.length < 4 ? `<section class="surface fd-compare-picker"><h2>Add from Shortlist</h2><div>${available.map(item => `<button type="button" data-action="compare" data-trip-id="${escapeHtml(tripId(item))}"><span>${escapeHtml(terminology(item))}</span><strong>${escapeHtml(sourceNumber(item))}</strong></button>`).join('')}</div></section>` : '';
+  return `${pageHero('SIDE BY SIDE', 'Compare Trips', 'Compare normalized trip facts from one active bid package using your selected priorities.')}${packageSummary()}
+    <section class="fd-compare-status" aria-live="polite"><strong>${escapeHtml(status)}</strong>${selectionNotice ? `<p>${escapeHtml(selectionNotice)}</p>` : ''}</section>
+    ${picker}<section class="fd-compare-grid">${cards || emptyState('No trips selected', 'Choose two to four trips from Flight Deck results or your shortlist.')}</section>${selectionDock()}`;
 }
 
 function uniqueDetails(values) {
@@ -603,9 +809,14 @@ function bindControls() {
   }));
   document.querySelectorAll('[data-action]').forEach(control => control.addEventListener('click', event => {
     const action = event.currentTarget.dataset.action;
+    const id = event.currentTarget.dataset.tripId;
     if (action === 'clear-filters') filterState = Object.fromEntries(Object.keys(filterState).map(key => [key, false]));
-    if (action === 'shortlist') togglePackageScopedId(shortlistKey, event.currentTarget.dataset.tripId);
-    if (action === 'compare') togglePackageScopedId(comparisonKey, event.currentTarget.dataset.tripId, 4);
+    if (action === 'shortlist') togglePackageScopedId(shortlistKey, id);
+    if (action === 'shortlist-remove') removePackageScopedId(shortlistKey, id);
+    if (action === 'shortlist-up') movePackageScopedId(shortlistKey, id, -1);
+    if (action === 'shortlist-down') movePackageScopedId(shortlistKey, id, 1);
+    if (action === 'compare') togglePackageScopedId(comparisonKey, id, 4);
+    if (action === 'compare-remove') removePackageScopedId(comparisonKey, id);
     render();
   }));
 }
@@ -636,8 +847,10 @@ document.getElementById('flightDeckTheme')?.addEventListener('click', () => {
 });
 
 window.addEventListener('storage', event => {
-  if (![latestJobKey, activeJobKey, activePackageKey].includes(event.key)) return;
+  if ([shortlistKey, comparisonKey].includes(event.key)) { render(); return; }
+  if (![latestJobKey, activeJobKey, activePackageKey, flightDeckSessionKey].includes(event.key)) return;
   if (event.key === activePackageKey && event.oldValue && event.newValue !== event.oldValue) clearPackageDependentState(event.newValue || '');
+  if (event.key === flightDeckSessionKey && event.oldValue && event.newValue !== event.oldValue) clearPackageDependentState(activePackageId() || '');
   sessionJob = null; sessionLoading = true; sessionError = ''; render(); loadSharedSession();
 });
 

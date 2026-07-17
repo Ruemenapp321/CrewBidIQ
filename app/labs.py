@@ -136,7 +136,7 @@ FLIGHT_DECK_HTML = r"""
   </div>
 </div>
 <script>window.CREWBIDIQ_FLIGHT_DECK_PAGE="__FLIGHT_DECK_PAGE__";window.CREWBIDIQ_FLIGHT_DECK_TRIP_ID=__TRIP_ID_JSON__;</script>
-<script src="/static/flight-deck.js?v=0003"></script>
+<script src="/static/flight-deck.js?v=0004"></script>
 </body>
 </html>
 """

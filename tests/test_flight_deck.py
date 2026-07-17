@@ -97,7 +97,8 @@ def test_flight_deck_reuses_active_package_and_strict_canonical_inventory():
     assert "item.eligibility_violations" in script
     assert "matchClass(item) === 'near' ? reasons : reasons.slice(0, 2)" in script
     assert "Mixed-package results were rejected." in script
-    assert "stored.package_id !== activePackageId()" in script
+    assert "stored.package_id !== expectedPackage" in script
+    assert "stored.session_id !== expectedSession" in script
     assert "clearPackageDependentState" in script
     assert "window.addEventListener('storage'" in script
 
@@ -214,7 +215,7 @@ def test_trip_briefing_has_airline_titles_and_all_required_sections():
     ):
         assert f"<h2>{section}</h2>" in script
     assert "Exact match explanation" in script
-    assert 'src="/static/flight-deck.js?v=0003"' in labs
+    assert 'src="/static/flight-deck.js?v=0004"' in labs
 
 
 def test_trip_briefing_reads_trip_facts_from_confirmed_canonical_models_only():
@@ -333,3 +334,108 @@ def test_trip_flow_mobile_layout_stacks_connections_and_layover_details():
     assert ".fd-duty-layover{display:grid;grid-template-columns:1fr auto 1fr" in styles
     assert ".fd-duty-layover{grid-template-columns:1fr}" in styles
     assert ".fd-trip-connection{align-items:flex-start;flex-direction:column}" in styles
+
+
+def test_shortlist_is_package_and_session_scoped_with_ordered_persistence():
+    script = (ROOT / "app" / "static" / "flight-deck.js").read_text(encoding="utf-8")
+
+    for value in (
+        "flightDeckSessionId",
+        "package_id: packageId",
+        "session_id: flightDeckSessionId()",
+        "updated_at: new Date().toISOString()",
+        "movePackageScopedId",
+        "removePackageScopedId",
+        "recordsForStoredIds(shortlistKey)",
+        "if (validIds.length !== ids.length) savePackageScopedIds(key, validIds)",
+        "shortlist-up",
+        "shortlist-down",
+        "shortlist-remove",
+        "Position ${index + 1}",
+    ):
+        assert value in script
+    assert "stored.package_id !== expectedPackage" in script
+    assert "stored.session_id !== expectedSession" in script
+    assert "localStorage.removeItem(key)" in script
+    assert ".slice(-maximum)" not in script
+
+
+def test_shortlist_can_feed_two_to_four_trip_comparison_without_silent_eviction():
+    script = (ROOT / "app" / "static" / "flight-deck.js").read_text(encoding="utf-8")
+
+    assert "ids.length >= maximum" in script
+    assert "Compare supports up to ${maximum} trips" in script
+    assert "recordsForStoredIds(comparisonKey).slice(0, 4)" in script
+    assert "You can compare two to four trips" in script
+    assert "Add from Shortlist" in script
+    assert "recordsForStoredIds(shortlistKey)" in script
+    assert "compare-remove" in script
+    assert "No universal winner is declared" not in script
+    assert "no universal winner is declared" in script
+
+
+def test_compare_uses_canonical_operational_metrics_and_preference_evidence():
+    script = (ROOT / "app" / "static" / "flight-deck.js").read_text(encoding="utf-8")
+    compare = script.split("function compareCard(item, records)", 1)[1].split("function comparePage()", 1)[0]
+
+    for label in (
+        "Match Class",
+        "Trip Length",
+        "TAFB",
+        "Duty Periods",
+        "Total Legs",
+        "Max Legs / Duty Day",
+        "Deadheads",
+        "Layovers",
+        "Report",
+        "Release",
+        "Preferred Destinations",
+        "Exact matched preferences",
+        "Compromises",
+        "Fatigue:",
+        "Likelihood of Holding:",
+        "Commute:",
+    ):
+        assert label in compare
+    assert "comparisonModels(item)" in script
+    assert "model.package_id === activePackageId()" in script
+    assert "model.ordered_legs" in script
+    assert "model.duty_days" in script
+    assert "model.layovers" in script
+    assert "item.matched_preferences" in compare
+    assert "item.compromises" in compare
+    assert "Not available (placeholder)" in compare
+
+
+def test_compare_hides_irrelevant_pay_metrics_and_highlights_selected_priorities():
+    script = (ROOT / "app" / "static" / "flight-deck.js").read_text(encoding="utf-8")
+
+    assert "if (airline === 'delta'" in script
+    assert "if (airline === 'american'" in script
+    assert "if (airline !== 'southwest'" in script
+    assert "if (airline === 'southwest')" in script
+    for label in ("Total Pay", "Trip Credit", "TFP"):
+        assert label in script
+    assert "comparisonPriorityKeys" in script
+    assert "profile.priority_order" in script
+    assert "profile.pay_priority" in script
+    assert "draft.interpretedProfile" in script
+    assert "draft.tripLengths" in script
+    assert "draft.maxLegs" in script
+    assert "Strengths for your priorities" in script
+    assert "Highest selected ${selected.label}" in script
+    assert "Lowest selected ${label}" in script
+    assert "fd-priority-metric" in script
+    assert "universally best" not in script.lower()
+
+
+def test_shortlist_and_compare_mobile_controls_stack_without_horizontal_scroll():
+    styles = (ROOT / "app" / "static" / "app.css").read_text(encoding="utf-8")
+
+    assert ".fd-shortlist-order{display:grid;grid-template-columns:1fr 1fr}" in styles
+    assert ".fd-shortlist-order button{min-height:44px}" in styles
+    assert ".fd-compare-card footer{display:grid;grid-template-columns:1fr}" in styles
+    assert ".fd-compare-card footer>*{min-height:44px;width:100%}" in styles
+    assert ".fd-compare-details{grid-template-columns:1fr}" in styles
+    assert ".fd-compare-picker>div{display:grid;grid-template-columns:1fr}" in styles
+    assert ".flight-deck-body{overflow-x:hidden}" in styles
