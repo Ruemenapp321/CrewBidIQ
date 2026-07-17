@@ -1,5 +1,10 @@
+from pathlib import Path
+
+import fitz
+from fastapi.testclient import TestClient
+
 from app.parsers import american
-from app.main import detect_airports, detect_layover_cities, score_pairing
+from app.main import app, db, detect_airports, detect_layover_cities, score_pairing
 
 
 SAMPLE = """<<<CREWBIDIQ_PAGE:8>>>
@@ -78,6 +83,28 @@ RPT 2300/2300
 RLS 0050/2150 5.30 0.00 5.30 1.50 1.20
 TTL 5.30 0.00 5.30 1.50
 """
+
+
+def sequence_fixture(days: int, sequence_id: str, *, intermediate_ttl: bool = False) -> str:
+    lines = [
+        "AMERICAN AIRLINES", "AUGUST 2026",
+        "DP D/A EQ FLT# STA DLCL/DHBT ML STA ALCL/AHBT BLOCK SYNTH TPAY DUTY TAFB FDP CALENDAR 08/01-08/30",
+        "LAX 787", f"SEQ {sequence_id} 1 OPS POSN FO MO TU WE TH FR SA SU",
+    ]
+    departure, arrival = "LAX", "JFK"
+    for day in range(1, days + 1):
+        lines.extend([
+            "RPT 0800/0800",
+            f"{day} {day}/{day} 78 {100 + day} {departure} 0900/0900 D {arrival} 1700/1400 5.00",
+            "RLS 1730/1430 5.00 0.00 5.00 9.30 9.00",
+        ])
+        if day < days:
+            lines.append(f"{arrival} HOTEL {12 + day}.00")
+        if intermediate_ttl and day == 2:
+            lines.append("TTL 10.00 0.00 10.00 33.30")
+        departure, arrival = arrival, departure
+    lines.append(f"TTL {days * 5}.00 0.00 {days * 5}.00 {days * 24}.00")
+    return "\n".join(lines)
 
 
 def test_detects_aa_cockpit_sequence_package():
@@ -194,3 +221,78 @@ def test_american_scoring_uses_sequence_days_and_keeps_all_lengths_without_defau
     assert exact["trip_length"] == 5
     assert exact["trip_length_match"] is True
     assert "Matches your preferred 5-day trip length" in exact["reasons"]
+
+
+def test_valid_one_through_five_day_sequences_all_survive_without_length_restriction():
+    parsed = [american.parse(sequence_fixture(days, f"8{days:02d}"))[0] for days in range(1, 6)]
+    results = [score_pairing(row, {"prefer_operate": False}) for row in parsed]
+    assert [row["sequence_days"] for row in parsed] == [1, 2, 3, 4, 5]
+    assert [row["calendar_span_days"] for row in parsed] == [1, 2, 3, 4, 5]
+    assert [row["duty_period_count"] for row in parsed] == [1, 2, 3, 4, 5]
+    assert all(result["eligible"] for result in results)
+    assert {result["trip_length"] for result in results} == {1, 2, 3, 4, 5}
+
+
+def test_ttl_page_subtotal_does_not_truncate_a_four_day_sequence():
+    row = american.parse(sequence_fixture(4, "840", intermediate_ttl=True))[0]
+    assert row["sequence_days"] == 4
+    assert row["duty_period_count"] == 4
+    assert len(row["legs"]) == 4
+    assert row["final_release"] == "1730"
+
+
+def test_four_day_request_classifies_four_day_exact_and_shorter_as_near():
+    rows = [american.parse(sequence_fixture(days, f"9{days:02d}"))[0] for days in (2, 3, 4)]
+    profile = {"required_trip_lengths": ["4"], "trip_length_priority": ["4"], "prefer_operate": False}
+    results = {result["trip_length"]: result for result in (score_pairing(row, profile) for row in rows)}
+    assert results[4]["eligible"] is True
+    assert results[4]["match_class"] == "exact"
+    for days in (2, 3):
+        assert results[days]["eligible"] is False
+        assert results[days]["match_class"] == "near"
+        assert results[days]["eligibility_violations"] == [f"Requires 4 days; this trip is {days} days"]
+
+
+def test_four_day_sequence_survives_pdf_to_api_and_frontend_display(monkeypatch):
+    monkeypatch.setenv("RECOMMENDATION_DEBUG_ENABLED", "true")
+    document = fitz.open()
+    page = document.new_page(width=900, height=1200)
+    page.insert_textbox(fitz.Rect(30, 30, 870, 1170), sequence_fixture(4, "944"), fontname="courier", fontsize=8)
+    payload = document.tobytes()
+    document.close()
+
+    with TestClient(app) as client:
+        upload = client.post(
+            "/api/jobs",
+            data={"airline": "american", "context": "classic", "profile_json": '{"required_trip_lengths":["4"],"trip_length_priority":["4"]}'},
+            files={"file": ("LAX787 AUG 2026.pdf", payload, "application/pdf")},
+        )
+        assert upload.status_code == 200
+        job_id = upload.json()["job_id"]
+        try:
+            response = client.get(f"/api/jobs/{job_id}")
+            assert response.status_code == 200
+            body = response.json()
+            assert body["status"] == "complete"
+            result = body["results"][0]
+            assert result["pairing"] == "944"
+            assert result["sequence_days"] == result["trip_length"] == 4
+            assert result["calendar_span_days"] == 4
+            assert result["duty_period_count"] == 4
+            assert result["overnight_count"] == 3
+            assert result["first_report"] == "0800"
+            assert result["final_release"] == "1730"
+            assert result["match_class"] == "exact"
+            diagnostic = result["recommendation_debug"]["sequence"]
+            assert diagnostic == {
+                "sequence_id": "944", "parsed_sequence_days": 4, "calendar_span_days": 4,
+                "duty_period_count": 4, "overnight_count": 3, "first_report": "0800",
+                "final_release": "1730", "eligibility": "eligible", "rejection_reason": None,
+            }
+            frontend = (Path(__file__).resolve().parents[1] / "app" / "static" / "app.js").read_text(encoding="utf-8")
+            assert "item.trip_length ? `${item.trip_length} days`" in frontend
+            assert "allResults.filter(item => item.eligible !== false)" in frontend
+            assert "trip_length <= 2" not in frontend
+        finally:
+            with db() as conn:
+                conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))

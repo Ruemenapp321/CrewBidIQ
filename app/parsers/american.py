@@ -298,7 +298,13 @@ def _build_sequence(current: dict[str, Any], month: int | None, year: int | None
                 pending_layover.update(transport)
 
     dates = _calendar_dates(lines, month, year)
-    first_report_day, final_release_day = _annotate_duty_calendar_days(duty_periods)
+    # RPT text can repeat in page furniture or malformed extraction. A duty
+    # period is production-valid only when it owns legs and has both endpoints.
+    validated_duty_periods = [
+        duty for duty in duty_periods
+        if duty.get("legs") and duty.get("report_local") and duty.get("release_local")
+    ]
+    first_report_day, final_release_day = _annotate_duty_calendar_days(validated_duty_periods)
     leg_days = [
         day
         for leg in leg_details
@@ -308,7 +314,7 @@ def _build_sequence(current: dict[str, Any], month: int | None, year: int | None
     span_end_candidates = leg_days + ([final_release_day] if final_release_day is not None else [])
     calendar_span_days = (
         max(span_end_candidates) - min(span_start_candidates) + 1
-        if span_start_candidates and span_end_candidates else len(duty_periods)
+        if span_start_candidates and span_end_candidates else len(validated_duty_periods)
     )
     sequence_days = max(calendar_span_days, 1) if legs else 0
     positions, qualifiers, position_text = _positions(current["position_text"])
@@ -322,8 +328,8 @@ def _build_sequence(current: dict[str, Any], month: int | None, year: int | None
         layovers=[],
         credit=raw_total_pay,  # Legacy API alias; pilot-facing AA output uses total_pay.
         tafb=tafb,
-        checkin=reports[0]["local"] if reports else None,
-        release=releases[-1]["local"] if releases else None,
+        checkin=validated_duty_periods[0]["report_local"] if validated_duty_periods else None,
+        release=validated_duty_periods[-1]["release_local"] if validated_duty_periods else None,
         effective=", ".join(dates) or None,
         parser="american_cockpit_sequence",
         confidence=confidence,
@@ -359,22 +365,24 @@ def _build_sequence(current: dict[str, Any], month: int | None, year: int | None
             "equipment_mapping_status": mapping_status,
             "duty_reports": reports,
             "duty_releases": releases,
-            "duty_periods": duty_periods,
+            "duty_periods": validated_duty_periods,
             "sequence_days": sequence_days,
-            "duty_period_count": len(duty_periods),
+            "duty_period_count": len(validated_duty_periods),
             "overnight_count": len(layovers),
             "calendar_span_days": calendar_span_days,
-            "first_report": reports[0]["local"] if reports else None,
+            "first_report": validated_duty_periods[0]["report_local"] if validated_duty_periods else None,
             "first_report_day": first_report_day,
-            "final_release": releases[-1]["local"] if releases else None,
+            "final_release": validated_duty_periods[-1]["release_local"] if validated_duty_periods else None,
             "final_release_day": final_release_day,
             "total_flight_segments": len(leg_details),
             "normalization_diagnostics": {
                 "raw_sequence_id": current["id"],
                 "parsed_sequence_days": sequence_days,
-                "duty_period_count": len(duty_periods),
-                "first_report": reports[0]["local"] if reports else None,
-                "final_release": releases[-1]["local"] if releases else None,
+                "calendar_span_days": calendar_span_days,
+                "duty_period_count": len(validated_duty_periods),
+                "overnight_count": len(layovers),
+                "first_report": validated_duty_periods[0]["report_local"] if validated_duty_periods else None,
+                "final_release": validated_duty_periods[-1]["release_local"] if validated_duty_periods else None,
                 "length_basis": "report_to_release_calendar_span",
             },
         }
@@ -417,10 +425,6 @@ def _parse_cockpit_package(text: str) -> list[dict[str, Any]]:
         if current:
             current["lines"].append(line)
             current["raw_lines"].append(raw_line.rstrip())
-            if TOTAL.match(line):
-                # Keep the calendar fields on the total row, then close the sequence.
-                results.append(_build_sequence(current, month, year))
-                current = None
     if current:
         results.append(_build_sequence(current, month, year))
     return results

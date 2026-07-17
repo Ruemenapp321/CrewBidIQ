@@ -1300,6 +1300,17 @@ def score_pairing(pairing: dict[str, Any], profile: dict[str, Any]) -> dict[str,
             "trip_length_priority": ranked_lengths,
             "length_priority_rank": length_rank,
             "length_score_contribution": length_points,
+            "sequence": {
+                "sequence_id": pairing.get("id"),
+                "parsed_sequence_days": pairing.get("sequence_days"),
+                "calendar_span_days": pairing.get("calendar_span_days"),
+                "duty_period_count": pairing.get("duty_period_count"),
+                "overnight_count": pairing.get("overnight_count"),
+                "first_report": pairing.get("first_report"),
+                "final_release": pairing.get("final_release"),
+                "eligibility": result.get("eligibility_result"),
+                "rejection_reason": "; ".join(result.get("eligibility_violations") or []) or None,
+            } if airline == "american" else None,
         }
     return result
 
