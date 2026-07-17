@@ -111,12 +111,32 @@ html[data-theme="dark"]{--bg:#06111f;--surface:#0b1b2d;--surface2:#10243a;--text
 .fd-empty h2{margin:0 0 6px}
 .fd-empty p{margin:0 0 16px;color:var(--muted)}
 .fd-empty .button+.button{margin-left:7px}
-.fd-saved-list{margin-top:15px}
+.fd-saved-list{display:grid;gap:12px;margin-top:15px}
+.fd-shortlist-item{min-width:0;padding:8px;border:1px solid var(--fd-line);border-radius:16px;background:var(--fd-soft)}
+.fd-shortlist-item .fd-card{margin:0}
+.fd-shortlist-order{display:flex;align-items:center;justify-content:flex-end;gap:6px;padding:2px 3px 9px}
+.fd-shortlist-order span{margin-right:auto;color:var(--muted);font-size:10px;font-weight:800;text-transform:uppercase}
+.fd-shortlist-order button,.fd-compare-card footer button{padding:7px 10px;border:1px solid var(--line);background:var(--surface2);color:var(--text);font-size:10px}
+.fd-shortlist-order button:disabled{opacity:.4;cursor:not-allowed}
 .fd-compare-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:15px}
 .fd-compare-card{margin:0;min-width:0}
-.fd-compare-card>span{color:var(--fd);font-size:9px;font-weight:900;text-transform:uppercase}
+.fd-compare-card>header{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+.fd-compare-card header>div>span{color:var(--fd);font-size:9px;font-weight:900;text-transform:uppercase}
 .fd-compare-card h2{margin:4px 0}
 .fd-compare-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin:12px 0}
+.fd-priority-metric{border:1px solid var(--fd);background:var(--fd-soft)}
+.fd-priority-strengths{display:flex;flex-wrap:wrap;gap:6px;margin-top:12px}
+.fd-priority-strengths strong{width:100%;font-size:10px;text-transform:uppercase;color:var(--muted)}
+.fd-priority-strengths span{padding:6px 8px;border-radius:99px;background:rgba(33,173,107,.13);color:#21ad6b;font-size:9px;font-weight:800}
+.fd-neutral-note{color:var(--muted);font-size:10px}
+.fd-compare-details{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.fd-compare-detail{min-width:0;padding:9px;border-radius:9px;background:var(--surface2)}
+.fd-compare-detail:last-child{grid-column:1/-1}
+.fd-compare-detail h3{margin:0 0 6px;font-size:11px}.fd-compare-detail ul{margin:0;padding-left:17px}.fd-compare-detail li,.fd-compare-detail p{margin:3px 0;color:var(--muted);font-size:10px;line-height:1.4}
+.fd-compare-card footer{display:flex;justify-content:flex-end;gap:7px;margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
+.fd-compare-card footer>*{min-height:40px}
+.fd-compare-status{margin-top:12px;padding:12px 14px;border:1px solid var(--fd-line);border-radius:12px;background:var(--fd-soft);font-size:11px}.fd-compare-status p{margin:5px 0 0;color:var(--amber)}
+.fd-compare-picker{margin-top:12px}.fd-compare-picker h2{margin:0 0 10px}.fd-compare-picker>div{display:flex;flex-wrap:wrap;gap:7px}.fd-compare-picker button{display:grid;gap:2px;min-height:44px;padding:8px 12px;border:1px solid var(--line);background:var(--surface2);color:var(--text);text-align:left}.fd-compare-picker button span{color:var(--muted);font-size:8px;text-transform:uppercase}
 .fd-briefing-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .fd-briefing-grid .surface{margin:0}
 .fd-briefing-grid h2,.fd-flow h2,.fd-layover-list h2{margin:0 0 12px}
@@ -251,6 +271,10 @@ html[data-theme="dark"]{--bg:#06111f;--surface:#0b1b2d;--surface2:#10243a;--text
   .fd-selection-dock{bottom:72px;width:calc(100% - 8px)}
   .fd-selection-dock a{flex:1;min-height:44px;text-align:center}
   .fd-compare-grid,.fd-briefing-grid{grid-template-columns:1fr}
+  .fd-shortlist-order{display:grid;grid-template-columns:1fr 1fr}.fd-shortlist-order span{grid-column:1/-1}.fd-shortlist-order button{min-height:44px}
+  .fd-compare-card>header{display:block}.fd-compare-card footer{display:grid;grid-template-columns:1fr}.fd-compare-card footer>*{min-height:44px;width:100%}
+  .fd-compare-details{grid-template-columns:1fr}.fd-compare-detail:last-child{grid-column:auto}
+  .fd-compare-picker>div{display:grid;grid-template-columns:1fr}.fd-compare-picker button{width:100%}
   .fd-briefing-layout{grid-template-columns:1fr}
   .fd-briefing-wide,.fd-briefing-overview{grid-column:auto}
   .fd-fact-grid,.fd-source-meta{grid-template-columns:1fr 1fr}
