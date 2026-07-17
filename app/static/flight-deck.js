@@ -84,6 +84,15 @@ function tripModel(item) { return item?.canonical_trip || {}; }
 function tripId(item) { return String(tripModel(item).id || item?.canonical_trip_id || item?.id || ''); }
 function sourceNumber(item) { return String(tripModel(item).source_trip_number || item?.source_trip_number || item?.pairing || 'Unavailable'); }
 function tripAirline(item) { return String(tripModel(item).airline || item?.airline || sessionJob?.airline || 'generic').toLowerCase(); }
+function canonicalTripFacts(item) {
+  const model = tripModel(item);
+  return {
+    orderedLegs: Array.isArray(model.ordered_legs) ? model.ordered_legs : [],
+    dutyDays: Array.isArray(model.duty_days) ? model.duty_days : [],
+    layovers: Array.isArray(model.layovers) ? model.layovers : [],
+    mapAirports: Array.isArray(model.route_map_airports) ? model.route_map_airports : [],
+  };
+}
 function tripDayValues(item) {
   const values = item?.item_type === 'line'
     ? canonicalTrips(item).map(trip => Number(trip.trip_length_days || 0))
@@ -97,9 +106,10 @@ function tripLengthLabel(item) {
   const days = values[0];
   return days ? `${days} day${days === 1 ? '' : 's'}` : 'Unavailable';
 }
-function tripLegs(item) { return tripModel(item).ordered_legs || item?.ordered_legs || []; }
-function tripDutyDays(item) { return tripModel(item).duty_days || item?.duty_days || []; }
-function tripLayovers(item) { return tripModel(item).layovers || item?.layovers || []; }
+function tripLegs(item) { return canonicalTripFacts(item).orderedLegs; }
+function tripDutyDays(item) { return canonicalTripFacts(item).dutyDays; }
+function tripLayovers(item) { return canonicalTripFacts(item).layovers; }
+function tripMapAirports(item) { return canonicalTripFacts(item).mapAirports; }
 function tripPay(item) { return tripModel(item).pay_breakdown || item?.pay_breakdown || {}; }
 function tripTfp(item) { return tripModel(item).tfp || item?.tfp || {}; }
 function tripTafb(item) { return tripModel(item).tafb ?? item?.tafb; }
@@ -125,11 +135,7 @@ function matchLabel(item) {
 }
 
 function simplifiedRoute(item) {
-  const normalized = tripModel(item).simplified_route;
-  if (normalized) return normalized;
-  const legs = tripLegs(item);
-  if (!legs.length) return item?.route || 'Route unavailable';
-  return [legs[0].origin, ...legs.map(leg => leg.destination)].filter(Boolean).join('–');
+  return tripModel(item).simplified_route || 'Route unavailable';
 }
 
 function layoverAirport(layover) { return String(layover?.airport || layover?.station || layover?.city || '').toUpperCase(); }
@@ -390,9 +396,17 @@ function briefingTitle(item, model) {
   return 'Pairing Briefing';
 }
 
+function formatLocalTime24(value) {
+  const text = String(value || '').trim();
+  const match = text.match(/T(\d{2}):(\d{2})/) || text.match(/^(\d{1,2}):?(\d{2})$/);
+  if (!match) return 'Unavailable';
+  const hours = Number(match[1]), minutes = Number(match[2]);
+  return hours < 24 && minutes < 60 ? `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}` : 'Unavailable';
+}
+
 function canonicalEventDisplay(event) {
   if (!event) return 'Unavailable';
-  const parts = [event.local_time, event.airport, event.local_timezone].filter(value => value !== null && value !== undefined && value !== '');
+  const parts = [formatLocalTime24(event.local_time), event.airport, event.local_timezone].filter(value => value !== null && value !== undefined && value !== '' && value !== 'Unavailable');
   return parts.length ? parts.join(' | ') : 'Unavailable';
 }
 
@@ -438,17 +452,24 @@ function thingsToKnow(item) {
     ${neutral.length ? `<div class="fd-briefing-detail"><h3>Neutral trip facts</h3>${detailList(neutral)}</div>` : ''}`;
 }
 
-function dutyDaySummary(models) {
+function tripFlow(models) {
   const groups = models.map(model => {
     const days = Array.isArray(model.duty_days) ? model.duty_days : [];
     if (!days.length) return '';
     const dayCards = days.map(day => {
       const legs = Array.isArray(day.ordered_legs) ? day.ordered_legs : [];
-      const legRows = legs.length ? legs.map(leg => `<li><span>${escapeHtml(displayValue(leg.sequence_index))}</span><div><strong>${escapeHtml(displayValue(leg.origin))} &rarr; ${escapeHtml(displayValue(leg.destination))}</strong><small>${escapeHtml(displayValue(leg.local_departure_time))} - ${escapeHtml(displayValue(leg.local_arrival_time))}${leg.operating_or_deadhead === 'deadhead' ? ' | Deadhead' : ''}${leg.flight_number ? ` | Flight ${escapeHtml(leg.flight_number)}` : ''}</small></div></li>`).join('') : '<li class="fd-missing">No normalized legs are available for this duty day.</li>';
-      return `<article class="fd-duty-day"><header><div><span>Duty Day ${escapeHtml(displayValue(day.day_index))}</span><strong>${escapeHtml(displayValue(day.calendar_date, 'Date unavailable'))}</strong></div><div><small>Report</small><strong>${escapeHtml(canonicalEventDisplay(day.report_event))}</strong><small>Release</small><strong>${escapeHtml(canonicalEventDisplay(day.release_event))}</strong></div></header><ol>${legRows}</ol></article>`;
+      const legRows = legs.length ? legs.map(leg => {
+        const operation = leg.operating_or_deadhead === 'deadhead' ? 'Deadhead' : 'Operating';
+        const details = [operation, leg.flight_number ? `Flight ${leg.flight_number}` : null, leg.equipment ? `Aircraft ${leg.equipment}` : null].filter(Boolean);
+        const connection = leg.connection_after ? `<div class="fd-trip-connection"><span>Connection / Sit</span><strong>${escapeHtml(displayValue(leg.destination))} | ${escapeHtml(leg.connection_after)}</strong></div>` : '';
+        return `<li class="fd-trip-leg"><span>${escapeHtml(displayValue(leg.sequence_index))}</span><div><strong>${escapeHtml(displayValue(leg.origin))} &rarr; ${escapeHtml(displayValue(leg.destination))}</strong><small>${escapeHtml(details.join(' | '))}</small><div class="fd-leg-times"><span>Depart <strong>${escapeHtml(formatLocalTime24(leg.local_departure_time))}</strong></span><span>Arrive <strong>${escapeHtml(formatLocalTime24(leg.local_arrival_time))}</strong></span></div>${connection}</div></li>`;
+      }).join('') : '<li class="fd-missing">No normalized legs are available for this duty day.</li>';
+      const layover = day.layover_after_duty;
+      const layoverBlock = layover ? `<footer class="fd-duty-layover"><div><span>Layover / Overnight after release</span><strong>${escapeHtml(displayValue(layover.airport || layover.city))}</strong></div><div><span>Duration</span><strong>${escapeHtml(displayValue(layover.duration))}</strong></div><div><span>Hotel</span><strong>${escapeHtml(displayValue(layover.hotel))}</strong></div></footer>` : '<footer class="fd-duty-layover fd-no-layover"><span>No canonical layover after release.</span></footer>';
+      return `<article class="fd-duty-day" data-duty-day="${escapeHtml(displayValue(day.day_index))}"><header><div><span>Duty Day ${escapeHtml(displayValue(day.day_index))}</span><strong>${escapeHtml(displayValue(day.calendar_date, 'Date unavailable'))}</strong></div><div class="fd-duty-endpoints"><small>Local Report</small><strong>${escapeHtml(formatLocalTime24(day.report_event?.local_time))}</strong><span>${escapeHtml(displayValue(day.report_event?.airport, 'Airport unavailable'))}</span><small>Local Release</small><strong>${escapeHtml(formatLocalTime24(day.release_event?.local_time))}</strong><span>${escapeHtml(displayValue(day.release_event?.airport, 'Airport unavailable'))}</span></div></header><ol>${legRows}</ol>${layoverBlock}</article>`;
     }).join('');
     const showMember = models.length > 1;
-    return `<div class="fd-duty-group">${showMember ? `<h3>${escapeHtml(model.terminology || 'pairing')} ${escapeHtml(model.source_trip_number)}</h3>` : ''}${dayCards}</div>`;
+    return `<div class="fd-duty-group" data-canonical-trip-id="${escapeHtml(model.id)}">${showMember ? `<h3>${escapeHtml(model.terminology || 'pairing')} ${escapeHtml(model.source_trip_number)}</h3>` : ''}${dayCards}</div>`;
   }).filter(Boolean);
   return groups.length ? groups.join('') : '<p class="fd-missing">Duty-day details are unavailable.</p>';
 }
@@ -539,7 +560,7 @@ function tripBriefingPage() {
       </section>
       <section class="surface fd-briefing-section"><span class="fd-section-number">02</span><h2>Operational Highlights</h2>${operationalHighlights(model)}</section>
       <section class="surface fd-briefing-section"><span class="fd-section-number">03</span><h2>Things to Know</h2>${thingsToKnow(item)}</section>
-      <section class="surface fd-briefing-section fd-briefing-wide"><span class="fd-section-number">04</span><h2>Duty-Day Summary</h2>${dutyDaySummary(models)}</section>
+      <section class="surface fd-briefing-section fd-briefing-wide"><span class="fd-section-number">04</span><span class="fd-trip-flow-label">Trip Flow</span><h2>Duty-Day Summary</h2><div class="fd-trip-flow">${tripFlow(models)}</div></section>
       <section class="surface fd-briefing-section fd-briefing-wide"><span class="fd-section-number">05</span><h2>Layovers and Hotels</h2>${layoversAndHotels(models)}</section>
       <section class="surface fd-briefing-section"><span class="fd-section-number">06</span><h2>Pay or TFP Breakdown</h2>${payOrTfpBreakdown(model)}</section>
       <section class="surface fd-briefing-section fd-placeholder"><span class="fd-section-number">07</span><h2>Fatigue</h2><p>No Flight Deck fatigue assessment is available for this trip.</p></section>

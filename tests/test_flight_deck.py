@@ -125,7 +125,7 @@ def test_flight_deck_groups_fields_and_airline_terminology_are_explicit():
     assert "if (tripAirline(item) === 'american') return 'Sequence'" in script
     assert "item?.item_type === 'line' ? 'Line' : 'Pairing'" in script
     assert "return 'Pairing'" in script
-    assert "[legs[0].origin, ...legs.map(leg => leg.destination)]" in script
+    assert "return tripModel(item).simplified_route || 'Route unavailable'" in script
 
 
 def test_flight_deck_filters_and_airline_relevant_sorting_are_available():
@@ -214,7 +214,7 @@ def test_trip_briefing_has_airline_titles_and_all_required_sections():
     ):
         assert f"<h2>{section}</h2>" in script
     assert "Exact match explanation" in script
-    assert 'src="/static/flight-deck.js?v=0002"' in labs
+    assert 'src="/static/flight-deck.js?v=0003"' in labs
 
 
 def test_trip_briefing_reads_trip_facts_from_confirmed_canonical_models_only():
@@ -276,3 +276,60 @@ def test_trip_briefing_layout_is_responsive_on_desktop_and_mobile():
     assert ".fd-briefing-wide,.fd-briefing-overview{grid-column:auto}" in styles
     assert ".fd-fact-grid,.fd-source-meta{grid-template-columns:1fr 1fr}" in styles
     assert ".fd-duty-day>header{grid-template-columns:1fr}" in styles
+
+
+def test_trip_flow_uses_canonical_duty_days_legs_layovers_and_map_path():
+    script = (ROOT / "app" / "static" / "flight-deck.js").read_text(encoding="utf-8")
+    flow = script.split("function tripFlow(models)", 1)[1].split("function layoversAndHotels", 1)[0]
+
+    assert "function canonicalTripFacts(item)" in script
+    assert "model.ordered_legs" in script
+    assert "model.duty_days" in script
+    assert "model.layovers" in script
+    assert "model.route_map_airports" in script
+    assert "function tripLegs(item) { return canonicalTripFacts(item).orderedLegs; }" in script
+    assert "function tripDutyDays(item) { return canonicalTripFacts(item).dutyDays; }" in script
+    assert "function tripLayovers(item) { return canonicalTripFacts(item).layovers; }" in script
+    assert "function tripMapAirports(item) { return canonicalTripFacts(item).mapAirports; }" in script
+    assert "Array.isArray(model.duty_days)" in flow
+    assert "Array.isArray(day.ordered_legs)" in flow
+    assert "day.layover_after_duty" in flow
+    assert 'data-duty-day=' in flow
+    assert "artificial" not in flow.lower()
+    assert "layover-only" not in flow.lower()
+
+
+def test_trip_flow_displays_operating_details_connections_and_24_hour_local_times():
+    script = (ROOT / "app" / "static" / "flight-deck.js").read_text(encoding="utf-8")
+    flow = script.split("function tripFlow(models)", 1)[1].split("function layoversAndHotels", 1)[0]
+
+    for value in (
+        "Duty Day",
+        "Local Report",
+        "Local Release",
+        "Operating",
+        "Deadhead",
+        "Flight",
+        "Aircraft",
+        "Depart",
+        "Arrive",
+        "Connection / Sit",
+        "Layover / Overnight after release",
+        "Duration",
+        "Hotel",
+    ):
+        assert value in flow
+    assert "formatLocalTime24" in flow
+    assert "leg.connection_after" in flow
+    assert "source_time" not in flow
+    assert "source_departure_time" not in flow
+    assert "source_arrival_time" not in flow
+    assert "Herb" not in script
+
+
+def test_trip_flow_mobile_layout_stacks_connections_and_layover_details():
+    styles = (ROOT / "app" / "static" / "app.css").read_text(encoding="utf-8")
+
+    assert ".fd-duty-layover{display:grid;grid-template-columns:1fr auto 1fr" in styles
+    assert ".fd-duty-layover{grid-template-columns:1fr}" in styles
+    assert ".fd-trip-connection{align-items:flex-start;flex-direction:column}" in styles

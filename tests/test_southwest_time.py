@@ -75,7 +75,37 @@ def test_missing_event_year_never_exposes_source_clock_as_local():
 
 
 def test_standard_user_surfaces_do_not_offer_herb_time():
-    for filename in ("app/static/app.js", "app/static/labs.js", "app/reporting.py"):
+    for filename in ("app/static/app.js", "app/static/labs.js", "app/static/flight-deck.js", "app/reporting.py"):
         text = Path(filename).read_text(encoding="utf-8")
         assert "Herb Time" not in text
         assert "View in Herb" not in text
+
+
+def test_flight_deck_trip_flow_receives_southwest_local_times_only():
+    row = southwest.parse(SAMPLE)[0]
+    scored = score_pairing(row, {})
+    model = scored["canonical_trip"]
+    first_day = model["duty_days"][0]
+    second_day = model["duty_days"][1]
+    first_leg = first_day["ordered_legs"][0]
+
+    assert first_day["calendar_date"] == "2026-08-10"
+    assert first_day["report_event"]["local_time"] == "2026-08-10T05:05:00-07:00"
+    assert first_day["report_event"]["airport"] == "LAX"
+    assert first_day["release_event"]["local_time"] == "1455"
+    assert first_day["release_event"]["airport"] == "SAT"
+    assert second_day["calendar_date"] == "2026-08-11"
+    assert second_day["report_event"]["local_time"] == "0630"
+    assert second_day["report_event"]["airport"] == "SAT"
+    assert second_day["release_event"]["local_time"] == "1235"
+    assert second_day["release_event"]["airport"] == "LAX"
+    assert [layover["airport"] for layover in model["layovers"]] == ["SAT"]
+    assert first_day["layover_after_duty"]["airport"] == "SAT"
+    assert second_day["layover_after_duty"] is None
+    assert first_leg["local_departure_time"] == "0605"
+    assert first_leg["local_arrival_time"] == "0725"
+    assert first_leg["connection_after"] == "00:40"
+    assert first_leg["source_departure_time"] is None
+    assert first_leg["source_arrival_time"] is None
+    assert first_day["report_event"]["source_time"] is None
+    assert all(event["source_time"] is None for event in model["ordered_events"])

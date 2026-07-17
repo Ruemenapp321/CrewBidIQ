@@ -41,7 +41,7 @@ def test_typed_canonical_schema_contains_required_cross_airline_fields():
         "sequence_index", "duty_day_index", "origin", "destination", "operating_or_deadhead",
         "flight_number", "equipment", "source_departure_time", "source_arrival_time",
         "utc_departure_time", "utc_arrival_time", "local_departure_time", "local_arrival_time",
-        "origin_timezone", "destination_timezone",
+        "origin_timezone", "destination_timezone", "connection_after", "connection_after_minutes",
     }
     assert {field.name for field in fields(Layover)} == {
         "after_duty_day", "airport", "city", "hotel", "transportation", "start_local",
@@ -83,6 +83,47 @@ def test_repeated_airports_remain_ordered_and_connections_are_not_layovers():
     assert [layover["airport"] for layover in trip["layovers"]] == ["BOS"]
     assert "MCO" not in [layover["airport"] for layover in trip["layovers"]]
     assert trip["duty_days"][0]["layover_after_duty"]["airport"] == "BOS"
+
+
+def test_trip_flow_uses_real_duty_days_and_places_connections_and_layovers_correctly():
+    source = {
+        "id": "FLOW1",
+        "package_id": "pkg-flow",
+        "airline": "generic",
+        "legs": [
+            {"day": "1", "departure": "ATL", "departure_time": "2300", "arrival": "MCO", "arrival_time": "0030", "flight": "101", "aircraft": "320", "deadhead": False},
+            {"day": "1", "departure": "MCO", "departure_time": "0115", "arrival": "BOS", "arrival_time": "0300", "flight": "102", "aircraft": "320", "deadhead": False},
+            {"day": "2", "departure": "BOS", "departure_time": "0800", "arrival": "MCO", "arrival_time": "1100", "flight": "103", "aircraft": "320", "deadhead": True},
+            {"day": "2", "departure": "MCO", "departure_time": "1200", "arrival": "ATL", "arrival_time": "1330", "flight": "104", "aircraft": "320", "deadhead": False},
+        ],
+        "duty_periods": [
+            {"report_local": "2200", "release_local": "0330"},
+            {"report_local": "0730", "release_local": "1400"},
+        ],
+        "layovers": [{"city": "BOS", "duration": "04:30", "hotel": "BOSTON HOTEL", "validated": True}],
+        "bidable_inventory_confirmed": True,
+    }
+
+    trip = canonical_trip_payload(source)
+
+    assert len(trip["duty_days"]) == 2
+    assert [day["day_index"] for day in trip["duty_days"]] == [1, 2]
+    assert [len(day["ordered_legs"]) for day in trip["duty_days"]] == [2, 2]
+    assert trip["duty_days"][0]["ordered_legs"][0]["local_arrival_time"] == "0030"
+    assert trip["duty_days"][0]["ordered_legs"][0]["connection_after"] == "00:45"
+    assert trip["duty_days"][0]["ordered_legs"][0]["connection_after_minutes"] == 45
+    assert trip["duty_days"][0]["layover_after_duty"]["airport"] == "BOS"
+    assert trip["duty_days"][0]["layover_after_duty"]["hotel"] == "BOSTON HOTEL"
+    assert trip["duty_days"][1]["layover_after_duty"] is None
+    assert trip["ordered_legs"][2]["operating_or_deadhead"] == "deadhead"
+    assert trip["ordered_operating_airports"] == ["ATL", "MCO", "BOS", "MCO", "ATL"]
+    assert trip["route_map_airports"] == trip["ordered_operating_airports"]
+    assert [layover["airport"] for layover in trip["layovers"]] == ["BOS"]
+    assert [leg for day in trip["duty_days"] for leg in day["ordered_legs"]] == trip["ordered_legs"]
+    assert [
+        day["layover_after_duty"] for day in trip["duty_days"]
+        if day["layover_after_duty"] is not None
+    ] == trip["layovers"]
 
 
 def test_airline_specific_pay_and_tfp_map_without_cross_airline_rules():

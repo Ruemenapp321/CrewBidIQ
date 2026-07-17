@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime
 from hashlib import sha256
 import re
 from typing import Any
@@ -35,6 +36,8 @@ class TripLeg:
     local_arrival_time: str | None
     origin_timezone: str | None
     destination_timezone: str | None
+    connection_after: str | None
+    connection_after_minutes: int | None
 
 
 @dataclass(frozen=True)
@@ -240,6 +243,59 @@ def _leg_day_indices(legs: list[dict[str, Any]]) -> list[int]:
     return indices
 
 
+def _clock_minutes(value: Any) -> int | None:
+    text = str(value or "").strip()
+    iso_match = re.search(r"T(\d{2}):(\d{2})", text)
+    if iso_match:
+        return int(iso_match.group(1)) * 60 + int(iso_match.group(2))
+    clock_match = re.fullmatch(r"(\d{1,2}):?(\d{2})", text)
+    if not clock_match:
+        return None
+    hours, minutes = int(clock_match.group(1)), int(clock_match.group(2))
+    return hours * 60 + minutes if hours < 24 and minutes < 60 else None
+
+
+def _utc_connection_minutes(current: TripLeg, following: TripLeg) -> int | None:
+    if not current.utc_arrival_time or not following.utc_departure_time:
+        return None
+    try:
+        arrival = datetime.fromisoformat(current.utc_arrival_time.replace("Z", "+00:00"))
+        departure = datetime.fromisoformat(following.utc_departure_time.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    minutes = int((departure - arrival).total_seconds() // 60)
+    return minutes if 0 < minutes <= 24 * 60 else None
+
+
+def _connection_minutes(
+    current: TripLeg,
+    following: TripLeg,
+    current_source: dict[str, Any],
+    following_source: dict[str, Any],
+) -> int | None:
+    if current.duty_day_index != following.duty_day_index or current.destination != following.origin:
+        return None
+    utc_minutes = _utc_connection_minutes(current, following)
+    if utc_minutes is not None:
+        return utc_minutes
+    arrival_clock = _clock_minutes(current.local_arrival_time)
+    departure_clock = _clock_minutes(following.local_departure_time)
+    if arrival_clock is None or departure_clock is None:
+        return None
+    try:
+        arrival_day = int(current_source.get("arrival_day"))
+        departure_day = int(following_source.get("departure_day"))
+    except (TypeError, ValueError):
+        arrival_day = departure_day = 0
+    if arrival_day and departure_day:
+        minutes = (departure_day - arrival_day) * 24 * 60 + departure_clock - arrival_clock
+    else:
+        minutes = departure_clock - arrival_clock
+        if minutes <= 0:
+            minutes += 24 * 60
+    return minutes if 0 < minutes <= 24 * 60 else None
+
+
 def _trip_legs(record: dict[str, Any]) -> list[TripLeg]:
     source = record.get("legs", []) or []
     day_indices = _leg_day_indices(source)
@@ -261,8 +317,24 @@ def _trip_legs(record: dict[str, Any]) -> list[TripLeg]:
             local_arrival_time=str(leg.get("arrival_time") or leg.get("local_arrival_time") or "") or None,
             origin_timezone=str(leg.get("departure_local_event_timezone") or leg.get("origin_timezone") or "") or None,
             destination_timezone=str(leg.get("arrival_local_event_timezone") or leg.get("destination_timezone") or "") or None,
+            connection_after=None,
+            connection_after_minutes=None,
         ))
-    return legs
+    connected: list[TripLeg] = []
+    for index, leg in enumerate(legs):
+        following = legs[index + 1] if index + 1 < len(legs) else None
+        minutes = _connection_minutes(
+            leg,
+            following,
+            source[index] if index < len(source) else {},
+            source[index + 1] if following and index + 1 < len(source) else {},
+        ) if following else None
+        connected.append(replace(
+            leg,
+            connection_after=f"{minutes // 60:02d}:{minutes % 60:02d}" if minutes is not None else None,
+            connection_after_minutes=minutes,
+        ))
+    return connected
 
 
 def _ordered_operating_airports(legs: list[TripLeg]) -> list[str]:
@@ -484,7 +556,7 @@ def canonical_trip_from_record(record: dict[str, Any], package_id: str | None = 
         ordered_legs=legs,
         ordered_operating_airports=ordered_operating_airports,
         operating_cities=operating_cities,
-        route_map_airports=operating_cities,
+        route_map_airports=ordered_operating_airports,
         simplified_route="–".join(ordered_operating_airports),
         duty_days=duty_days,
         layovers=layovers,

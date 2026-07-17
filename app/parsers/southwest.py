@@ -105,8 +105,27 @@ def parse(text: str) -> list[dict]:
             if lay_city and lay_duration:
                 layovers.append(Layover(city=lay_city, duration=lay_duration, hotel=None))
 
-        summary = TRIP_SUMMARY.search(block)
         reports = REPORT.findall(block)
+        duty_order = list(dict.fromkeys(leg.get("day") or "1" for leg in normalized_legs))
+        duty_periods = []
+        for duty_index, duty_label in enumerate(duty_order):
+            duty_legs = [leg for leg in normalized_legs if (leg.get("day") or "1") == duty_label]
+            if not duty_legs:
+                continue
+            event_date = duty_legs[0].get("event_date")
+            source_report = reports[duty_index] if duty_index < len(reports) else None
+            normalized_report = normalize_herb_event(
+                source_report,
+                date.fromisoformat(event_date),
+                duty_legs[0].get("departure"),
+            ) if source_report and event_date else None
+            duty_periods.append({
+                "number": duty_index + 1,
+                "report_local": normalized_report["local_clock"] if normalized_report else None,
+                "release_local": duty_legs[-1].get("arrival_time"),
+            })
+
+        summary = TRIP_SUMMARY.search(block)
         release = normalized_legs[-1].get("arrival_time") if normalized_legs else None
         first_leg_date = normalized_legs[0].get("event_date") if normalized_legs else None
         report_normalized = normalize_herb_event(
@@ -134,8 +153,9 @@ def parse(text: str) -> list[dict]:
         result["final_release"] = release
         result["report_time_provenance"] = {key: value for key, value in report_normalized.items() if key != "local_clock"} if report_normalized else None
         result["time_normalization_status"] = "normalized" if normalized_legs and all(leg.get("departure_time") and leg.get("arrival_time") for leg in normalized_legs) else "unavailable"
-        duty_periods = len({leg.day or "1" for leg in legs if not leg.deadhead})
-        result.update(southwest_pairing_pay_fields(summary.group(1) if summary else None, result["tafb"], duty_periods))
+        result["duty_periods"] = duty_periods
+        duty_period_count = len(duty_periods)
+        result.update(southwest_pairing_pay_fields(summary.group(1) if summary else None, result["tafb"], duty_period_count))
         result["airline"] = "southwest"
         results.append(result)
     return results

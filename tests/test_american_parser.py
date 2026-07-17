@@ -3,6 +3,7 @@ from pathlib import Path
 import fitz
 from fastapi.testclient import TestClient
 
+from app.canonical import canonical_trip_payload
 from app.parsers import american
 from app.main import app, db, detect_airports, detect_layover_cities, score_pairing
 
@@ -210,6 +211,19 @@ def test_american_after_midnight_release_uses_arrival_day_without_double_countin
     assert row["sequence_days"] == 2
     assert row["first_report_day"] == 1
     assert row["final_release_day"] == 2
+
+
+def test_american_trip_flow_keeps_actual_duties_without_layover_only_days():
+    row = next(row for row in american.parse(MULTI_DAY_SAMPLE) if row["id"] == "705")
+    trip = canonical_trip_payload({**row, "package_id": "pkg-aa-flow", "bidable_inventory_confirmed": True})
+
+    assert trip["trip_length_days"] == 5
+    assert trip["calendar_span_days"] == 5
+    assert trip["duty_period_count"] == 2
+    assert len(trip["duty_days"]) == 2
+    assert [len(day["ordered_legs"]) for day in trip["duty_days"]] == [1, 1]
+    assert trip["duty_days"][0]["layover_after_duty"]["airport"] == "SYD"
+    assert trip["duty_days"][1]["layover_after_duty"] is None
 
 
 def test_american_scoring_uses_sequence_days_and_keeps_all_lengths_without_default_limit():

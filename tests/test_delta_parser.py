@@ -74,7 +74,7 @@ def test_delta_a023_operating_airports_come_only_from_validated_leg_rows(monkeyp
     assert result["ordered_operating_airports"] == model["ordered_operating_airports"] == ["ATL", "ATH", "ATL"]
     assert result["operating_cities"] == model["operating_cities"] == ["ATL", "ATH"]
     assert result["touched_cities"] == ["ATL", "ATH"]
-    assert result["route_map_airports"] == model["route_map_airports"] == ["ATL", "ATH"]
+    assert result["route_map_airports"] == model["route_map_airports"] == ["ATL", "ATH", "ATL"]
     assert result["simplified_route"] == model["simplified_route"] == "ATL–ATH–ATL"
     assert result["international"] is True
     assert [(leg["origin"], leg["destination"]) for leg in model["ordered_legs"]] == [("ATL", "ATH"), ("ATH", "ATL")]

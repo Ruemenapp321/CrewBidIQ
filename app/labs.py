@@ -106,7 +106,7 @@ FLIGHT_DECK_HTML = r"""
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#071525">
   <title>Flight Deck Preview | CrewBidIQ</title>
-  <link rel="stylesheet" href="/static/app.css?v=0426">
+  <link rel="stylesheet" href="/static/app.css?v=0427">
 </head>
 <body class="labs-body flight-deck-body" data-flight-deck-page="__FLIGHT_DECK_PAGE__">
 <div class="app-shell">
@@ -136,7 +136,7 @@ FLIGHT_DECK_HTML = r"""
   </div>
 </div>
 <script>window.CREWBIDIQ_FLIGHT_DECK_PAGE="__FLIGHT_DECK_PAGE__";window.CREWBIDIQ_FLIGHT_DECK_TRIP_ID=__TRIP_ID_JSON__;</script>
-<script src="/static/flight-deck.js?v=0002"></script>
+<script src="/static/flight-deck.js?v=0003"></script>
 </body>
 </html>
 """
