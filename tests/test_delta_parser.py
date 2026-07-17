@@ -1,7 +1,9 @@
 from pathlib import Path
 import fitz
+from app.airports import is_valid_airport_code
 from app.parsers import delta
-from app.main import build_bid_synopsis, consolidate_pairings, filter_pairings_for_profile, score_pairing, sort_pdf_text_for_airline
+from app.main import build_bid_synopsis, consolidate_pairings, detect_airports, filter_pairings_for_profile, score_pairing, sort_pdf_text_for_airline
+from app.recommendations import evaluate_eligibility
 
 
 ROTATION_5354 = """#5354  TU              EFFECTIVE AUG25 ONLY                  CHECK-IN AT 14.15
@@ -46,6 +48,90 @@ R523 = """#R523  MO              EFFECTIVE AUG01 ONLY                  CHECK-IN 
   B      201    JNB 2300  ATL 1100  9.00       350   10.00/12.00 10.00/11.30 2
   TOTAL CREDIT 18.00TL  18.00BL    .00CR   20.00FDP                TAFB  28.00
 """
+
+A023 = """ATL A330 SEPTEMBER 2026 BID PACKAGE
+MASTER PAIRINGS
+#A023  MO              EFFECTIVE SEP08 ONLY                  CHECK-IN AT 14.00
+ DAY   FLIGHT T POS DEPARTS   ARRIVES C BLK.  TURN BLK/MAX FDP/MAX PWA FDP/MAX
+  A       82    ATL 1600  ATH 0830  9.30       330 M                         2
+          ATH 24.00/ATHENS HOTEL                    5.00/ 9.00  .00CRD  5.00TL
+  B       83    ATH 1000  ATL 1500 10.00       330  11.00/12.00 10.30/11.30 2
+  TOTAL CREDIT 19.30TL  19.30BL    .00CR   21.30FDP                TAFB  48.00
+  TOTAL PAY    20:00TL    .30SIT    .00EDP    .00HOL
+"""
+
+
+def test_delta_a023_operating_airports_come_only_from_validated_leg_rows(monkeypatch):
+    monkeypatch.setenv("PARSER_DEBUG_ENABLED", "true")
+    pairing = delta.parse(A023)[0]
+    result = score_pairing(pairing, {"prefer_operate": False})
+    model = result["canonical_trip"]
+
+    assert [
+        (leg["departure"], leg["arrival"])
+        for leg in pairing["legs"]
+    ] == [("ATL", "ATH"), ("ATH", "ATL")]
+    assert result["ordered_operating_airports"] == model["ordered_operating_airports"] == ["ATL", "ATH", "ATL"]
+    assert result["operating_cities"] == model["operating_cities"] == ["ATL", "ATH"]
+    assert result["touched_cities"] == ["ATL", "ATH"]
+    assert result["route_map_airports"] == model["route_map_airports"] == ["ATL", "ATH"]
+    assert result["simplified_route"] == model["simplified_route"] == "ATL–ATH–ATL"
+    assert result["international"] is True
+    assert [(leg["origin"], leg["destination"]) for leg in model["ordered_legs"]] == [("ATL", "ATH"), ("ATH", "ATL")]
+    assert [layover["airport"] for layover in model["layovers"]] == ["ATH"]
+    assert not ({"POS", "BLK", "PWA", "PAY"} & set(result["operating_cities"]))
+    assert not ({"POS", "BLK", "PWA", "PAY"} & {layover["airport"] for layover in model["layovers"]})
+
+    # Metadata membership cannot override the structural source-row context.
+    assert all(is_valid_airport_code(token) for token in ("POS", "BLK", "PWA", "PAY"))
+    diagnostics = [entry for entry in delta.get_diagnostics() if entry.get("token")]
+    for token in ("POS", "BLK", "PWA", "PAY"):
+        rejected = next(entry for entry in diagnostics if entry["token"] == token and entry["result"] == "REJECTED")
+        assert rejected["reason"] == "not_in_validated_flight_leg_origin_destination_position"
+    assert next(entry for entry in diagnostics if entry["token"] == "POS")["context"] == "header field"
+    assert next(entry for entry in diagnostics if entry["token"] == "BLK")["context"] == "column heading"
+    assert next(entry for entry in diagnostics if entry["token"] == "PWA")["context"] == "duty-limit field"
+    assert next(entry for entry in diagnostics if entry["token"] == "PAY")["context"] == "pay heading"
+    assert any(entry["token"] == "ATL" and entry["result"] == "ACCEPTED" for entry in diagnostics)
+    assert any(entry["token"] == "ATH" and entry["result"] == "ACCEPTED" for entry in diagnostics)
+
+    provenance = pairing["airport_event_provenance"]
+    assert model["raw_source_fields"]["airport_event_provenance"] == provenance
+    assert [(event["token"], event["role"]) for event in provenance] == [
+        ("ATL", "origin"), ("ATH", "destination"), ("ATH", "origin"), ("ATL", "destination")
+    ]
+    assert all(event["source_page"] == 1 and event["source_line"] for event in provenance)
+    assert all(event["leg_index"] in {1, 2} and event["duty_day_index"] in {1, 2} for event in provenance)
+
+
+def test_destination_matching_and_frontends_cannot_reintroduce_delta_header_tokens():
+    result = score_pairing(delta.parse(A023)[0], {"prefer_operate": False})
+    decision = evaluate_eligibility(result, {"must_avoid_destinations": ["POS"]})
+    assert decision["eligible"] is True
+    assert detect_airports("POS BLK PWA ATL ATH PAY", {"airline": "delta", "legs": []}) == []
+
+    root = Path(__file__).resolve().parents[1]
+    classic = (root / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    labs = (root / "app" / "static" / "labs.js").read_text(encoding="utf-8")
+    flight_deck = (root / "app" / "static" / "flight-deck.js").read_text(encoding="utf-8")
+    assert "tripModel(item)?.ordered_legs" in classic
+    assert "tripModel(item)?.operating_cities" in classic
+    assert "tripModel(item)?.operating_cities" in labs
+    assert "tripModel(item).simplified_route" in flight_deck
+    for script in (classic, labs, flight_deck):
+        assert "source_text.match" not in script
+        assert "original_display.match" not in script
+
+
+def test_legitimate_delta_flight_to_pos_remains_valid():
+    source = A023.replace("ATL 1600  ATH 0830", "ATL 1600  POS 2030").replace(
+        "ATH 24.00/ATHENS HOTEL", "POS 24.00/PORT OF SPAIN HOTEL"
+    ).replace("ATH 1000  ATL 1500", "POS 1000  ATL 1500")
+    result = score_pairing(delta.parse(source)[0], {"prefer_operate": False})
+    assert result["ordered_operating_airports"] == ["ATL", "POS", "ATL"]
+    assert result["operating_cities"] == ["ATL", "POS"]
+    assert result["simplified_route"] == "ATL–POS–ATL"
+    assert [layover["airport"] for layover in result["canonical_trip"]["layovers"]] == ["POS"]
 
 
 def test_instructional_r523_is_rejected_but_atl_a350_inventory_occurrence_is_accepted(monkeypatch):

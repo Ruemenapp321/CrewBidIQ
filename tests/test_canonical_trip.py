@@ -28,7 +28,8 @@ def test_typed_canonical_schema_contains_required_cross_airline_fields():
     assert {field.name for field in fields(CanonicalTrip)} == {
         "id", "package_id", "airline", "terminology", "base", "fleet", "seat", "bid_month",
         "source_trip_number", "trip_length_days", "calendar_span_days", "duty_period_count",
-        "tafb", "pay_breakdown", "tfp", "ordered_events", "ordered_legs", "duty_days",
+        "tafb", "pay_breakdown", "tfp", "ordered_events", "ordered_legs",
+        "ordered_operating_airports", "operating_cities", "route_map_airports", "simplified_route", "duty_days",
         "layovers", "hotels", "report", "release", "operating_dates", "source_text",
         "source_page", "source_section", "raw_source_fields", "bidable_inventory_confirmed",
         "parser_confidence",
@@ -107,6 +108,10 @@ def test_scoring_and_api_shape_publish_one_canonical_model_with_classic_aliases(
     assert result["id"] == "pkg-american:A200"
     assert result["pairing"] == "A200"
     assert result["ordered_legs"] == model["ordered_legs"]
+    assert result["ordered_operating_airports"] == model["ordered_operating_airports"]
+    assert result["operating_cities"] == model["operating_cities"]
+    assert result["route_map_airports"] == model["route_map_airports"]
+    assert result["simplified_route"] == model["simplified_route"]
     assert result["ordered_events"] == model["ordered_events"]
     assert result["duty_days"] == model["duty_days"]
     assert result["layovers"] == model["layovers"]

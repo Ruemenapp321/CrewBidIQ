@@ -1,5 +1,6 @@
 const labsContent = document.getElementById('labsContent');
 const labsPage = window.CREWBIDIQ_LABS_PAGE || 'landing';
+const flightDeckPreviewEnabled = window.CREWBIDIQ_FLIGHT_DECK_PREVIEW_ENABLED === true;
 const latestJobKey = 'crewbidiqLatestJob';
 const activeJobKey = 'crewbidiqActiveJob';
 const activePackageKey = 'crewbidiqActivePackage';
@@ -52,6 +53,7 @@ function readJson(key, fallback = null) {
 
 function tripModel(item) { return item?.canonical_trip || null; }
 function tripLayovers(item) { return tripModel(item)?.layovers || item?.layovers || []; }
+function tripOperatingCities(item) { return tripModel(item)?.operating_cities || []; }
 function tripPayBreakdown(item) { return tripModel(item)?.pay_breakdown || item?.pay_breakdown || { trip_credit: item?.trip_credit ?? item?.credit, total_pay: item?.total_pay }; }
 function tripTfp(item) { return tripModel(item)?.tfp || item?.tfp || { pairing_tfp: item?.pairing_tfp }; }
 
@@ -166,17 +168,20 @@ function postParseActions() {
   ] : [
     ['/labs/build', 'Describe the Trip You Want'], ['/labs/recommendations', 'Refine Recommendations'], ['/labs/plan', 'Build My Month'], ['/labs/plan', 'What to Enter in NAVBLUE/PBS']
   ];
+  if (flightDeckPreviewEnabled) actions.unshift(['/labs/flight-deck', 'Open Flight Deck Preview']);
   return `<section class="labs-post-parse"><div><span class="kicker">PACKAGE READY</span><h2>Continue with your bid</h2></div><div>${actions.map(([href, label], index) => `<a class="${index === 0 ? 'primary' : 'secondary'} button" href="${href}">${escapeHtml(label)}</a>`).join('')}</div></section>`;
 }
 
 function landingPage() {
   const hasDraft = Boolean(readJson(draftKey));
+  const flightDeckCard = flightDeckPreviewEnabled ? '<a href="/labs/flight-deck" class="labs-action-card flight-deck-entry"><span>FD</span><h2>Flight Deck Preview</h2><p>Scan strict matches, shortlist trips, compare options, and open a focused Trip Briefing.</p><strong>Open Flight Deck Preview</strong></a>' : '';
   return `${pageHeader('CREWBIDIQ LABS', 'Experimental bidding tools', 'Explore a guided path from your parsed bid package to a clear, pilot-ready bid plan.')}
     <section class="labs-beta-notice"><span>Beta</span><p>Labs features are experimental. Review any proposed bid plan before using it with your airline bidding system.</p></section>
     ${packageCard()}
     ${uploadPanel()}
     ${postParseActions()}
     <section class="labs-action-grid">
+      ${flightDeckCard}
       <a href="/labs/build" class="labs-action-card primary-action"><span>01</span><h2>Build My Bid</h2><p>Turn days off, trip shape, layovers, and workload into a guided bid strategy.</p><strong>Start guided builder</strong></a>
       <a href="/labs/recommendations" class="labs-action-card"><span>02</span><h2>Refine Trip Recommendations</h2><p>Review the strongest options from the Classic analysis with less noise.</p><strong>Open recommendations</strong></a>
       <a href="/labs/preview" class="labs-action-card"><span>03</span><h2>View Bid Pool Preview</h2><p>Understand the shape of the airline's bid package before building a plan.</p><strong>View package picture</strong></a>

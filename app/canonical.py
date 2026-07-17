@@ -93,6 +93,10 @@ class CanonicalTrip:
     tfp: dict[str, Any] | None
     ordered_events: list[TripEvent]
     ordered_legs: list[TripLeg]
+    ordered_operating_airports: list[str]
+    operating_cities: list[str]
+    route_map_airports: list[str]
+    simplified_route: str
     duty_days: list[DutyDay]
     layovers: list[Layover]
     hotels: list[dict[str, Any]]
@@ -120,6 +124,10 @@ CANONICAL_ALIAS_FIELDS = {
     "trip_length_days",
     "ordered_events",
     "ordered_legs",
+    "ordered_operating_airports",
+    "operating_cities",
+    "route_map_airports",
+    "simplified_route",
     "duty_days",
     "hotels",
     "pay_breakdown",
@@ -255,6 +263,17 @@ def _trip_legs(record: dict[str, Any]) -> list[TripLeg]:
             destination_timezone=str(leg.get("arrival_local_event_timezone") or leg.get("destination_timezone") or "") or None,
         ))
     return legs
+
+
+def _ordered_operating_airports(legs: list[TripLeg]) -> list[str]:
+    path: list[str] = []
+    for leg in legs:
+        if not leg.origin or not leg.destination:
+            continue
+        if not path or path[-1] != leg.origin:
+            path.append(leg.origin)
+        path.append(leg.destination)
+    return path
 
 
 def _layovers(record: dict[str, Any], legs: list[TripLeg]) -> list[Layover]:
@@ -416,6 +435,8 @@ def canonical_trip_from_record(record: dict[str, Any], package_id: str | None = 
         source_number = "TRIP-" + sha256(source_text.encode("utf-8", errors="ignore")).hexdigest()[:12].upper()
     canonical_id = f"{package}:{source_number}"
     legs = _trip_legs(record)
+    ordered_operating_airports = _ordered_operating_airports(legs)
+    operating_cities = list(dict.fromkeys(ordered_operating_airports))
     layovers = _layovers(record, legs)
     duty_days, ordered_events = _duty_days(record, legs, layovers)
     trip_length = next((value for value in (
@@ -461,6 +482,10 @@ def canonical_trip_from_record(record: dict[str, Any], package_id: str | None = 
         tfp=_tfp(record, airline),
         ordered_events=ordered_events,
         ordered_legs=legs,
+        ordered_operating_airports=ordered_operating_airports,
+        operating_cities=operating_cities,
+        route_map_airports=operating_cities,
+        simplified_route="–".join(ordered_operating_airports),
         duty_days=duty_days,
         layovers=layovers,
         hotels=hotels,
@@ -494,6 +519,10 @@ def attach_canonical_trip(record: dict[str, Any], package_id: str | None = None)
         "duty_period_count": canonical["duty_period_count"],
         "ordered_events": canonical["ordered_events"],
         "ordered_legs": canonical["ordered_legs"],
+        "ordered_operating_airports": canonical["ordered_operating_airports"],
+        "operating_cities": canonical["operating_cities"],
+        "route_map_airports": canonical["route_map_airports"],
+        "simplified_route": canonical["simplified_route"],
         "duty_days": canonical["duty_days"],
         "hotels": canonical["hotels"],
         "pay_breakdown": canonical["pay_breakdown"],

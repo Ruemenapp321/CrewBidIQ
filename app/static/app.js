@@ -171,6 +171,7 @@ function tripLegs(item) {
   return (item?.legs || []).map((leg, index) => ({ sequence_index: index + 1, duty_day_index: leg.duty_day_index, origin: leg.departure, destination: leg.arrival, operating_or_deadhead: leg.deadhead ? 'deadhead' : 'operating', flight_number: leg.flight, equipment: leg.aircraft, local_departure_time: leg.departure_time, local_arrival_time: leg.arrival_time }));
 }
 function tripLayovers(item) { return tripModel(item)?.layovers || item?.layovers || []; }
+function tripOperatingCities(item) { return tripModel(item)?.operating_cities || []; }
 function tripLength(item) { return tripModel(item)?.trip_length_days ?? item?.trip_length_days ?? item?.trip_length; }
 function tripOperatingDates(item) { return tripModel(item)?.operating_dates || item?.operating_dates || item?.dates || []; }
 function tripPay(item) { return tripModel(item)?.pay_breakdown || item?.pay_breakdown || { trip_credit: item?.trip_credit ?? item?.credit, edp: item?.edp, hol: item?.hol, sit: item?.sit, additional_pay: item?.additional_pay, total_pay: item?.total_pay, raw_pay_tokens: item?.raw_pay_tokens || [], unresolved_pay_tokens: item?.unresolved_pay_tokens || [] }; }
@@ -244,6 +245,7 @@ function appendResultCards(items, wrap, term) {
       ...item,
       layovers: normalizedLayovers,
       cities: normalizedLayovers.map(value => value.airport || value.city).filter(Boolean),
+      touched_cities: tripOperatingCities(item),
       trip_length: tripLength(item),
       operating_dates: tripOperatingDates(item),
       tafb: model?.tafb ?? item.tafb,

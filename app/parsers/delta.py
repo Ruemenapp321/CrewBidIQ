@@ -7,14 +7,15 @@ from calendar import monthrange
 from typing import Any
 
 from .base import Leg, Layover, Pairing
+from app.airports import is_valid_airport_code
 from app.pay import parse_delta_pay
 
 
 PAGE_MARKER = re.compile(r"(?m)^<<<CREWBIDIQ_PAGE:(\d+)>>>\s*$")
 HEADER = re.compile(r"(?m)^\s*#([A-Z]?\d{3,5})\b")
 LEG = re.compile(
-    r"^\s*([A-Z])?\s*(DH\s+)?(\d{3,4})?\s+([A-Z]{3})\s+(\d{4})\s+"
-    r"([A-Z]{3})\s+(\d{4})\*?\s+(\d\.\d{2})(.*)$"
+    r"^\s*([A-Z])?\s*(DH\s+)?(\d{1,4})?\s+([A-Z]{3})\s+(\d{4})\s+"
+    r"([A-Z]{3})\s+(\d{4})\*?\s+(\d{1,2}\.\d{2})(.*)$"
 )
 LAYOVER = re.compile(r"(?m)^\s*([A-Z]{3})\s+(\d{1,2}\.\d{2})/([^\n]+?)\s+\d+\.\d{2}/")
 CREDIT = re.compile(r"TOTAL CREDIT\s+(\d{1,2}\.\d{2})TL")
@@ -193,6 +194,141 @@ def get_diagnostics() -> list[dict[str, Any]]:
     return list(LAST_DIAGNOSTICS)
 
 
+def _valid_clock(value: str) -> bool:
+    return bool(re.fullmatch(r"(?:[01]\d|2[0-3])[0-5]\d", value))
+
+
+def _duty_day_index(day: str | None) -> int | None:
+    return ord(day) - ord("A") + 1 if day and re.fullmatch(r"[A-Z]", day) else None
+
+
+def _parse_leg_rows(block: str, page_number: int) -> tuple[list[Leg], list[dict[str, Any]]]:
+    """Parse Delta production rows without scanning arbitrary row tokens."""
+    legs: list[Leg] = []
+    provenance: list[dict[str, Any]] = []
+    current_day: str | None = None
+    for source_line, line in enumerate(block.splitlines(), 1):
+        leg_match = LEG.match(line)
+        if not leg_match:
+            continue
+        if leg_match.group(1):
+            current_day = leg_match.group(1)
+        flight = leg_match.group(3)
+        origin, destination = leg_match.group(4), leg_match.group(6)
+        departure_time, arrival_time = leg_match.group(5), leg_match.group(7)
+        continuation = flight is None
+        structurally_contiguous = bool(legs and legs[-1].arrival == origin)
+        if (
+            current_day is None
+            or (continuation and not structurally_contiguous)
+            or not _valid_clock(departure_time)
+            or not _valid_clock(arrival_time)
+            or not is_valid_airport_code(origin)
+            or not is_valid_airport_code(destination)
+        ):
+            continue
+        rest = leg_match.group(9)
+        equipment = re.search(r"\b(3NE|3N1|3NP|321|320|319|75D|73R|73J|221|223|330|350)\b", rest)
+        leg_index = len(legs) + 1
+        duty_index = _duty_day_index(current_day)
+        legs.append(Leg(
+            day=current_day,
+            deadhead=bool(leg_match.group(2)),
+            flight=flight,
+            departure=origin,
+            departure_time=departure_time,
+            arrival=destination,
+            arrival_time=arrival_time,
+            block=leg_match.group(8),
+            aircraft=equipment.group(1) if equipment else None,
+        ))
+        for role, token in (("origin", origin), ("destination", destination)):
+            provenance.append({
+                "token": token,
+                "source_page": page_number,
+                "source_line": source_line,
+                "source_row": line.rstrip(),
+                "leg_index": leg_index,
+                "duty_day_index": duty_index,
+                "role": role,
+                "validation_result": "accepted",
+                "validation_reason": "validated_flight_leg_position_and_iata_metadata",
+            })
+    return legs, provenance
+
+
+def _validated_layovers(block: str, legs: list[Leg]) -> list[Layover]:
+    duty_order: list[str] = []
+    last_destination: dict[str, str] = {}
+    for leg in legs:
+        day = leg.day or ""
+        if day not in duty_order:
+            duty_order.append(day)
+        last_destination[day] = leg.arrival
+    rest_boundaries = {last_destination[day] for day in duty_order[:-1] if last_destination.get(day)}
+    return [
+        Layover(city=match.group(1), duration=match.group(2), hotel=match.group(3).strip())
+        for match in LAYOVER.finditer(block)
+        if match.group(1) in rest_boundaries and is_valid_airport_code(match.group(1))
+    ]
+
+
+def _diagnose_airport_tokens(
+    rotation: str,
+    block: str,
+    page_number: int,
+    provenance: list[dict[str, Any]],
+) -> None:
+    if os.environ.get("PARSER_DEBUG_ENABLED", "false").lower() != "true":
+        return
+    accepted = {(event["source_line"], event["token"], event["role"]): event for event in provenance}
+    for source_line, line in enumerate(block.splitlines(), 1):
+        for token_match in re.finditer(r"\b[A-Z]{3}\b", line.upper()):
+            token = token_match.group(0)
+            events = [event for (line_no, value, _), event in accepted.items() if line_no == source_line and value == token]
+            if events:
+                for event in events:
+                    LAST_DIAGNOSTICS.append({
+                        "token": token,
+                        "rotation": rotation,
+                        "source_page": page_number,
+                        "source_line": source_line,
+                        "context": f'parsed leg {event["role"]}',
+                        "result": "ACCEPTED",
+                        "reason": "validated_flight_leg_position_and_iata_metadata",
+                        "leg_index": event["leg_index"],
+                        "duty_day_index": event["duty_day_index"],
+                        "role": event["role"],
+                    })
+                continue
+            upper_line = line.upper()
+            if "TOTAL PAY" in upper_line:
+                context = "pay heading"
+            elif PRODUCTION_COLUMNS.search(line):
+                duty_columns = upper_line.find("BLK/MAX")
+                departure_column = upper_line.find("DEPARTS")
+                if duty_columns >= 0 and token_match.start() >= duty_columns:
+                    context = "duty-limit field"
+                elif departure_column >= 0 and token_match.start() < departure_column:
+                    context = "header field"
+                else:
+                    context = "column heading"
+            else:
+                context = "non-flight source row"
+            LAST_DIAGNOSTICS.append({
+                "token": token,
+                "rotation": rotation,
+                "source_page": page_number,
+                "source_line": source_line,
+                "context": context,
+                "result": "REJECTED",
+                "reason": "not_in_validated_flight_leg_origin_destination_position",
+                "leg_index": None,
+                "duty_day_index": None,
+                "role": None,
+            })
+
+
 def parse(text: str) -> list[dict]:
     normalized = text.replace("\r", "\n")
     LAST_DIAGNOSTICS.clear()
@@ -246,22 +382,8 @@ def parse(text: str) -> list[dict]:
             if not accepted:
                 continue
 
-            legs, current_day = [], None
-            for line in block.splitlines():
-                leg_match = LEG.match(line)
-                if not leg_match:
-                    continue
-                if leg_match.group(1):
-                    current_day = leg_match.group(1)
-                rest = leg_match.group(9)
-                equipment = re.search(r"\b(3NE|3N1|3NP|321|320|319|75D|73R|73J|221|223)\b", rest)
-                legs.append(Leg(
-                    day=current_day, deadhead=bool(leg_match.group(2)), flight=leg_match.group(3),
-                    departure=leg_match.group(4), departure_time=leg_match.group(5), arrival=leg_match.group(6),
-                    arrival_time=leg_match.group(7), block=leg_match.group(8),
-                    aircraft=equipment.group(1) if equipment else None,
-                ))
-            layovers = [Layover(city=x.group(1), duration=x.group(2), hotel=x.group(3).strip()) for x in LAYOVER.finditer(block)]
+            legs, airport_event_provenance = _parse_leg_rows(block, page_number)
+            layovers = _validated_layovers(block, legs)
             credit, tafb, checkin = CREDIT.search(block), TAFB.search(block), CHECKIN.search(block)
             operating_dates = _operating_dates(block, bid_month_context)
             result = Pairing(
@@ -271,6 +393,21 @@ def parse(text: str) -> list[dict]:
                 effective=", ".join(operating_dates) or None,
                 parser="delta_master_pairing", confidence=confidence,
             ).to_dict()
+            for leg_index, leg in enumerate(result["legs"], 1):
+                events = [event for event in airport_event_provenance if event["leg_index"] == leg_index]
+                origin = next((event for event in events if event["role"] == "origin"), None)
+                destination = next((event for event in events if event["role"] == "destination"), None)
+                leg.update({
+                    "source_page": page_number,
+                    "source_line": origin["source_line"] if origin else None,
+                    "source_row": origin["source_row"] if origin else None,
+                    "leg_index": leg_index,
+                    "duty_day_index": origin["duty_day_index"] if origin else None,
+                    "origin_validation": origin,
+                    "destination_validation": destination,
+                })
+            for layover in result["layovers"]:
+                layover["validated"] = True
             result.update(parse_delta_pay(block, result["credit"]))
             result.update({
                 "airline": "delta", "package_id": package_id, "source_page": page_number,
@@ -282,6 +419,8 @@ def parse(text: str) -> list[dict]:
                 "operating_dates": operating_dates,
                 "operating_dates_status": "validated" if operating_dates else "unavailable",
                 "bid_month": bid_month_context[0], "bid_year": bid_month_context[1],
+                "airport_event_provenance": airport_event_provenance,
             })
+            _diagnose_airport_tokens(rotation, block, page_number, airport_event_provenance)
             results.append(result)
     return results

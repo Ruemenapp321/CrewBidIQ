@@ -6,4 +6,5 @@ COPY app ./app
 RUN mkdir -p /app/data/uploads
 ENV PORT=10000
 ENV LABS_ENABLED=true
+ENV FLIGHT_DECK_PREVIEW_ENABLED=true
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-10000}"]

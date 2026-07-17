@@ -1,3 +1,4 @@
+import json
 import os
 
 from fastapi import APIRouter, HTTPException
@@ -13,6 +14,10 @@ def labs_enabled() -> bool:
 
 def southwest_line_ranker_enabled() -> bool:
     return os.environ.get("SOUTHWEST_LINE_RANKER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def flight_deck_preview_enabled() -> bool:
+    return os.environ.get("FLIGHT_DECK_PREVIEW_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 LABS_HTML = r"""
@@ -34,6 +39,7 @@ LABS_HTML = r"""
       <a href="/labs/build" class="nav-link" data-labs-route="/labs/build"><span>Build My Bid</span></a>
       <a href="/labs/recommendations" class="nav-link" data-labs-route="/labs/recommendations"><span>Recommendations</span></a>
       <a href="/labs/preview" class="nav-link" data-labs-route="/labs/preview"><span>Bid Pool Preview</span></a>
+      __FLIGHT_DECK_LINK__
       __SOUTHWEST_LINK__
       <a href="/labs/plan" class="nav-link" data-labs-route="/labs/plan"><span>Bid Plan</span></a>
     </nav>
@@ -64,7 +70,7 @@ LABS_HTML = r"""
     </nav>
   </div>
 </div>
-<script>window.CREWBIDIQ_LABS_PAGE = "__LABS_PAGE__";</script>
+<script>window.CREWBIDIQ_LABS_PAGE = "__LABS_PAGE__";window.CREWBIDIQ_FLIGHT_DECK_PREVIEW_ENABLED = __FLIGHT_DECK_ENABLED__;</script>
 <script src="/static/labs.js?v=0425"></script>
 </body>
 </html>
@@ -80,7 +86,70 @@ def labs_page(page: str) -> HTMLResponse:
         '<a href="/labs/southwest" class="nav-link" data-labs-route="/labs/southwest"><span>Southwest Tools</span></a>'
         if southwest_line_ranker_enabled() else ""
     )
-    return HTMLResponse(LABS_HTML.replace("__LABS_PAGE__", page).replace("__SOUTHWEST_LINK__", southwest_link))
+    flight_deck_link = (
+        '<a href="/labs/flight-deck" class="nav-link"><span>Flight Deck Preview</span></a>'
+        if flight_deck_preview_enabled() else ""
+    )
+    return HTMLResponse(
+        LABS_HTML.replace("__LABS_PAGE__", page)
+        .replace("__SOUTHWEST_LINK__", southwest_link)
+        .replace("__FLIGHT_DECK_LINK__", flight_deck_link)
+        .replace("__FLIGHT_DECK_ENABLED__", "true" if flight_deck_preview_enabled() else "false")
+    )
+
+
+FLIGHT_DECK_HTML = r"""
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#071525">
+  <title>Flight Deck Preview | CrewBidIQ</title>
+  <link rel="stylesheet" href="/static/app.css?v=0426">
+</head>
+<body class="labs-body flight-deck-body" data-flight-deck-page="__FLIGHT_DECK_PAGE__">
+<div class="app-shell">
+  <aside class="desktop-sidebar labs-sidebar flight-deck-sidebar">
+    <a class="side-brand" href="/labs/flight-deck"><span class="wing">&#9992;</span><strong>Flight Deck</strong><em>Preview</em></a>
+    <nav aria-label="Flight Deck navigation">
+      <a href="/labs/flight-deck" class="nav-link" data-flight-deck-route="results"><span>Results</span></a>
+      <a href="/labs/flight-deck/shortlist" class="nav-link" data-flight-deck-route="shortlist"><span>Shortlist</span></a>
+      <a href="/labs/flight-deck/compare" class="nav-link" data-flight-deck-route="compare"><span>Compare</span></a>
+    </nav>
+    <a class="labs-return" href="/labs">Back to Labs</a>
+    <div class="side-footer"><a href="/results">CrewBidIQ Classic</a></div>
+  </aside>
+  <div class="app-main">
+    <header class="mobile-header flight-deck-header">
+      <div class="header-identity"><a class="brand-word" href="/labs/flight-deck">Flight Deck</a><span class="beta-badge">Preview</span></div>
+      <div class="header-controls"><a class="text-button button" href="/results">Classic</a><button id="flightDeckTheme" class="round-button" type="button" aria-label="Toggle color theme">◐</button></div>
+    </header>
+    <main id="flightDeckContent" class="flight-deck-main" aria-live="polite">
+      <section class="surface labs-loading"><strong>Opening Flight Deck Preview...</strong></section>
+    </main>
+    <nav class="bottom-nav three flight-deck-bottom-nav" aria-label="Flight Deck navigation">
+      <a href="/labs/flight-deck" data-flight-deck-route="results"><span>R</span>Results</a>
+      <a href="/labs/flight-deck/shortlist" data-flight-deck-route="shortlist"><span>S</span>Shortlist</a>
+      <a href="/labs/flight-deck/compare" data-flight-deck-route="compare"><span>C</span>Compare</a>
+    </nav>
+  </div>
+</div>
+<script>window.CREWBIDIQ_FLIGHT_DECK_PAGE="__FLIGHT_DECK_PAGE__";window.CREWBIDIQ_FLIGHT_DECK_TRIP_ID=__TRIP_ID_JSON__;</script>
+<script src="/static/flight-deck.js?v=0001"></script>
+</body>
+</html>
+"""
+
+
+def flight_deck_page(page: str, trip_id: str = "") -> HTMLResponse:
+    if not labs_enabled() or not flight_deck_preview_enabled():
+        raise HTTPException(404, "Flight Deck Preview is not enabled")
+    return HTMLResponse(
+        FLIGHT_DECK_HTML.replace("__FLIGHT_DECK_PAGE__", page).replace(
+            "__TRIP_ID_JSON__", json.dumps(trip_id).replace("<", "\\u003c")
+        )
+    )
 
 
 @router.get("/labs", response_class=HTMLResponse)
@@ -111,3 +180,23 @@ def labs_plan() -> HTMLResponse:
 @router.get("/labs/southwest", response_class=HTMLResponse)
 def labs_southwest() -> HTMLResponse:
     return labs_page("southwest")
+
+
+@router.get("/labs/flight-deck", response_class=HTMLResponse)
+def flight_deck_results() -> HTMLResponse:
+    return flight_deck_page("results")
+
+
+@router.get("/labs/flight-deck/trip/{trip_id}", response_class=HTMLResponse)
+def flight_deck_trip(trip_id: str) -> HTMLResponse:
+    return flight_deck_page("trip", trip_id)
+
+
+@router.get("/labs/flight-deck/shortlist", response_class=HTMLResponse)
+def flight_deck_shortlist() -> HTMLResponse:
+    return flight_deck_page("shortlist")
+
+
+@router.get("/labs/flight-deck/compare", response_class=HTMLResponse)
+def flight_deck_compare() -> HTMLResponse:
+    return flight_deck_page("compare")
