@@ -18,6 +18,7 @@ let monthPlanJob = null;
 let monthPlanError = '';
 let labsUploadBusy = false;
 let labsUploadController = null;
+let labsStatusController = null;
 let labsUploadError = '';
 let refinedRecommendationsLoading = false;
 let refinedRecommendationsError = '';
@@ -54,7 +55,11 @@ function safeLocalStorageRemoveItem(key) {
 }
 function analysisHeaders() { return { Accept: 'application/json', 'X-CrewBidIQ-Session': browserSessionId() }; }
 function storedAnalysis() { return readJson(analysisStateKey, {}) || {}; }
-function persistAnalysis(body) { safeLocalStorageSetItem(analysisStateKey, JSON.stringify({ ...storedAnalysis(), ...body, progress_percent: Math.max(lastConfirmedProgress, Number(body.progress_percent ?? body.progress ?? 0)) })); }
+function lightweightAnalysis(body = {}) {
+  const keys = ['job_id', 'package_id', 'filename', 'airline', 'status', 'state', 'current_stage', 'stage_label', 'progress', 'progress_percent', 'message', 'user_message', 'error', 'error_code', 'created_at', 'updated_at', 'last_successful_poll_at', 'retry_count', 'recoverable', 'package_persisted'];
+  return Object.fromEntries(keys.filter(key => body[key] !== undefined).map(key => [key, body[key]]));
+}
+function persistAnalysis(body) { const next = { ...lightweightAnalysis(storedAnalysis()), ...lightweightAnalysis(body), progress_percent: Math.max(lastConfirmedProgress, Number(body.progress_percent ?? body.progress ?? 0)) }; safeLocalStorageSetItem(analysisStateKey, JSON.stringify(next)); }
 function analysisErrorDetail(body, fallback) { const detail = body?.detail || body || {}; return typeof detail === 'string' ? { user_message: detail } : { ...detail, user_message: detail.user_message || fallback }; }
 
 const packageStateKeys = ['crewbidiqShortlist', 'crewbidiqComparison', 'crewbidiqPbsPool', 'crewbidiqCommuteAssessments', 'crewbidiqExports'];
@@ -765,15 +770,16 @@ function scheduleSharedPoll(delay = 2000) { clearTimeout(sessionPollTimer); sess
 async function fetchSharedJob() {
   const jobId = currentJobId(), packageId = activePackageId();
   if (!jobId || !packageId) throw Object.assign(new Error('No recoverable analysis reference exists.'), { status: 400, detail: { error_code: 'PACKAGE_NOT_PERSISTED' } });
-  const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 12000);
+  labsStatusController?.abort();
+  const controller = new AbortController(); labsStatusController = controller; const timeout = setTimeout(() => controller.abort(), 12000);
   try {
-    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}?package_id=${encodeURIComponent(packageId)}`, { headers: analysisHeaders(), signal: controller.signal });
+    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}?package_id=${encodeURIComponent(packageId)}&include_results=false`, { headers: analysisHeaders(), signal: controller.signal });
     latestStatusCode = response.status;
     const text = await response.text(); let body = {}; try { body = text ? JSON.parse(text) : {}; } catch (_) {}
     if (!response.ok) { const detail = analysisErrorDetail(body, 'Stored analysis is unavailable.'); throw Object.assign(new Error(detail.user_message), { status: response.status, detail }); }
     if (body.job_id !== jobId || body.package_id !== packageId) throw Object.assign(new Error('The stored job belongs to another bid package.'), { status: 409, detail: { error_code: 'JOB_PACKAGE_MISMATCH' } });
     return body;
-  } finally { clearTimeout(timeout); }
+  } finally { clearTimeout(timeout); if (labsStatusController === controller) labsStatusController = null; }
 }
 function applySharedJob(body) {
   const jobId = body.job_id, state = sharedJobState(body);
@@ -863,6 +869,7 @@ async function resumeSharedAnalysis() {
     const body = await fetchSharedJob(), state = sharedJobState(body);
     if ((state === 'failed' || state === 'expired') && body.package_persisted && body.recoverable) await restartSharedAnalysis(); else applySharedJob(body);
   } catch (error) {
+    if (error.name === 'AbortError') return;
     if (error.status === 404 || error.status === 410) { try { await restartSharedAnalysis(); } catch (restartError) { handleSharedFailure(restartError); } }
     else handleSharedFailure(error);
   } finally { sessionResumeInFlight = false; const currentButton = document.getElementById('labsResumeAnalysis'); if (currentButton) { currentButton.disabled = false; currentButton.textContent = 'Resume analysis'; } }
@@ -916,7 +923,7 @@ async function loadSharedSession() {
   if (!jobId) { sessionLoading = false; render(); return; }
   sessionPollInFlight = true;
   try { applySharedJob(await fetchSharedJob()); }
-  catch (error) { handleSharedFailure(error); }
+  catch (error) { if (error.name !== 'AbortError') handleSharedFailure(error); }
   finally { sessionPollInFlight = false; }
 }
 
@@ -924,5 +931,16 @@ document.documentElement.dataset.theme = 'dark';
 render();
 loadSharedSession();
 window.addEventListener('online', () => { if (currentJobId()) resumeSharedAnalysis(); });
-window.addEventListener('pageshow', () => { if (currentJobId()) resumeSharedAnalysis(); });
+window.addEventListener('pageshow', event => {
+  if (!currentJobId()) return;
+  if (event.persisted) { sessionLoading = true; render(); loadSharedSession(); }
+  else resumeSharedAnalysis();
+});
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && currentJobId()) resumeSharedAnalysis(); });
+window.addEventListener('pagehide', event => {
+  if (!event.persisted) return;
+  clearTimeout(sessionPollTimer); labsStatusController?.abort(); labsStatusController = null; labsUploadController?.abort(); labsUploadController = null;
+  sessionPollInFlight = false; sessionResumeInFlight = false;
+  sessionJob = null; navbluePlan = null; monthPlan = null; tripIntentResult = null;
+  labsContent.replaceChildren();
+});

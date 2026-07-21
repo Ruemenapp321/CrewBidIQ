@@ -209,6 +209,49 @@ def test_client_recovery_is_bounded_refreshable_and_safari_aware():
     assert "analysis-debug" in css
 
 
+def test_completed_status_can_omit_large_results_but_keep_package_summary():
+    job_id = "lightweight-status-test"
+    source = {
+        "kind": "pairings",
+        "parser_name": "delta",
+        "synopsis": {"total": 2, "start_airports": [{"airport": "ATL", "count": 2, "percent": 100}]},
+        "package_diagnostics": {"recommendation_output_count": 2},
+    }
+    results = [{"pairing": "1001"}, {"pairing": "1002"}]
+    with TestClient(main.app) as client:
+        with main.db() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO jobs
+                   (id,filename,status,progress,results_json,airline,source_json,state,current_stage)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (job_id, "ATL AUG 2026.pdf", "complete", 100, json.dumps(results), "delta", json.dumps(source), "completed", "ready"),
+            )
+        response = client.get(f"/api/jobs/{job_id}", params={"include_results": "false"})
+        with main.db() as conn:
+            conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "results" not in body
+    assert body["synopsis"] == source["synopsis"]
+    assert body["package"]["parsed_count"] == 2
+
+
+def test_clients_persist_only_lightweight_state_and_release_bfcache_resources():
+    classic = Path("app/static/app.js").read_text(encoding="utf-8")
+    labs = Path("app/static/labs.js").read_text(encoding="utf-8")
+    flight_deck = Path("app/static/flight-deck.js").read_text(encoding="utf-8")
+
+    assert "lightweightAnalysisState" in classic
+    assert "lightweightAnalysis" in labs
+    assert "include_results=false" in labs
+    for script in (classic, labs, flight_deck):
+        assert "addEventListener('pagehide'" in script
+        assert "event.persisted" in script
+        assert "AbortController" in script
+    assert "flightDeckMap.remove()" in flight_deck
+
+
 def test_classic_labs_and_demo_remain_isolated_on_the_shared_job_model():
     classic = Path("app/static/app.js").read_text(encoding="utf-8")
     labs = Path("app/static/labs.js").read_text(encoding="utf-8")

@@ -17,6 +17,9 @@ let selectedMapDay = 'all';
 let flightDeckMap = null;
 let flightDeckMapLayers = null;
 let renderedBriefingModels = [];
+let sharedSessionController = null;
+let sharedSessionTimer = null;
+let sharedSessionInFlight = false;
 let filterState = {
   exactOnly: false,
   oneDay: false,
@@ -1120,20 +1123,27 @@ function bindControls() {
 }
 
 async function loadSharedSession() {
+  if (sharedSessionInFlight) return;
   const jobId = currentJobId();
   if (!jobId) { sessionJob = null; sessionLoading = false; sessionError = ''; render(); return; }
+  sharedSessionInFlight = true;
+  sharedSessionController?.abort();
+  const controller = new AbortController(); sharedSessionController = controller;
   try {
     // Legacy contract reference: fetch(`/api/jobs/${encodeURIComponent(jobId)}`)
     // The active request additionally proves package and browser-session identity.
     const packageId = activePackageId();
-    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}?package_id=${encodeURIComponent(packageId || '')}`, { headers: { Accept: 'application/json', 'X-CrewBidIQ-Session': browserSessionId() } });
+    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}?package_id=${encodeURIComponent(packageId || '')}`, { headers: { Accept: 'application/json', 'X-CrewBidIQ-Session': browserSessionId() }, signal: controller.signal });
     if (!response.ok) throw new Error('The active package could not be loaded.');
     const body = await response.json();
     acceptPackageResponse(body);
     sessionJob = body; sessionError = ''; sessionLoading = false; render();
-    if (body.status === 'queued' || body.status === 'processing') setTimeout(loadSharedSession, 2000);
+    if (body.status === 'queued' || body.status === 'processing') { clearTimeout(sharedSessionTimer); sharedSessionTimer = setTimeout(loadSharedSession, 2000); }
   } catch (error) {
-    sessionLoading = false; sessionError = error.message || 'The active package could not be loaded.'; render();
+    if (error.name !== 'AbortError') { sessionLoading = false; sessionError = error.message || 'The active package could not be loaded.'; render(); }
+  } finally {
+    if (sharedSessionController === controller) sharedSessionController = null;
+    sharedSessionInFlight = false;
   }
 }
 
@@ -1162,6 +1172,18 @@ window.addEventListener('storage', event => {
     selectedMapDay = 'all';
   }
   sessionJob = null; sessionLoading = true; sessionError = ''; render(); loadSharedSession();
+});
+
+window.addEventListener('pagehide', event => {
+  if (!event.persisted) return;
+  clearTimeout(sharedSessionTimer); sharedSessionController?.abort(); sharedSessionController = null; sharedSessionInFlight = false;
+  if (flightDeckMap) flightDeckMap.remove();
+  flightDeckMap = null; flightDeckMapLayers = null; renderedBriefingModels = []; sessionJob = null;
+  flightDeckContent.replaceChildren();
+});
+window.addEventListener('pageshow', event => {
+  if (!event.persisted) return;
+  sessionLoading = true; sessionError = ''; render(); loadSharedSession();
 });
 
 applyTheme();

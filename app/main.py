@@ -2572,7 +2572,7 @@ def paginated_recommendation_payload(
     }
 
 
-def job_status_payload(row: sqlite3.Row) -> dict[str, Any]:
+def job_status_payload(row: sqlite3.Row, *, include_results: bool = True) -> dict[str, Any]:
     package_id = row_package_id(row)
     state = job_state(row)
     persisted = package_is_recoverable(package_id)
@@ -2599,28 +2599,43 @@ def job_status_payload(row: sqlite3.Row) -> dict[str, Any]:
         **job_progress_payload(row),
     }
     if row["status"] == "complete":
-        payload["results"] = json.loads(row["results_json"] or "[]")
         source = json.loads(row["source_json"] or "{}")
-        if row["package_id"]:
-            package_records(payload["results"], package_id)
-        payload["recommendation_page"] = paginated_recommendation_payload(
-            row,
-            package_id=package_id,
-            limit=50,
-            offset=0,
-            match_class=None,
-            sort="rank",
-        )
+        results: list[dict[str, Any]] = []
+        if include_results:
+            results = json.loads(row["results_json"] or "[]")
+            if row["package_id"]:
+                package_records(results, package_id)
+            payload["results"] = results
+            payload["recommendation_page"] = paginated_recommendation_payload(
+                row,
+                package_id=package_id,
+                limit=50,
+                offset=0,
+                match_class=None,
+                sort="rank",
+            )
         payload["performance"] = json.loads(row["performance_json"] or "{}")
         payload["synopsis"] = source.get("synopsis") or build_bid_synopsis(source_pairings(source))
-        payload["package"] = job_package_metadata(row, payload["results"], source)
+        payload["package"] = job_package_metadata(row, results, source)
+        if not include_results:
+            diagnostics = source.get("package_diagnostics") or {}
+            payload["package"]["parsed_count"] = int(
+                diagnostics.get("recommendation_output_count")
+                or payload["synopsis"].get("total")
+                or 0
+            )
         if os.environ.get("PACKAGE_DEBUG_ENABLED", "false").lower() == "true":
             payload["package_diagnostics"] = source.get("package_diagnostics") or {}
     return payload
 
 
 @app.get("/api/jobs/{job_id}")
-def job_status(job_id: str, request: Request, package_id: str | None = None):
+def job_status(
+    job_id: str,
+    request: Request,
+    package_id: str | None = None,
+    include_results: bool = True,
+):
     row = get_job(job_id)
     if not row:
         raise analysis_error(404, "JOB_NOT_FOUND", job_id=job_id, package_id=package_id)
@@ -2642,7 +2657,7 @@ def job_status(job_id: str, request: Request, package_id: str | None = None):
         conn.execute("UPDATE jobs SET last_successful_poll_at=? WHERE id=?", (polled_at, job_id))
     row = get_job(job_id)
     analysis_log("status_polled", row)
-    return job_status_payload(row)
+    return job_status_payload(row, include_results=include_results)
 
 
 @app.get("/api/jobs/{job_id}/recommendations")
@@ -2792,7 +2807,7 @@ def resume_package_analysis(
         background_tasks.add_task(
             run_job_once, new_job_id, paths, json.loads(package["profile_json"] or "{}"), package["airline"],
         )
-    return {**job_status_payload(row), "replacement_created": created}
+    return {**job_status_payload(row, include_results=False), "replacement_created": created}
 
 
 @app.post("/api/jobs/{job_id}/rescore")
