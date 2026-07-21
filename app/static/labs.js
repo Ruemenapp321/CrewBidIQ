@@ -1,6 +1,8 @@
 const labsContent = document.getElementById('labsContent');
 // Legacy reference retained for regression checks: localStorage.removeItem(latestJobKey)
 const labsPage = window.CREWBIDIQ_LABS_PAGE || 'landing';
+const routeBidPackageId = String(window.CREWBIDIQ_BID_PACKAGE_ID || '').trim();
+let routePackageRejected = false;
 const flightDeckPreviewEnabled = window.CREWBIDIQ_FLIGHT_DECK_PREVIEW_ENABLED === true;
 const latestJobKey = 'crewbidiqLatestJob';
 const activeJobKey = 'crewbidiqActiveJob';
@@ -30,6 +32,15 @@ let sessionPollTimer = null;
 let sessionPollFailures = 0;
 let sessionPollInFlight = false;
 let sessionResumeInFlight = false;
+let dashboardRecommendations = null;
+let dashboardRecommendationsJob = null;
+let dashboardRecommendationsLoading = false;
+let dashboardRecommendationsError = '';
+let dashboardRecommendationsController = null;
+let dashboardSourceController = null;
+let dashboardMap = null;
+let dashboardMapLayers = null;
+let pageLifecycleSuspended = false;
 let lastConfirmedProgress = Number(readJson(analysisStateKey, {})?.progress_percent || 0);
 let latestStatusCode = null;
 function browserSessionId() {
@@ -63,7 +74,7 @@ function persistAnalysis(body) { const next = { ...lightweightAnalysis(storedAna
 function analysisErrorDetail(body, fallback) { const detail = body?.detail || body || {}; return typeof detail === 'string' ? { user_message: detail } : { ...detail, user_message: detail.user_message || fallback }; }
 
 const packageStateKeys = ['crewbidiqShortlist', 'crewbidiqComparison', 'crewbidiqPbsPool', 'crewbidiqCommuteAssessments', 'crewbidiqExports'];
-function activePackageId() { return localStorage.getItem(activePackageKey); }
+function activePackageId() { return (routeBidPackageId && !routePackageRejected) ? routeBidPackageId : localStorage.getItem(activePackageKey); }
 function invalidatePackageState(nextPackageId) {
   packageStateKeys.forEach(key => safeLocalStorageRemoveItem(key));
   const draft = readJson(draftKey, {}) || {};
@@ -132,6 +143,8 @@ function formatParsedTime(value) {
 
 function currentJobId() {
   const record = storedAnalysis(), packageId = activePackageId(); let activeId = localStorage.getItem(activeJobKey);
+  const storedPackageId = localStorage.getItem(activePackageKey);
+  if (routeBidPackageId && !routePackageRejected && storedPackageId !== routeBidPackageId && record.package_id !== routeBidPackageId) return null;
   if (record.job_id && record.package_id === packageId) return record.job_id;
   if (record.job_id && record.package_id !== packageId) { safeLocalStorageRemoveItem(activeJobKey); safeLocalStorageRemoveItem(analysisStateKey); activeId = null; }
   if (activeId && packageId) return activeId;
@@ -255,6 +268,286 @@ function postParseActions() {
   ];
   if (flightDeckPreviewEnabled) actions.unshift(['/labs/flight-deck', 'Open Flight Deck Preview']);
   return `<section class="labs-post-parse"><div><span class="kicker">PACKAGE READY</span><h2>Continue with your bid</h2></div><div>${actions.map(([href, label], index) => `<a class="${index === 0 ? 'primary' : 'secondary'} button" href="${href}">${escapeHtml(label)}</a>`).join('')}</div></section>`;
+}
+
+const dashboardIconPaths = {
+  package: '<path d="M4 5.5A2.5 2.5 0 0 1 6.5 3h7L20 9.5v9A2.5 2.5 0 0 1 17.5 21h-11A2.5 2.5 0 0 1 4 18.5z"/><path d="M13 3v7h7M8 14h8M8 17h6"/>',
+  pin: '<path d="M20 10c0 5-8 11-8 11S4 15 4 10a8 8 0 1 1 16 0Z"/><circle cx="12" cy="10" r="2.5"/>',
+  shield: '<path d="M12 3 4.5 6v5.5c0 4.6 3.2 8.4 7.5 9.5 4.3-1.1 7.5-4.9 7.5-9.5V6z"/><path d="m9 12 2 2 4-4"/>',
+  outlook: '<path d="M4 19V9m5 10V5m5 14v-7m5 7V3"/>',
+  source: '<path d="M6 3h9l4 4v14H6z"/><path d="M15 3v5h5M9 12h7M9 16h7"/>',
+  spark: '<path d="m12 3 1.4 4.1L17.5 8.5l-4.1 1.4L12 14l-1.4-4.1-4.1-1.4 4.1-1.4zM18.5 15l.7 2.3 2.3.7-2.3.7-.7 2.3-.7-2.3-2.3-.7 2.3-.7z"/>',
+};
+
+function dashboardIcon(name) {
+  return `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${dashboardIconPaths[name] || dashboardIconPaths.package}</svg>`;
+}
+
+function packageLabsPath(packageId = activePackageId()) {
+  return packageId ? `/bid-packages/${encodeURIComponent(packageId)}/labs` : '/labs';
+}
+
+function dashboardStatus() {
+  const state = sharedJobState(sessionJob || {});
+  if (sessionJob?.status === 'complete' || state === 'completed') return ['ready', 'Analysis ready'];
+  if (state === 'failed' || state === 'expired' || state === 'cancelled') return ['attention', 'Needs attention'];
+  if (state === 'reconnecting') return ['processing', 'Reconnecting'];
+  return ['processing', sessionJob?.stage_label || 'Processing package'];
+}
+
+function dashboardHeader() {
+  const packageId = activePackageId();
+  const metadata = sessionJob?.package || {};
+  const [tone, status] = dashboardStatus();
+  const filename = metadata.filename || sessionJob?.filename || 'Bid package analysis';
+  return `<header class="command-header">
+    <div class="command-breadcrumb"><a href="/">Bid packages</a><span>/</span><span>${packageId ? escapeHtml(packageId.slice(0, 8)) : 'No active package'}</span><span>/</span><strong>Labs</strong></div>
+    <div class="command-title-row"><div><span class="kicker">ACTIVE BID PACKAGE</span><h1>${escapeHtml(filename)}</h1><p>${escapeHtml(airlineName(metadata.airline || sessionJob?.airline))} · ${escapeHtml(metadata.bid_month || inferredBidMonth(filename))}</p></div>
+      <div class="command-actions"><span class="command-status ${tone}"><i></i>${escapeHtml(status)}</span><a class="text-button button" href="/results">Classic results</a>${packageId ? '<button id="dashboardStartOver" class="text-button" type="button">Change package</button>' : ''}</div>
+    </div>
+  </header>`;
+}
+
+function analysisPhaseStrip() {
+  const stage = resolveStage(sessionJob || {});
+  const stageIndex = processingStageIndex.get(stage) ?? 0;
+  const complete = sessionJob?.status === 'complete';
+  const groups = [
+    ['Package received', 0, 'Upload stored'],
+    ['Source extraction', 4, 'Pages and records'],
+    ['Requirements analysis', 6, 'Normalize and rank'],
+    ['Briefing ready', 7, 'Operational review'],
+  ];
+  return `<section class="command-phases" aria-label="Analysis phases">${groups.map(([label, index, detail], groupIndex) => {
+    const done = complete || stageIndex > index;
+    const active = !complete && stageIndex >= index && (groupIndex === groups.length - 1 || stageIndex < groups[groupIndex + 1][1]);
+    return `<div class="command-phase ${done ? 'done' : ''} ${active ? 'active' : ''}" ${active ? 'aria-current="step"' : ''}><span>${done ? '✓' : groupIndex + 1}</span><div><strong>${label}</strong><small>${active ? escapeHtml(sessionJob?.stage_label || detail) : detail}</small></div></div>`;
+  }).join('')}</section>`;
+}
+
+function metricValue(value, suffix = '') {
+  return value === null || value === undefined || value === '' ? '<span class="metric-unavailable">Not available</span>' : `${escapeHtml(value)}${escapeHtml(suffix)}`;
+}
+
+function dashboardMetrics() {
+  const synopsis = sessionJob?.synopsis || {};
+  const total = Number(synopsis.total || sessionJob?.package?.parsed_count || 0);
+  const complete = Number(synopsis.complete || 0);
+  const coverage = total ? Math.round((complete / total) * 100) : null;
+  const startCount = (synopsis.start_airports || []).length || null;
+  const overnightCount = synopsis.overnight_city_count ?? null;
+  return `<section class="command-metrics" aria-label="Package metrics">
+    <article><span>Parsed inventory</span><strong>${metricValue(total || null)}</strong><small>${escapeHtml(sessionJob?.package?.record_label || 'records')}</small></article>
+    <article><span>Structured coverage</span><strong>${metricValue(coverage, coverage === null ? '' : '%')}</strong><small>${coverage === null ? 'No coverage signal' : `${complete} of ${total} records`}</small></article>
+    <article><span>Bid locations</span><strong>${metricValue(startCount)}</strong><small>Detected start airports</small></article>
+    <article><span>Overnight network</span><strong>${metricValue(overnightCount)}</strong><small>Distinct destinations</small></article>
+  </section>`;
+}
+
+function briefingCopy() {
+  const synopsis = sessionJob?.synopsis || {};
+  const total = Number(synopsis.total || sessionJob?.package?.parsed_count || 0);
+  const starts = (synopsis.start_airports || []).slice(0, 3).map(item => item.airport).filter(Boolean);
+  const layovers = (synopsis.layover_cities || []).slice(0, 3).map(item => item.city).filter(Boolean);
+  const sentences = [];
+  if (total) sentences.push(`CrewBidIQ parsed ${total} unique ${sessionJob?.package?.record_label || 'records'} from this package.`);
+  if (starts.length) sentences.push(`Most published trips begin at ${starts.join(', ')}.`);
+  if (layovers.length) sentences.push(`The most frequent overnight markets are ${layovers.join(', ')}.`);
+  if (synopsis.incomplete) sentences.push(`${synopsis.incomplete} source record${synopsis.incomplete === 1 ? '' : 's'} need manual validation before bid submission.`);
+  return sentences.length ? sentences.join(' ') : 'The package is connected, but there is not enough structured content to generate a reliable briefing yet.';
+}
+
+function dashboardBriefing() {
+  const metadata = sessionJob?.package || {};
+  return `<section class="command-card command-briefing"><div class="command-card-heading"><span class="command-icon">${dashboardIcon('spark')}</span><div><span class="kicker">CREWBIDIQ BRIEFING</span><h2>Package at a glance</h2></div><span class="data-badge">Data-derived</span></div>
+    <p class="briefing-lead">${escapeHtml(briefingCopy())}</p>
+    <dl class="briefing-facts"><div><dt>Package type</dt><dd>${metricValue(metadata.package_type)}</dd></div><div><dt>Base</dt><dd>${metricValue(metadata.base)}</dd></div><div><dt>Fleet / category</dt><dd>${metricValue(metadata.fleet_category)}</dd></div><div><dt>Last analyzed</dt><dd>${escapeHtml(formatParsedTime(metadata.last_parsed_at))}</dd></div></dl>
+  </section>`;
+}
+
+function dashboardFindings() {
+  const synopsis = sessionJob?.synopsis || {};
+  const findings = [
+    { tone: Number(synopsis.incomplete || 0) ? 'high' : 'clear', label: 'Source completeness', value: Number(synopsis.incomplete || 0) ? `${synopsis.incomplete} incomplete record${synopsis.incomplete === 1 ? '' : 's'}` : 'No incomplete records detected', detail: 'Validate incomplete records against the normalized source evidence.' },
+    { tone: Number(synopsis.redeye?.count || 0) ? 'medium' : 'clear', label: 'WOCL exposure', value: synopsis.redeye ? `${synopsis.redeye.count || 0} trips · ${synopsis.redeye.percent || 0}%` : 'Not available', detail: 'Departures between 02:00 and 05:59 local are flagged for fatigue review.' },
+    { tone: Number(synopsis.deadhead?.count || 0) ? 'medium' : 'clear', label: 'Deadhead exposure', value: synopsis.deadhead ? `${synopsis.deadhead.count || 0} trips · ${synopsis.deadhead.percent || 0}%` : 'Not available', detail: 'Trips containing deadhead segments may change commute and duty tradeoffs.' },
+  ];
+  return `<section id="risk-findings" class="command-card command-findings"><div class="command-card-heading"><span class="command-icon">${dashboardIcon('shield')}</span><div><span class="kicker">RISK & COMPLIANCE SIGNALS</span><h2>Findings requiring review</h2></div></div>
+    <div class="finding-list">${findings.map(item => `<article><i class="finding-tone ${item.tone}"></i><div><span>${escapeHtml(item.label)}</span><strong>${escapeHtml(item.value)}</strong><p>${escapeHtml(item.detail)}</p></div></article>`).join('')}</div>
+  </section>`;
+}
+
+function dashboardOutlook() {
+  const results = dashboardRecommendations?.results || [];
+  const holdSignals = results.map(item => String(item.hold_likelihood || '')).filter(value => value && !/insufficient/i.test(value));
+  const likely = holdSignals.filter(value => /likely|high|strong/i.test(value)).length;
+  const label = !holdSignals.length ? 'Not estimated' : likely > holdSignals.length / 2 ? 'Favorable signal' : likely ? 'Mixed signal' : 'Limited signal';
+  const counts = dashboardRecommendations?.counts || {};
+  const highFit = Number(counts.exact || 0) + Number(counts.strong || 0);
+  const total = Number(dashboardRecommendations?.total_count || 0);
+  const width = total ? Math.min(100, Math.round((highFit / total) * 100)) : 0;
+  return `<section id="win-outlook" class="command-card command-outlook"><div class="command-card-heading"><span class="command-icon">${dashboardIcon('outlook')}</span><div><span class="kicker">WIN OUTLOOK</span><h2>${escapeHtml(label)}</h2></div></div>
+    <div class="outlook-meter" role="img" aria-label="${highFit} of ${total} recommendations are exact or strong matches"><i style="width:${width}%"></i></div>
+    <div class="outlook-numbers"><strong>${total ? `${highFit} of ${total}` : '—'}</strong><span>exact or strong package matches</span></div>
+    <p>${holdSignals.length ? `${likely} of ${holdSignals.length} reviewed options carry a favorable hold signal.` : 'Add seniority and category context to estimate the likelihood of holding recommended trips. No probability is inferred without that data.'}</p>
+  </section>`;
+}
+
+function dashboardStrategy() {
+  const synopsis = sessionJob?.synopsis || {};
+  const counts = dashboardRecommendations?.counts || {};
+  const actions = [];
+  const highFit = Number(counts.exact || 0) + Number(counts.strong || 0);
+  if (highFit) actions.push([`${highFit} high-fit options`, 'Coordinate shortlist review before converting these results into bid order.']);
+  if (Number(synopsis.incomplete || 0)) actions.push(['Source validation', `Assign review for ${synopsis.incomplete} incomplete source record${synopsis.incomplete === 1 ? '' : 's'}.`]);
+  if (Number(synopsis.redeye?.count || 0)) actions.push(['Fatigue review', `Review ${synopsis.redeye.count} WOCL-exposed trips before selection.`]);
+  return `<section class="command-card command-strategy"><div class="command-card-heading"><span class="command-icon">${dashboardIcon('package')}</span><div><span class="kicker">TEAMING & STRATEGY</span><h2>Recommended next actions</h2></div></div>${actions.length ? `<ol>${actions.map(([title, detail], index) => `<li><span>${index + 1}</span><div><strong>${escapeHtml(title)}</strong><p>${escapeHtml(detail)}</p></div></li>`).join('')}</ol>` : '<div class="partial-state"><strong>No data-backed actions yet</strong><p>Recommendations will appear when package analysis and source signals are available.</p></div>'}<div class="teaming-note"><strong>Teaming entities</strong><span>No prime, partner, or subcontractor records were detected in this package.</span></div></section>`;
+}
+
+function dashboardLocationRows() {
+  const synopsis = sessionJob?.synopsis || {};
+  const rows = [];
+  (synopsis.start_airports || []).forEach(item => rows.push({ code: item.airport, role: 'Bid base', count: item.count, percent: item.percent }));
+  (synopsis.layover_cities || []).forEach(item => {
+    if (!rows.some(row => row.code === item.city)) rows.push({ code: item.city, role: 'Overnight', count: item.count, percent: item.percent });
+  });
+  return rows.filter(item => item.code).slice(0, 12);
+}
+
+function dashboardLocations() {
+  const rows = dashboardLocationRows();
+  return `<section id="locations" class="command-card command-locations"><div class="command-card-heading"><span class="command-icon">${dashboardIcon('pin')}</span><div><span class="kicker">BID LOCATIONS</span><h2>Package network</h2></div><span class="data-badge">${rows.length ? `${rows.length} detected` : 'Partial data'}</span></div>
+    <div class="location-layout"><div id="dashboardMap" class="command-map" aria-label="Detected bid locations map">${rows.length ? '' : '<div class="map-empty">No geocoded locations were detected.</div>'}</div><div class="location-table" role="table" aria-label="Detected package locations"><div role="row" class="location-table-head"><span role="columnheader">Location</span><span role="columnheader">Relationship</span><span role="columnheader">Records</span></div>${rows.length ? rows.map(item => `<div role="row"><strong role="cell">${escapeHtml(item.code)}</strong><span role="cell">${escapeHtml(item.role)}</span><span role="cell">${escapeHtml(item.count ?? '—')}</span></div>`).join('') : '<p class="partial-copy">Location records are unavailable for this package.</p>'}</div></div>
+  </section>`;
+}
+
+function sourceLabel(item) {
+  const page = item.source_page ? `Page ${item.source_page}` : 'Page not recorded';
+  return `${page} · ${item.source_section || 'Normalized inventory'}`;
+}
+
+function sourceRecordTitle(item, fallback = 'Package evidence') {
+  const label = [item.display_label, item.trip_identifier].filter(Boolean).join(' ');
+  return label || item.trip_identifier || fallback;
+}
+
+function dashboardSources() {
+  const records = dashboardRecommendations?.results || [];
+  return `<section id="source-records" class="command-card command-sources"><div class="command-card-heading"><span class="command-icon">${dashboardIcon('source')}</span><div><span class="kicker">SOURCE NAVIGATION</span><h2>Supporting package records</h2></div><span class="data-badge">${records.length ? `${records.length} indexed` : 'Unavailable'}</span></div>
+    ${dashboardRecommendationsLoading ? '<div class="source-loading"><i></i><span>Indexing source records…</span></div>' : dashboardRecommendationsError ? `<div class="partial-state"><strong>Source index unavailable</strong><p>${escapeHtml(dashboardRecommendationsError)}</p></div>` : records.length ? `<div class="source-list">${records.slice(0, 8).map((item, index) => `<button type="button" data-source-index="${index}"><span><strong>${escapeHtml(sourceRecordTitle(item, `Record ${index + 1}`))}</strong><small>${escapeHtml(sourceLabel(item))}</small></span><span>${escapeHtml(item.simplified_route || item.layover_summary || 'Open record')} →</span></button>`).join('')}</div>` : '<div class="partial-state"><strong>No source records indexed</strong><p>Source navigation will appear after recommendation records are ready.</p></div>'}
+    <p class="source-retention-note">The uploaded file is removed after parsing. CrewBidIQ retains the normalized source record and page reference for review.</p>
+  </section>`;
+}
+
+function sourceDrawer() {
+  return `<div id="sourceDrawerBackdrop" class="source-drawer-backdrop hidden"></div><aside id="sourceDrawer" class="source-drawer hidden" role="dialog" aria-modal="true" aria-labelledby="sourceDrawerTitle" aria-hidden="true"><header><div><span class="kicker">SOURCE RECORD</span><h2 id="sourceDrawerTitle">Package evidence</h2></div><button id="closeSourceDrawer" type="button" aria-label="Close source record">×</button></header><div id="sourceDrawerBody" class="source-drawer-body"></div></aside>`;
+}
+
+function analysisDashboardPage() {
+  if (sessionLoading) return `${dashboardHeader()}${analysisPhaseStrip()}<section class="dashboard-skeleton" aria-label="Loading package dashboard"><i></i><div></div><div></div><div></div></section>`;
+  if (!sessionJob) return `${dashboardHeader()}<section class="command-empty"><span class="command-icon">${dashboardIcon('package')}</span><div><span class="kicker">NO ACTIVE PACKAGE</span><h1>Select one package to open Labs</h1><p>Upload once in CrewBidIQ or return to an existing package-scoped Labs link. A valid package is reused by ID and is never uploaded twice.</p></div></section>${uploadPanel()}`;
+  const ready = sessionJob.status === 'complete';
+  if (!ready) return `${dashboardHeader()}${analysisPhaseStrip()}${dashboardMetrics()}${uploadProgressPanel()}${sourceDrawer()}`;
+  return `${dashboardHeader()}${analysisPhaseStrip()}${dashboardMetrics()}<div class="command-grid"><div class="command-primary">${dashboardBriefing()}${dashboardLocations()}${dashboardFindings()}${dashboardSources()}</div><aside class="command-rail">${dashboardOutlook()}${dashboardStrategy()}</aside></div>${sourceDrawer()}`;
+}
+
+function dashboardAirportCoordinate(airport) {
+  const code = String(airport || '').trim().toUpperCase();
+  const record = window.CREWBIDIQ_AIRPORT_COORDINATES?.[code];
+  if (!record || !Number.isFinite(record.latitude) || !Number.isFinite(record.longitude)) return null;
+  return { ...record, code };
+}
+
+function disposeDashboardMap() {
+  if (dashboardMap) dashboardMap.remove();
+  dashboardMap = null;
+  dashboardMapLayers = null;
+}
+
+function initializeDashboardMap() {
+  const element = document.getElementById('dashboardMap');
+  if (!element || !window.L || !window.CREWBIDIQ_AIRPORT_COORDINATES) return;
+  const locations = dashboardLocationRows().map(item => ({ ...item, coordinate: dashboardAirportCoordinate(item.code) })).filter(item => item.coordinate);
+  if (!locations.length) { element.innerHTML = '<div class="map-empty">No geocoded locations were detected.</div>'; return; }
+  disposeDashboardMap();
+  dashboardMap = window.L.map(element, { worldCopyJump: true, minZoom: 2, zoomControl: true, attributionControl: true });
+  window.L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>', maxZoom: 19 }).addTo(dashboardMap);
+  dashboardMapLayers = window.L.layerGroup().addTo(dashboardMap);
+  const bounds = [];
+  const coordinateByCode = new Map(locations.map(item => [item.coordinate.code, item.coordinate]));
+  locations.forEach(item => {
+    const point = [item.coordinate.latitude, item.coordinate.longitude];
+    bounds.push(point);
+    window.L.circleMarker(point, { radius: item.role === 'Bid base' ? 8 : 6, weight: 2, color: '#071525', fillColor: item.role === 'Bid base' ? '#22d3ee' : '#8b7cff', fillOpacity: 1 }).bindTooltip(`${item.coordinate.code} · ${item.role}`).addTo(dashboardMapLayers);
+  });
+  (dashboardRecommendations?.results || []).slice(0, 5).forEach(item => {
+    const codes = String(item.simplified_route || '').split(/[–—→>\-]+/).map(value => value.trim().toUpperCase()).filter(Boolean);
+    const points = codes.map(code => coordinateByCode.get(code) || dashboardAirportCoordinate(code)).filter(Boolean).map(record => [record.latitude, record.longitude]);
+    if (points.length > 1) window.L.polyline(points, { color: '#2e8bff', weight: 2, opacity: .42 }).addTo(dashboardMapLayers);
+  });
+  dashboardMap.fitBounds(bounds, { padding: [24, 24], maxZoom: 5 });
+  setTimeout(() => dashboardMap?.invalidateSize(), 0);
+}
+
+async function openSourceRecord(index, trigger) {
+  const record = dashboardRecommendations?.results?.[index];
+  const drawer = document.getElementById('sourceDrawer');
+  const backdrop = document.getElementById('sourceDrawerBackdrop');
+  const body = document.getElementById('sourceDrawerBody');
+  if (!record || !drawer || !body) return;
+  drawer.dataset.returnFocus = trigger?.dataset?.sourceIndex || '';
+  drawer.classList.remove('hidden'); backdrop?.classList.remove('hidden'); drawer.setAttribute('aria-hidden', 'false');
+  document.getElementById('sourceDrawerTitle').textContent = sourceRecordTitle(record);
+  body.innerHTML = `<div class="source-record-summary"><span>${escapeHtml(sourceLabel(record))}</span><strong>${escapeHtml(record.simplified_route || record.layover_summary || 'Route unavailable')}</strong></div><div class="source-loading"><i></i><span>Loading preserved source text…</span></div>`;
+  document.getElementById('closeSourceDrawer')?.focus();
+  dashboardSourceController?.abort(); dashboardSourceController = new AbortController();
+  try {
+    const jobId = currentJobId(), packageId = activePackageId();
+    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/recommendations/${encodeURIComponent(record.trip_id || record.id)}?package_id=${encodeURIComponent(packageId)}`, { headers: analysisHeaders(), signal: dashboardSourceController.signal });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(analysisErrorDetail(payload, 'The source record could not be loaded.').user_message);
+    acceptPackageResponse(payload);
+    const result = payload.result || {};
+    const model = result.canonical_trip || {};
+    const source = model.source_text || result.original_display || result.block || '';
+    body.innerHTML = `<dl class="source-metadata"><div><dt>Source page</dt><dd>${metricValue(model.source_page || result.source_page)}</dd></div><div><dt>Source section</dt><dd>${metricValue(model.source_section || result.source_section)}</dd></div><div><dt>Record ID</dt><dd>${escapeHtml(model.source_trip_number || result.pairing || result.id || 'Not available')}</dd></div></dl>${source ? `<pre>${escapeHtml(source)}</pre>` : '<div class="partial-state"><strong>Source text unavailable</strong><p>The package did not provide preserved source text for this record.</p></div>'}`;
+  } catch (error) {
+    if (error.name !== 'AbortError') body.innerHTML = `<div class="partial-state"><strong>Source record unavailable</strong><p>${escapeHtml(error.message || 'The preserved source record could not be loaded.')}</p></div>`;
+  }
+}
+
+function closeSourceDrawer() {
+  const drawer = document.getElementById('sourceDrawer');
+  const returnIndex = drawer?.dataset.returnFocus;
+  dashboardSourceController?.abort(); dashboardSourceController = null;
+  drawer?.classList.add('hidden'); drawer?.setAttribute('aria-hidden', 'true');
+  document.getElementById('sourceDrawerBackdrop')?.classList.add('hidden');
+  if (returnIndex !== undefined) document.querySelector(`[data-source-index="${returnIndex}"]`)?.focus();
+}
+
+function bindDashboard() {
+  document.getElementById('dashboardStartOver')?.addEventListener('click', startOverSharedPackage);
+  document.querySelectorAll('[data-source-index]').forEach(button => button.addEventListener('click', () => openSourceRecord(Number(button.dataset.sourceIndex), button)));
+  document.getElementById('closeSourceDrawer')?.addEventListener('click', closeSourceDrawer);
+  document.getElementById('sourceDrawerBackdrop')?.addEventListener('click', closeSourceDrawer);
+  if (document.getElementById('dashboardMap')) requestAnimationFrame(initializeDashboardMap);
+}
+
+async function loadDashboardRecommendations(jobId) {
+  const packageId = activePackageId();
+  if (!jobId || !packageId || dashboardRecommendationsLoading || dashboardRecommendationsJob === jobId) return;
+  dashboardRecommendationsLoading = true; dashboardRecommendationsError = ''; render();
+  dashboardRecommendationsController?.abort(); dashboardRecommendationsController = new AbortController();
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/recommendations?package_id=${encodeURIComponent(packageId)}&limit=25&sort=rank&include_source=true`, { headers: analysisHeaders(), signal: dashboardRecommendationsController.signal });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(analysisErrorDetail(payload, 'Recommendation evidence is unavailable.').user_message);
+    acceptPackageResponse(payload); dashboardRecommendations = payload; dashboardRecommendationsJob = jobId;
+  } catch (error) {
+    if (error.name !== 'AbortError') dashboardRecommendationsError = error.message || 'Recommendation evidence is unavailable.';
+  } finally {
+    dashboardRecommendationsLoading = false; dashboardRecommendationsController = null; render();
+  }
 }
 
 function landingPage() {
@@ -492,13 +785,16 @@ function bindSouthwestSchedule() {
 }
 
 function render() {
-  const pages = { landing: landingPage, build: builderPage, recommendations: recommendationsPage, preview: previewPage, plan: planPage, southwest: southwestPage };
+  if (pageLifecycleSuspended) return;
+  disposeDashboardMap();
+  const pages = { analysis_dashboard: analysisDashboardPage, landing: landingPage, build: builderPage, recommendations: recommendationsPage, preview: previewPage, plan: planPage, southwest: southwestPage };
   labsContent.innerHTML = (pages[labsPage] || landingPage)();
-  const route = labsPage === 'landing' ? '/labs' : `/labs/${labsPage}`;
+  const route = labsPage === 'analysis_dashboard' ? packageLabsPath() : labsPage === 'landing' ? '/labs' : `/labs/${labsPage}`;
   document.querySelectorAll('[data-labs-route]').forEach(link => link.classList.toggle('active', link.dataset.labsRoute === route));
   bindBuilder();
   bindUploader();
   bindSouthwestSchedule();
+  bindDashboard();
 }
 
 function showLabsUploadError(message) {
@@ -781,6 +1077,20 @@ async function fetchSharedJob() {
     return body;
   } finally { clearTimeout(timeout); if (labsStatusController === controller) labsStatusController = null; }
 }
+async function fetchSharedPackage() {
+  const packageId = activePackageId();
+  if (!packageId) throw Object.assign(new Error('No recoverable package reference exists.'), { status: 400, detail: { error_code: 'PACKAGE_NOT_PERSISTED' } });
+  labsStatusController?.abort();
+  const controller = new AbortController(); labsStatusController = controller; const timeout = setTimeout(() => controller.abort(), 12000);
+  try {
+    const response = await fetch(`/api/packages/${encodeURIComponent(packageId)}`, { headers: analysisHeaders(), signal: controller.signal });
+    latestStatusCode = response.status;
+    const text = await response.text(); let body = {}; try { body = text ? JSON.parse(text) : {}; } catch (_) {}
+    if (!response.ok) { const detail = analysisErrorDetail(body, 'Stored package analysis is unavailable.'); throw Object.assign(new Error(detail.user_message), { status: response.status, detail }); }
+    if (body.package_id !== packageId || !body.job_id) throw Object.assign(new Error('The package route resolved to another analysis.'), { status: 409, detail: { error_code: 'JOB_PACKAGE_MISMATCH' } });
+    return body;
+  } finally { clearTimeout(timeout); if (labsStatusController === controller) labsStatusController = null; }
+}
 function applySharedJob(body) {
   const jobId = body.job_id, state = sharedJobState(body);
   const previous = sessionJob || storedAnalysis() || {};
@@ -800,9 +1110,15 @@ function applySharedJob(body) {
     progress: lastConfirmedProgress,
     progress_percent: lastConfirmedProgress,
   };
-  acceptPackageResponse(sessionJob); persistAnalysis(sessionJob); sessionLoading = false; render();
+  acceptPackageResponse(sessionJob);
+  safeLocalStorageSetItem(activePackageKey, body.package_id);
+  safeLocalStorageSetItem(activeJobKey, jobId);
+  persistAnalysis(sessionJob); sessionLoading = false;
+  if (labsPage === 'analysis_dashboard' && (window.location.pathname === '/labs' || routePackageRejected)) window.history.replaceState({}, '', packageLabsPath(body.package_id));
+  render();
   if (state === 'completed' || body.status === 'complete') {
     safeLocalStorageSetItem(latestJobKey, jobId); safeLocalStorageRemoveItem(activeJobKey); safeLocalStorageRemoveItem(analysisStateKey);
+    if (labsPage === 'analysis_dashboard') loadDashboardRecommendations(jobId);
     if (labsPage === 'recommendations') loadRefinedRecommendations(jobId);
     if (labsPage === 'plan') { loadMonthPlan(jobId); loadNavbluePlan(jobId); }
   } else if (['queued', 'parsing', 'normalizing', 'ranking'].includes(state)) scheduleSharedPoll(2000);
@@ -811,8 +1127,11 @@ function handleSharedFailure(error) {
   const status = Number(error.status || 0), code = error.detail?.error_code || 'POLLING_NETWORK_ERROR';
   latestStatusCode = status || 'network'; sessionLoading = false;
   if (code === 'PACKAGE_NOT_PERSISTED') {
+    routePackageRejected = Boolean(routeBidPackageId);
     safeLocalStorageRemoveItem(activeJobKey); safeLocalStorageRemoveItem(latestJobKey); safeLocalStorageRemoveItem(activePackageKey); safeLocalStorageRemoveItem(analysisStateKey);
-    sessionJob = null; labsUploadError = 'The upload was not saved. Please upload the bid package again.'; render(); return;
+    sessionJob = null; labsUploadError = 'The upload was not saved. Please upload the bid package again.';
+    if (window.location.pathname.startsWith('/bid-packages/')) window.history.replaceState({}, '', '/labs');
+    render(); return;
   }
   if (status === 404 || status === 410) {
     const previous = sessionJob || storedAnalysis() || {};
@@ -831,8 +1150,11 @@ function handleSharedFailure(error) {
     persistAnalysis(sessionJob); clearTimeout(sessionPollTimer); render(); return;
   }
   if (status === 401 || status === 403 || status === 409 || status === 400) {
+    routePackageRejected = Boolean(routeBidPackageId);
     safeLocalStorageRemoveItem(activeJobKey); safeLocalStorageRemoveItem(latestJobKey); safeLocalStorageRemoveItem(activePackageKey); safeLocalStorageRemoveItem(analysisStateKey);
-    sessionJob = null; labsUploadError = `${error.message} Please upload the bid package again.`; render(); return;
+    sessionJob = null; labsUploadError = `${error.message} Please upload the bid package again.`;
+    if (window.location.pathname.startsWith('/bid-packages/')) window.history.replaceState({}, '', '/labs');
+    render(); return;
   }
   sessionPollFailures += 1;
   const previous = sessionJob || storedAnalysis() || {};
@@ -866,7 +1188,7 @@ async function resumeSharedAnalysis() {
   if (sessionResumeInFlight) return;
   sessionResumeInFlight = true; clearTimeout(sessionPollTimer); const button = document.getElementById('labsResumeAnalysis'); if (button) { button.disabled = true; button.textContent = 'Resuming…'; }
   try {
-    const body = await fetchSharedJob(), state = sharedJobState(body);
+    const body = currentJobId() ? await fetchSharedJob() : await fetchSharedPackage(), state = sharedJobState(body);
     if ((state === 'failed' || state === 'expired') && body.package_persisted && body.recoverable) await restartSharedAnalysis(); else applySharedJob(body);
   } catch (error) {
     if (error.name === 'AbortError') return;
@@ -908,9 +1230,11 @@ async function startOverSharedPackage() {
     safeLocalStorageRemoveItem(analysisStateKey);
     invalidatePackageState('');
     sessionJob = null;
+    dashboardRecommendations = null; dashboardRecommendationsJob = null; dashboardRecommendationsError = '';
     sessionLoading = false;
     labsUploadError = '';
     clearTimeout(sessionPollTimer);
+    if (window.location.pathname.startsWith('/bid-packages/')) { window.location.assign('/labs'); return; }
     render();
   } catch (error) {
     labsUploadError = error.message || 'Could not reset package.';
@@ -920,9 +1244,9 @@ async function startOverSharedPackage() {
 async function loadSharedSession() {
   if (sessionPollInFlight) return;
   const jobId = currentJobId();
-  if (!jobId) { sessionLoading = false; render(); return; }
+  if (!jobId && !activePackageId()) { sessionLoading = false; render(); return; }
   sessionPollInFlight = true;
-  try { applySharedJob(await fetchSharedJob()); }
+  try { applySharedJob(jobId ? await fetchSharedJob() : await fetchSharedPackage()); }
   catch (error) { if (error.name !== 'AbortError') handleSharedFailure(error); }
   finally { sessionPollInFlight = false; }
 }
@@ -930,17 +1254,21 @@ async function loadSharedSession() {
 document.documentElement.dataset.theme = 'dark';
 render();
 loadSharedSession();
-window.addEventListener('online', () => { if (currentJobId()) resumeSharedAnalysis(); });
+window.addEventListener('online', () => { if (currentJobId() || activePackageId()) resumeSharedAnalysis(); });
 window.addEventListener('pageshow', event => {
-  if (!currentJobId()) return;
-  if (event.persisted) { sessionLoading = true; render(); loadSharedSession(); }
-  else resumeSharedAnalysis();
+  pageLifecycleSuspended = false;
+  const hasPackage = Boolean(currentJobId() || activePackageId());
+  if (event.persisted) { sessionLoading = hasPackage; render(); if (hasPackage) loadSharedSession(); return; }
+  if (hasPackage) resumeSharedAnalysis();
 });
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && currentJobId()) resumeSharedAnalysis(); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && (currentJobId() || activePackageId())) resumeSharedAnalysis(); });
+document.addEventListener('keydown', event => { if (event.key === 'Escape' && !document.getElementById('sourceDrawer')?.classList.contains('hidden')) closeSourceDrawer(); });
 window.addEventListener('pagehide', event => {
   if (!event.persisted) return;
+  pageLifecycleSuspended = true;
   clearTimeout(sessionPollTimer); labsStatusController?.abort(); labsStatusController = null; labsUploadController?.abort(); labsUploadController = null;
+  dashboardRecommendationsController?.abort(); dashboardRecommendationsController = null; dashboardSourceController?.abort(); dashboardSourceController = null; disposeDashboardMap();
   sessionPollInFlight = false; sessionResumeInFlight = false;
-  sessionJob = null; navbluePlan = null; monthPlan = null; tripIntentResult = null;
+  sessionJob = null; navbluePlan = null; monthPlan = null; tripIntentResult = null; dashboardRecommendations = null;
   labsContent.replaceChildren();
 });

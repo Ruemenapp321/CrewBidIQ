@@ -28,14 +28,15 @@ LABS_HTML = r"""
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#071525">
   <title>CrewBidIQ Labs</title>
-  <link rel="stylesheet" href="/static/app.css?v=0424">
+  __LABS_MAP_STYLES__
+  <link rel="stylesheet" href="/static/app.css?v=0430">
 </head>
 <body class="labs-body" data-labs-page="__LABS_PAGE__">
 <div class="app-shell">
   <aside class="desktop-sidebar labs-sidebar">
-    <a class="side-brand" href="/labs"><span class="wing">&#9992;</span><strong>CrewBid<span>IQ</span></strong><em>Beta</em></a>
+    <a class="side-brand" href="__LABS_HOME_HREF__"><span class="wing">&#9992;</span><strong>CrewBid<span>IQ</span></strong><em>Beta</em></a>
     <nav>
-      <a href="/labs" class="nav-link" data-labs-route="/labs"><span>Home</span></a>
+      __DASHBOARD_NAV__
       <a href="/labs/build" class="nav-link" data-labs-route="/labs/build"><span>Build My Bid</span></a>
       <a href="/labs/recommendations" class="nav-link" data-labs-route="/labs/recommendations"><span>Recommendations</span></a>
       <a href="/labs/preview" class="nav-link" data-labs-route="/labs/preview"><span>Bid Pool Preview</span></a>
@@ -53,7 +54,7 @@ LABS_HTML = r"""
         <a class="brand-word" href="/">CrewBid<span>IQ</span></a>
         <nav class="experience-switch" aria-label="CrewBidIQ experience">
           <a href="/">Classic</a>
-          <a href="/labs" class="active">Labs <small>Beta</small></a>
+          <a href="__LABS_HOME_HREF__" class="active">Labs <small>Beta</small></a>
         </nav>
       </div>
       <span class="beta-badge">Beta</span>
@@ -66,18 +67,19 @@ LABS_HTML = r"""
     <nav class="bottom-nav three labs-bottom-nav" aria-label="Primary navigation">
       <a href="/"><span>A</span>Analyze</a>
       <a href="/results"><span>R</span>Results</a>
-      <a href="/labs" class="active"><span>L</span>Labs</a>
+      <a href="__LABS_HOME_HREF__" class="active"><span>L</span>Labs</a>
     </nav>
   </div>
 </div>
-<script>window.CREWBIDIQ_LABS_PAGE = "__LABS_PAGE__";window.CREWBIDIQ_FLIGHT_DECK_PREVIEW_ENABLED = __FLIGHT_DECK_ENABLED__;window.CREWBIDIQ_ANALYSIS_DEBUG_ENABLED=__ANALYSIS_DEBUG_ENABLED__;</script>
-<script src="/static/labs.js?v=0426"></script>
+<script>window.CREWBIDIQ_LABS_PAGE = "__LABS_PAGE__";window.CREWBIDIQ_BID_PACKAGE_ID=__BID_PACKAGE_ID_JSON__;window.CREWBIDIQ_FLIGHT_DECK_PREVIEW_ENABLED = __FLIGHT_DECK_ENABLED__;window.CREWBIDIQ_ANALYSIS_DEBUG_ENABLED=__ANALYSIS_DEBUG_ENABLED__;</script>
+__LABS_MAP_SCRIPTS__
+<script src="/static/labs.js?v=0430"></script>
 </body>
 </html>
 """
 
 
-def labs_page(page: str) -> HTMLResponse:
+def labs_page(page: str, bid_package_id: str = "") -> HTMLResponse:
     if not labs_enabled():
         raise HTTPException(404, "CrewBidIQ Labs is not enabled")
     if page == "southwest" and not southwest_line_ranker_enabled():
@@ -90,8 +92,29 @@ def labs_page(page: str) -> HTMLResponse:
         '<a href="/labs/flight-deck" class="nav-link"><span>Flight Deck Preview</span></a>'
         if flight_deck_preview_enabled() else ""
     )
+    dashboard = page == "analysis_dashboard"
+    home_href = f"/bid-packages/{bid_package_id}/labs" if bid_package_id else "/labs"
+    dashboard_nav = (
+        f'<a href="{home_href}" class="nav-link" data-labs-route="{home_href}"><span>Package Overview</span></a>'
+        '<a href="#locations" class="nav-link"><span>Locations</span></a>'
+        '<a href="#risk-findings" class="nav-link"><span>Risk Signals</span></a>'
+        '<a href="#win-outlook" class="nav-link"><span>Win Outlook</span></a>'
+        '<a href="#source-records" class="nav-link"><span>Source Records</span></a>'
+        if dashboard else '<a href="/labs" class="nav-link" data-labs-route="/labs"><span>Package Overview</span></a>'
+    )
+    map_styles = '<link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css?v=1.9.4">' if dashboard else ""
+    map_scripts = (
+        '<script src="/static/airport-coordinates.js?v=20260716"></script>\n'
+        '<script src="/static/vendor/leaflet/leaflet.js?v=1.9.4"></script>'
+        if dashboard else ""
+    )
     return HTMLResponse(
         LABS_HTML.replace("__LABS_PAGE__", page)
+        .replace("__BID_PACKAGE_ID_JSON__", json.dumps(bid_package_id or None).replace("<", "\\u003c"))
+        .replace("__LABS_HOME_HREF__", home_href)
+        .replace("__DASHBOARD_NAV__", dashboard_nav)
+        .replace("__LABS_MAP_STYLES__", map_styles)
+        .replace("__LABS_MAP_SCRIPTS__", map_scripts)
         .replace("__SOUTHWEST_LINK__", southwest_link)
         .replace("__FLIGHT_DECK_LINK__", flight_deck_link)
         .replace("__FLIGHT_DECK_ENABLED__", "true" if flight_deck_preview_enabled() else "false")
@@ -164,7 +187,12 @@ def flight_deck_page(page: str, trip_id: str = "") -> HTMLResponse:
 
 @router.get("/labs", response_class=HTMLResponse)
 def labs_landing() -> HTMLResponse:
-    return labs_page("landing")
+    return labs_page("analysis_dashboard")
+
+
+@router.get("/bid-packages/{bid_package_id}/labs", response_class=HTMLResponse)
+def bid_package_labs(bid_package_id: str) -> HTMLResponse:
+    return labs_page("analysis_dashboard", bid_package_id)
 
 
 @router.get("/labs/build", response_class=HTMLResponse)

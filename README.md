@@ -18,6 +18,7 @@ The comprehensive user guide is built into the application header.
 
 CrewBidIQ Classic remains the default experience at `/`, with direct Classic results at `/results`. CrewBidIQ Labs runs in the same FastAPI service and shares the completed Classic job stored by the browser:
 
+- `/bid-packages/:bidPackageId/labs` (package-scoped command center)
 - `/labs`
 - `/labs/build`
 - `/labs/recommendations`
@@ -31,6 +32,8 @@ CrewBidIQ Classic remains the default experience at `/`, with direct Classic res
 Set `LABS_ENABLED=true` to enable the Labs routes and navigation. Any other value hides Labs from Classic and returns 404 for Labs routes.
 
 Flight Deck Preview is additionally gated by `FLIGHT_DECK_PREVIEW_ENABLED=true`. It reuses the active Classic/Labs package and never requires a second upload.
+
+`/labs` is the unscoped entry point. After an upload or a stored package recovery, Labs uses the authoritative package URL above. The dashboard can recover the package's latest analysis job from the package ID without uploading the source again.
 
 Identical PDF packages are parsed once and stored in the managed SQLite parser cache. Pilot preferences are not part of the cache; reranking always uses the current user's selections.
 

@@ -2508,6 +2508,24 @@ def validate_job_access(row: sqlite3.Row, supplied_package_id: str | None, suppl
         raise analysis_error(403, "SESSION_EXPIRED", package_id=expected_package_id, job_id=row["id"])
 
 
+def validate_package_access(package: sqlite3.Row, supplied_session_id: str | None) -> None:
+    """Keep package-scoped Labs URLs bound to the browser that uploaded them."""
+    expected_session = package["session_id_hash"]
+    if expected_session and session_hash(supplied_session_id) != expected_session:
+        raise analysis_error(403, "SESSION_EXPIRED", package_id=package["id"])
+
+
+def latest_package_job(package_id: str) -> sqlite3.Row | None:
+    with db() as conn:
+        return conn.execute(
+            """SELECT * FROM jobs
+               WHERE package_id=?
+               ORDER BY datetime(updated_at) DESC, datetime(created_at) DESC
+               LIMIT 1""",
+            (package_id,),
+        ).fetchone()
+
+
 def _filter_and_sort_summaries(
     summaries: list[dict[str, Any]],
     *,
@@ -2542,6 +2560,7 @@ def paginated_recommendation_payload(
     offset: int = 0,
     match_class: str | None = None,
     sort: str = "rank",
+    include_source: bool = False,
 ) -> dict[str, Any]:
     if row["status"] != "complete":
         raise HTTPException(409, "Recommendations are not ready yet")
@@ -2557,6 +2576,19 @@ def paginated_recommendation_payload(
     safe_limit = min(max(int(limit or 50), 1), 100)
     safe_offset = max(int(offset or 0), 0)
     page = filtered[safe_offset:safe_offset + safe_limit]
+    if include_source and page:
+        source_results = json.loads(row["results_json"] or "[]")
+        if row["package_id"]:
+            package_records(source_results, package_id)
+        source_by_id = {str(result.get("id") or ""): result for result in source_results}
+        page = [
+            {
+                **item,
+                "source_page": (source_by_id.get(str(item.get("id") or "")) or {}).get("source_page"),
+                "source_section": (source_by_id.get(str(item.get("id") or "")) or {}).get("source_section"),
+            }
+            for item in page
+        ]
     next_offset = safe_offset + safe_limit if safe_offset + safe_limit < len(filtered) else None
     return {
         "job_id": row["id"],
@@ -2660,6 +2692,27 @@ def job_status(
     return job_status_payload(row, include_results=include_results)
 
 
+@app.get("/api/packages/{package_id}")
+def package_status(package_id: str, request: Request):
+    """Recover the authoritative job for a package-scoped Labs route."""
+    package = get_package(package_id)
+    if not package:
+        raise analysis_error(404, "PACKAGE_NOT_PERSISTED", package_id=package_id)
+    validate_package_access(package, request.headers.get("x-crewbidiq-session"))
+    row = latest_package_job(package_id)
+    if not row:
+        raise analysis_error(404, "JOB_NOT_FOUND", package_id=package_id)
+    validate_job_access(row, package_id, request.headers.get("x-crewbidiq-session"))
+    if job_is_stale(row):
+        update_job(
+            row["id"], status="failed", state="expired", current_stage="expired", progress=row["progress"],
+            recoverable=1, error_code="JOB_EXPIRED", error=ANALYSIS_ERROR_MESSAGES["JOB_EXPIRED"],
+            message=ANALYSIS_ERROR_MESSAGES["JOB_EXPIRED"],
+        )
+        row = get_job(row["id"])
+    return job_status_payload(row, include_results=False)
+
+
 @app.get("/api/jobs/{job_id}/recommendations")
 def job_recommendations(
     job_id: str,
@@ -2669,6 +2722,7 @@ def job_recommendations(
     offset: int = 0,
     match_class: str | None = None,
     sort: str = "rank",
+    include_source: bool = False,
 ):
     row = get_job(job_id)
     if not row:
@@ -2682,6 +2736,7 @@ def job_recommendations(
         offset=offset,
         match_class=match_class,
         sort=sort,
+        include_source=include_source,
     )
 
 
