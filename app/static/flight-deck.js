@@ -625,7 +625,7 @@ function briefingTitle(item, model) {
 
 function formatLocalTime24(value) {
   const text = String(value || '').trim();
-  const match = text.match(/T(\d{2}):(\d{2})/) || text.match(/^(\d{1,2}):?(\d{2})$/);
+  const match = text.match(/T(\d{2}):(\d{2})/) || text.match(/^(\d{1,2})[.:]?(\d{2})$/);
   if (!match) return 'Unavailable';
   const hours = Number(match[1]), minutes = Number(match[2]);
   return hours < 24 && minutes < 60 ? `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}` : 'Unavailable';
@@ -633,7 +633,9 @@ function formatLocalTime24(value) {
 
 function canonicalEventDisplay(event) {
   if (!event) return 'Unavailable';
-  const parts = [formatLocalTime24(event.local_time), event.airport, event.local_timezone].filter(value => value !== null && value !== undefined && value !== '' && value !== 'Unavailable');
+  const offset = Number(event.day_offset || 0) > 0 ? `+${Number(event.day_offset)} day${Number(event.day_offset) === 1 ? '' : 's'}` : null;
+  const provenance = event.provenance === 'derived_from_report_plus_tafb' ? 'derived from report + TAFB' : (event.provenance === 'printed_check_in' ? 'printed check-in' : null);
+  const parts = [formatLocalTime24(event.local_time), offset, event.airport, event.local_timezone, provenance].filter(value => value !== null && value !== undefined && value !== '' && value !== 'Unavailable');
   return parts.length ? parts.join(' | ') : 'Unavailable';
 }
 

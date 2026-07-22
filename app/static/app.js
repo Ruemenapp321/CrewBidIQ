@@ -460,6 +460,7 @@ function appendResultCards(items, wrap, term) {
     const model = tripModel(item), normalizedLayovers = tripLayovers(item);
     item = {
       ...item,
+      original_display: item.original_display || model?.source_text,
       layovers: normalizedLayovers,
       cities: normalizedLayovers.map(value => value.airport || value.city).filter(Boolean),
       touched_cities: tripOperatingCities(item),

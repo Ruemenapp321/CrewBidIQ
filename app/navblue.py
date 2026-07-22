@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any
 
 from app.canonical import canonical_value
+from app.geography import resolve_layover_preference
 from app.recommendations import length_rule_matches
 
 
@@ -45,13 +46,53 @@ def _time(value: Any) -> str | None:
     return f"{int(match.group(1)):02d}:{match.group(2)}" if match else None
 
 
-def _matching_layovers(results: list[dict[str, Any]], city: str) -> int:
-    return sum(
-        city in {
-            str(value.get("airport") or value.get("city") or "").upper()
-            for value in (canonical_value(result, "layovers", []) or [])
-        }
+def _result_layover_codes(result: dict[str, Any]) -> set[str]:
+    canonical_layovers = canonical_value(result, "layovers", []) or []
+    structured = {
+        str(value.get("arrival_airport") or value.get("airport") or value.get("city") or "").upper()
+        for value in canonical_layovers
+        if str(value.get("arrival_airport") or value.get("airport") or value.get("city") or "").strip()
+    }
+    if structured:
+        return structured
+    return {str(value or "").strip().upper() for value in (result.get("cities") or []) if str(value or "").strip()}
+
+
+def _matching_layovers(results: list[dict[str, Any]], cities: str | list[str]) -> int:
+    wanted = {cities} if isinstance(cities, str) else set(cities)
+    return sum(bool(wanted.intersection(_result_layover_codes(result))) for result in results)
+
+
+def _available_layover_airports(results: list[dict[str, Any]]) -> list[str]:
+    return list(dict.fromkeys(
+        code
         for result in results
+        for code in sorted(_result_layover_codes(result))
+    ))
+
+
+def _layover_request(
+    verb: str,
+    value: str,
+    results: list[dict[str, Any]],
+    available_airports: list[str],
+    warnings: list[str],
+    reason: str,
+) -> dict[str, Any] | None:
+    resolved = resolve_layover_preference(value, available_airports)
+    airports = list(resolved["airports"])
+    if not airports:
+        warnings.append(
+            f"No {resolved['label']} layovers are present in this bid package, so CrewBidIQ did not emit an active {verb.lower()} request."
+        )
+        return None
+    joined = " OR ".join(airports)
+    return _request(
+        f"{verb} Pairings If Layover In {joined}",
+        f"{reason} Resolved {resolved['label']} to {joined} from this package's published layovers.",
+        _matching_layovers(results, airports),
+        preference_type=f"{verb} Pairings",
+        values=airports,
     )
 
 
@@ -88,6 +129,8 @@ def build_navblue_layers(
     """Build a pilot-reviewable NavBlue PBS request order from CrewBidIQ preferences."""
     results = [item for item in results if item.get("eligible") is True]
     airline = str(profile.get("airline") or "").lower()
+    warnings: list[str] = []
+    available_layovers = _available_layover_airports(results)
     layers: list[dict[str, Any]] = []
     layers.append({"number": 1, "title": "Start Pairing Group", "requests": []})
     hard_requests: list[dict[str, Any]] = []
@@ -99,11 +142,8 @@ def build_navblue_layers(
 
     avoid_requests: list[dict[str, Any]] = []
     for city in _list(profile.get("penalty_cities")):
-        avoid_requests.append(_request(
-            f"Avoid Pairings If Layover In {city}",
-            f"Avoid the {city} overnight preference.",
-            _matching_layovers(results, city),
-        ))
+        if request := _layover_request("Avoid", city, results, available_layovers, warnings, "Avoid this overnight preference."):
+            avoid_requests.append(request)
     earliest = _time(profile.get("earliest_report") or profile.get("earliest_report_minutes"))
     latest = _time(profile.get("latest_release") or profile.get("latest_release_minutes"))
     if earliest:
@@ -138,11 +178,8 @@ def build_navblue_layers(
 
     priority_requests: list[dict[str, Any]] = []
     for city in _list(profile.get("elite_cities")):
-        priority_requests.append(_request(
-            f"Award Pairings If Layover In {city}",
-            f"Place highest-priority {city} overnights first.",
-            _matching_layovers(results, city),
-        ))
+        if request := _layover_request("Award", city, results, available_layovers, warnings, "Place these highest-priority overnights first."):
+            priority_requests.append(request)
     if priority_requests:
         layers.append({"number": len(layers) + 1, "title": "Award highest priorities", "requests": priority_requests})
 
@@ -184,11 +221,8 @@ def build_navblue_layers(
             matches,
         ))
     for city in _list(profile.get("secondary_cities")):
-        shape_requests.append(_request(
-            f"Award Pairings If Layover In {city}",
-            f"Favor preferred {city} overnights after the highest priorities.",
-            _matching_layovers(results, city),
-        ))
+        if request := _layover_request("Award", city, results, available_layovers, warnings, "Favor these overnights after the highest priorities."):
+            shape_requests.append(request)
     if shape_requests:
         layers.append({"number": len(layers) + 1, "title": "Shape the remaining awards", "requests": shape_requests})
 
@@ -198,10 +232,10 @@ def build_navblue_layers(
         "requests": [_request("Award Pairings", "Allow the remaining legal pairing pool after the preferences above.", len(results))],
     })
 
-    warnings = [
+    warnings.extend([
         "Confirm each request is available in your airline's NavBlue configuration before submitting.",
         "CrewBidIQ does not submit these requests to NavBlue; this is a pilot-reviewed draft.",
-    ]
+    ])
     if profile.get("max_legs_per_day") not in (None, "") and airline != "delta":
         warnings.append("Maximum legs per duty day needs airline-specific NavBlue keyword confirmation and was not emitted automatically.")
     if (profile.get("allow_productive_redeye") is False or profile.get("avoid_final_redeye")) and airline != "delta":
@@ -222,4 +256,5 @@ def build_navblue_layers(
         "request_count": ordering,
         "submission_mode": "pilot_review_only",
         "airline_scope": airline or "generic_navblue",
+        "available_layovers": available_layovers,
     }

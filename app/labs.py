@@ -29,7 +29,7 @@ LABS_HTML = r"""
   <meta name="theme-color" content="#071525">
   <title>CrewBidIQ Labs</title>
   __LABS_MAP_STYLES__
-  <link rel="stylesheet" href="/static/app.css?v=0430">
+  <link rel="stylesheet" href="/static/app.css?v=0431">
 </head>
 <body class="labs-body" data-labs-page="__LABS_PAGE__">
 <div class="app-shell">
@@ -57,7 +57,7 @@ LABS_HTML = r"""
           <a href="__LABS_HOME_HREF__" class="active">Labs <small>Beta</small></a>
         </nav>
       </div>
-      <span class="beta-badge">Beta</span>
+      <div class="header-controls"><span class="beta-badge">Beta</span><button id="labsTheme" class="round-button" type="button" aria-label="Toggle color theme">◐</button></div>
     </header>
 
     <main id="labsContent" class="labs-main" aria-live="polite">
@@ -73,7 +73,7 @@ LABS_HTML = r"""
 </div>
 <script>window.CREWBIDIQ_LABS_PAGE = "__LABS_PAGE__";window.CREWBIDIQ_BID_PACKAGE_ID=__BID_PACKAGE_ID_JSON__;window.CREWBIDIQ_FLIGHT_DECK_PREVIEW_ENABLED = __FLIGHT_DECK_ENABLED__;window.CREWBIDIQ_ANALYSIS_DEBUG_ENABLED=__ANALYSIS_DEBUG_ENABLED__;</script>
 __LABS_MAP_SCRIPTS__
-<script src="/static/labs.js?v=0430"></script>
+<script src="/static/labs.js?v=0431"></script>
 </body>
 </html>
 """
@@ -131,7 +131,7 @@ FLIGHT_DECK_HTML = r"""
   <meta name="theme-color" content="#071525">
   <title>Flight Deck Preview | CrewBidIQ</title>
   __FLIGHT_DECK_MAP_STYLES__
-  <link rel="stylesheet" href="/static/app.css?v=0428">
+  <link rel="stylesheet" href="/static/app.css?v=0431">
 </head>
 <body class="labs-body flight-deck-body" data-flight-deck-page="__FLIGHT_DECK_PAGE__">
 <div class="app-shell">

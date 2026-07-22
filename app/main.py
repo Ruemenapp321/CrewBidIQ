@@ -13,6 +13,7 @@ import shutil
 import os
 import gzip
 import hashlib
+import io
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -27,12 +28,14 @@ from app.airlines import airline_terminology_payload, get_airline_terminology
 from app.airports import coterminal_group_for_airport, coterminal_payload, expand_airports, is_international_airport, is_valid_airport_code
 from app.canonical import attach_canonical_trip, canonical_presentation_record, public_canonical_trip
 from app.destinations import is_transcontinental, taxonomy_payload
+from app.geography import available_layover_options
 from app.fatigue import build_fatigue_index
 from app.labs import flight_deck_preview_enabled, labs_enabled, router as labs_router
 from app.month_planner import build_month_plan
 from app.navblue import build_navblue_layers
 from app.pay import pay_minutes_per_duty_day, pay_priority_value, tfp_per_day_away, tfp_ratio
 from app.parsers import select_parser
+from app.parsers import delta as delta_parser
 from app.recommendations import (
     evaluate_recommendation,
     length_priority,
@@ -49,7 +52,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR / "data"))
 UPLOAD_DIR = DATA_DIR / "uploads"
 DB_PATH = DATA_DIR / "pairingiq.db"
-PARSER_CACHE_VERSION = "2026-07-17.3"
+PARSER_CACHE_VERSION = "2026-07-21.2"
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_PARSE_SECONDS = int(os.environ.get("MAX_PARSE_SECONDS", "600"))
 JOB_STALE_SECONDS = int(os.environ.get("JOB_STALE_SECONDS", str(MAX_PARSE_SECONDS + 120)))
@@ -126,6 +129,12 @@ def init_db() -> None:
                 records_failed INTEGER NOT NULL DEFAULT 0,
                 current_batch INTEGER NOT NULL DEFAULT 0,
                 total_batches INTEGER NOT NULL DEFAULT 0,
+                pages_total INTEGER NOT NULL DEFAULT 0,
+                pages_processed INTEGER NOT NULL DEFAULT 0,
+                batch_start INTEGER NOT NULL DEFAULT 0,
+                batch_end INTEGER NOT NULL DEFAULT 0,
+                last_pairing_id TEXT,
+                warning_count INTEGER NOT NULL DEFAULT 0,
                 last_successful_poll_at TEXT,
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 recoverable INTEGER NOT NULL DEFAULT 1,
@@ -160,6 +169,18 @@ def init_db() -> None:
                 last_used_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 hit_count INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS parse_batch_cache (
+                cache_key TEXT NOT NULL,
+                batch_index INTEGER NOT NULL,
+                page_start INTEGER NOT NULL,
+                page_end INTEGER NOT NULL,
+                pairings_gzip BLOB NOT NULL,
+                warnings_gzip BLOB NOT NULL,
+                inventory_open_after INTEGER NOT NULL DEFAULT 0,
+                last_pairing_id TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (cache_key, batch_index)
+            );
             """
         )
         columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
@@ -174,6 +195,12 @@ def init_db() -> None:
             "records_failed": "INTEGER NOT NULL DEFAULT 0",
             "current_batch": "INTEGER NOT NULL DEFAULT 0",
             "total_batches": "INTEGER NOT NULL DEFAULT 0",
+            "pages_total": "INTEGER NOT NULL DEFAULT 0",
+            "pages_processed": "INTEGER NOT NULL DEFAULT 0",
+            "batch_start": "INTEGER NOT NULL DEFAULT 0",
+            "batch_end": "INTEGER NOT NULL DEFAULT 0",
+            "last_pairing_id": "TEXT",
+            "warning_count": "INTEGER NOT NULL DEFAULT 0",
             "retry_count": "INTEGER NOT NULL DEFAULT 0", "recoverable": "INTEGER NOT NULL DEFAULT 1",
             "error_code": "TEXT", "user_message": "TEXT", "request_id": "TEXT",
             "session_id_hash": "TEXT",
@@ -228,9 +255,9 @@ def state_for_stage(stage: str, status: str) -> str:
         return "failed"
     if status == "queued":
         return "queued"
-    if stage == "normalizing":
+    if stage in {"normalizing", "normalizing_records"}:
         return "normalizing"
-    if stage == "building_recommendations":
+    if stage in {"building_recommendations", "validating_results", "persisting_results", "building_indexes"}:
         return "ranking"
     return "parsing"
 
@@ -384,8 +411,14 @@ def load_cached_pairings(cache_key: str) -> tuple[list[dict[str, Any]], str] | N
 
 
 def store_cached_pairings(cache_key: str, airline: str, parser_name: str, pairings: list[dict[str, Any]]) -> None:
-    raw = json.dumps(pairings, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    compressed = gzip.compress(raw, compresslevel=5)
+    buffer = io.BytesIO()
+    encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
+    # Level 1 keeps restart caches small enough for SQLite while avoiding a
+    # costly high-compression pass on large bid packages.
+    with gzip.GzipFile(fileobj=buffer, mode="wb", compresslevel=1) as archive:
+        for chunk in encoder.iterencode(pairings):
+            archive.write(chunk.encode("utf-8"))
+    compressed = buffer.getvalue()
     with job_lock, db() as conn:
         conn.execute(
             """INSERT OR REPLACE INTO parse_cache
@@ -395,12 +428,195 @@ def store_cached_pairings(cache_key: str, airline: str, parser_name: str, pairin
         )
 
 
+def _cached_delta_batches(cache_key: str) -> dict[int, sqlite3.Row]:
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM parse_batch_cache WHERE cache_key=? ORDER BY batch_index",
+            (cache_key,),
+        ).fetchall()
+    return {int(row["batch_index"]): row for row in rows}
+
+
+def _decode_delta_batch(row: sqlite3.Row) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    return (
+        json.loads(gzip.decompress(row["pairings_gzip"]).decode("utf-8")),
+        json.loads(gzip.decompress(row["warnings_gzip"]).decode("utf-8")),
+    )
+
+
+def _store_delta_batch(
+    cache_key: str,
+    batch_index: int,
+    page_start: int,
+    page_end: int,
+    pairings: list[dict[str, Any]],
+    warnings: list[dict[str, Any]],
+    inventory_open: bool,
+) -> None:
+    pairings_gzip = gzip.compress(json.dumps(pairings, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), compresslevel=1)
+    warnings_gzip = gzip.compress(json.dumps(warnings, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), compresslevel=1)
+    last_pairing_id = str(pairings[-1].get("id") or "") if pairings else None
+    with job_lock, db() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO parse_batch_cache
+               (cache_key,batch_index,page_start,page_end,pairings_gzip,warnings_gzip,inventory_open_after,last_pairing_id,created_at)
+               VALUES(?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
+            (cache_key, batch_index, page_start, page_end, pairings_gzip, warnings_gzip, int(inventory_open), last_pairing_id),
+        )
+
+
+def parse_delta_pdf_bounded(
+    path: Path,
+    job_id: str,
+    cache_key: str,
+    *,
+    deadline: float | None = None,
+    batch_size: int = 10,
+) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]]:
+    """Extract and parse Delta pages in restart-safe, memory-bounded batches."""
+    doc = fitz.open(path)
+    pairings: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    cached_batches = _cached_delta_batches(cache_key)
+    inventory_open = False
+    try:
+        total_pages = len(doc)
+        if total_pages < 1:
+            raise RuntimeError("The PDF does not contain any pages.")
+        cover = doc.load_page(0).get_text("text", sort=False)
+        package_context = f"<<<CREWBIDIQ_PAGE:1>>>\n{cover}"
+        total_batches = max((total_pages + batch_size - 1) // batch_size, 1)
+        update_job(
+            job_id, state="parsing", current_stage="identifying_sections", progress=10,
+            message=f"Identifying bid-package sections across {total_pages} pages",
+            pages_total=total_pages, pages_processed=0, current_batch=0, total_batches=total_batches,
+            warning_count=0,
+        )
+        for batch_index, page_start_zero in enumerate(range(0, total_pages, batch_size), 1):
+            check_cancelled(job_id)
+            if deadline is not None and time.monotonic() > deadline:
+                raise TimeoutError("Parsing exceeded the configured time limit")
+            page_start = page_start_zero + 1
+            page_end = min(page_start_zero + batch_size, total_pages)
+            cached = cached_batches.get(batch_index)
+            if cached and int(cached["page_start"]) == page_start and int(cached["page_end"]) == page_end:
+                batch_pairings, batch_warnings = _decode_delta_batch(cached)
+                inventory_open = bool(cached["inventory_open_after"])
+            else:
+                update_job(
+                    job_id, current_stage="extracting_pages",
+                    progress=10 + int(page_start_zero / max(total_pages, 1) * 38),
+                    message=f"Extracting PDF pages {page_start}–{page_end} of {total_pages}",
+                    pages_total=total_pages, pages_processed=page_start_zero,
+                    batch_start=page_start, batch_end=page_end,
+                    current_batch=batch_index, total_batches=total_batches,
+                )
+                pages: list[tuple[int, str]] = []
+                batch_warnings: list[dict[str, Any]] = []
+                for page_number in range(page_start, page_end + 1):
+                    try:
+                        pages.append((page_number, doc.load_page(page_number - 1).get_text("text", sort=False)))
+                    except Exception as exc:
+                        batch_warnings.append({
+                            "code": "DELTA_PAGE_EXTRACTION_QUARANTINED",
+                            "source_page": page_number,
+                            "message": str(exc) or exc.__class__.__name__,
+                        })
+                update_job(
+                    job_id, current_stage="parsing_pairings",
+                    progress=12 + int(page_end / max(total_pages, 1) * 50),
+                    message=f"Parsing pairings from pages {page_start}–{page_end} of {total_pages}",
+                    pages_total=total_pages, pages_processed=page_start_zero,
+                    batch_start=page_start, batch_end=page_end,
+                    current_batch=batch_index, total_batches=total_batches,
+                )
+                try:
+                    batch_pairings, parser_warnings, inventory_open = delta_parser.parse_page_batch(
+                        pages, package_context=package_context, inventory_open=inventory_open,
+                    )
+                    batch_warnings.extend(parser_warnings)
+                except Exception as batch_exc:
+                    update_job(
+                        job_id, state="retrying", current_stage="retrying_batch",
+                        message=f"Retrying pages {page_start}–{page_end} individually after a recoverable batch error",
+                        pages_total=total_pages, pages_processed=page_start_zero,
+                        batch_start=page_start, batch_end=page_end,
+                        current_batch=batch_index, total_batches=total_batches,
+                    )
+                    batch_pairings = []
+                    batch_warnings.append({
+                        "code": "DELTA_BATCH_RETRIED_BY_PAGE",
+                        "page_start": page_start,
+                        "page_end": page_end,
+                        "message": str(batch_exc) or batch_exc.__class__.__name__,
+                    })
+                    for page_number, page_text in pages:
+                        try:
+                            page_pairings, page_warnings, inventory_after = delta_parser.parse_page_batch(
+                                [(page_number, page_text)],
+                                package_context=package_context,
+                                inventory_open=inventory_open,
+                            )
+                            batch_pairings.extend(page_pairings)
+                            batch_warnings.extend(page_warnings)
+                            inventory_open = inventory_after
+                        except Exception as page_exc:
+                            batch_warnings.append({
+                                "code": "DELTA_PAGE_PARSE_QUARANTINED",
+                                "source_page": page_number,
+                                "message": str(page_exc) or page_exc.__class__.__name__,
+                            })
+                _store_delta_batch(
+                    cache_key, batch_index, page_start, page_end,
+                    batch_pairings, batch_warnings, inventory_open,
+                )
+            pairings.extend(batch_pairings)
+            warnings.extend(batch_warnings)
+            update_job(
+                job_id, state="parsing", current_stage="parsing_pairings",
+                progress=12 + int(page_end / max(total_pages, 1) * 50),
+                message=f"Parsed pages {page_start}–{page_end} of {total_pages}; {len(pairings)} pairings identified",
+                pages_total=total_pages, pages_processed=page_end,
+                batch_start=page_start, batch_end=page_end,
+                current_batch=batch_index, total_batches=total_batches,
+                last_pairing_id=str(pairings[-1].get("id") or "") if pairings else None,
+                warning_count=len(warnings),
+                records_processed=len(pairings),
+            )
+    finally:
+        doc.close()
+    consolidated = consolidate_pairings(pairings)
+    if not consolidated:
+        raise RuntimeError("No confirmed Delta master-pairing records were found in the bid package.")
+    return consolidated, "delta_master_pairing_batched", warnings
+
+
+def readable_pdf(path: Path) -> bool:
+    try:
+        document = fitz.open(path)
+        try:
+            return document.page_count > 0 and not document.needs_pass
+        finally:
+            document.close()
+    except Exception:
+        return False
+
+
 def source_pairings(source: dict[str, Any]) -> list[dict[str, Any]]:
     if source.get("pairings") is not None:
         return source.get("pairings") or []
     cache_key = source.get("cache_key")
     cached = load_cached_pairings(cache_key) if cache_key else None
-    return cached[0] if cached else []
+    if cached:
+        return cached[0]
+    if cache_key:
+        batch_pairings: list[dict[str, Any]] = []
+        for row in _cached_delta_batches(cache_key).values():
+            pairings, _ = _decode_delta_batch(row)
+            batch_pairings.extend(pairings)
+        if batch_pairings:
+            return consolidate_pairings(batch_pairings)
+    return []
 
 
 def row_package_id(row: sqlite3.Row) -> str:
@@ -461,7 +677,7 @@ INDEX_HTML = r"""
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#071525">
   <title>CrewBidIQ</title>
-  <link rel="stylesheet" href="/static/app.css?v=0424">
+  <link rel="stylesheet" href="/static/app.css?v=0431">
 </head>
 <body data-classic-page="__CLASSIC_PAGE__">
 <div class="app-shell">
@@ -718,7 +934,7 @@ INDEX_HTML = r"""
   </div>
 </div>
 <script>window.CREWBIDIQ_ANALYSIS_DEBUG_ENABLED=__ANALYSIS_DEBUG_ENABLED__;</script>
-<script src="/static/app.js?v=0424"></script>
+<script src="/static/app.js?v=0431"></script>
 <script>document.getElementById('mobileGuideBtn').addEventListener('click',()=>document.getElementById('guideBtn').click());</script>
 </body></html>
 """
@@ -994,7 +1210,7 @@ def detect_layover_cities(pairing: dict[str, Any]) -> list[str]:
     """
     out: list[str] = []
     for layover in pairing.get("layovers", []) or []:
-        city = str(layover.get("city") or "").strip().upper()
+        city = str(layover.get("arrival_airport") or layover.get("airport") or layover.get("city") or "").strip().upper()
         if city and city not in out:
             out.append(city)
     if out:
@@ -1204,7 +1420,8 @@ def _breakdown(counter: Counter[str], total: int, label: str) -> list[dict[str, 
 
 
 def build_bid_synopsis(pairings: list[dict[str, Any]]) -> dict[str, Any]:
-    pairings = filter_pairings_for_profile(consolidate_pairings(pairings), {})
+    already_canonical = bool(pairings) and all(pairing.get("canonical_trip") and pairing.get("inventory_key") for pairing in pairings)
+    pairings = filter_pairings_for_profile(pairings if already_canonical else consolidate_pairings(pairings), {})
     total = len(pairings)
     complete = sum(bool(pairing.get("legs")) for pairing in pairings)
     redeyes = sum(classify_redeye(pairing) != "none" for pairing in pairings)
@@ -1224,6 +1441,7 @@ def build_bid_synopsis(pairings: list[dict[str, Any]]) -> dict[str, Any]:
         "trip_lengths": _breakdown(lengths, total, "days"),
         "start_airports": _breakdown(starts, total, "airport"),
         "layover_cities": _breakdown(layovers, total, "city")[:10],
+        "layover_options": available_layover_options(pairings),
         "fleets": _breakdown(fleets, total, "fleet"),
     }
 
@@ -1261,6 +1479,9 @@ def layover_summary(result: dict[str, Any]) -> str:
 
 
 def recommendation_summary(result: dict[str, Any]) -> dict[str, Any]:
+    canonical = result.get("canonical_trip") or {}
+    report = canonical.get("report") or {}
+    release = canonical.get("release") or {}
     return {
         "id": result.get("id"),
         "package_id": result.get("package_id"),
@@ -1273,8 +1494,10 @@ def recommendation_summary(result: dict[str, Any]) -> dict[str, Any]:
         "match_reasons": (result.get("qualification_reasons") or result.get("matched_preferences") or result.get("reasons") or [])[:3],
         "trip_length": result.get("trip_length"),
         "simplified_route": result.get("simplified_route"),
-        "report_time": result.get("checkin") or result.get("first_report"),
-        "release_time": result.get("release") or result.get("final_release"),
+        "report_time": report.get("local_time") or result.get("first_report") or result.get("checkin"),
+        "release_time": release.get("local_time") or result.get("final_release") or result.get("release"),
+        "report": report or None,
+        "release": release or None,
         "tafb": result.get("tafb"),
         "trip_credit": result.get("trip_credit") or result.get("credit"),
         "total_pay": result.get("total_pay"),
@@ -1916,6 +2139,7 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
     completed = False
     deadline = time.monotonic() + MAX_PARSE_SECONDS
     timings: dict[str, Any] = {}
+    stage_timings: dict[str, float] = {}
     try:
         check_cancelled(job_id)
         process_started = time.perf_counter()
@@ -1926,8 +2150,12 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
             records_total=0, records_processed=0, records_failed=0, current_batch=0, total_batches=0,
         )
         pairings: list[dict[str, Any]] = []
+        parse_warnings: list[dict[str, Any]] = []
         lines: list[dict[str, Any]] = []
         eligible_pairings: list[dict[str, Any]] = []
+        synopsis: dict[str, Any] | None = None
+        parsed_candidate_count = 0
+        accepted_inventory_count = 0
         item_label = "pairings"
         scoring_started = time.perf_counter()
         failed_records = 0
@@ -2057,6 +2285,7 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
             item_label = "lines"
         else:
             check_cancelled(job_id)
+            parse_started = time.perf_counter()
             cache_key = parser_cache_key(paths[0], airline)
             cached = load_cached_pairings(cache_key)
             if cached:
@@ -2068,21 +2297,34 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
                     message=f"Reusing the parsed {parser_name} bid package ({len(pairings)} pairings)",
                 )
             else:
-                text = extract_text(
-                    paths[0],
-                    paths[0].suffix.lower(),
-                    job_id,
-                    sort_pdf_text=sort_pdf_text_for_airline(airline),
-                    deadline=deadline,
-                )
-                pairings, parser_name = parse_pairings(
-                    text,
-                    job_id,
-                    airline if airline in {"delta", "american", "generic"} else "auto",
-                )
-                store_cached_pairings(cache_key, airline, parser_name, pairings)
+                used_batched_delta_cache = False
+                if airline == "delta" and paths[0].suffix.lower() == ".pdf" and readable_pdf(paths[0]):
+                    used_batched_delta_cache = True
+                    pairings, parser_name, parse_warnings = parse_delta_pdf_bounded(
+                        paths[0], job_id, cache_key, deadline=deadline,
+                    )
+                else:
+                    text = extract_text(
+                        paths[0],
+                        paths[0].suffix.lower(),
+                        job_id,
+                        sort_pdf_text=sort_pdf_text_for_airline(airline),
+                        deadline=deadline,
+                    )
+                    pairings, parser_name = parse_pairings(
+                        text,
+                        job_id,
+                        airline if airline in {"delta", "american", "generic"} else "auto",
+                    )
+                # Delta's page-batch checkpoints are already the authoritative
+                # restart cache. Avoid serializing the same large package a
+                # second time into the legacy whole-document cache.
+                if not used_batched_delta_cache:
+                    store_cached_pairings(cache_key, airline, parser_name, pairings)
+            stage_timings["parse_pairings"] = round(time.perf_counter() - parse_started, 3)
             check_cancelled(job_id)
-            update_job(job_id, state="normalizing", current_stage="normalizing", progress=72, message=f"Normalizing {len(pairings)} parsed trip records")
+            normalization_started = time.perf_counter()
+            update_job(job_id, state="normalizing", current_stage="normalizing_records", progress=72, message=f"Normalizing {len(pairings)} parsed trip records")
             pairings = bind_pairings_to_package(pairings, package_id)
             if airline == "auto" and pairings:
                 detected_airline = airline_for_pairing(pairings[0])
@@ -2091,6 +2333,10 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
             eligible_pairings = filter_pairings_for_profile(pairings, profile)
             if profile.get("bid_fleets") and not eligible_pairings:
                 raise RuntimeError("No pairings matched the selected bid fleet. Check the fleet code and run the package again.")
+            parsed_candidate_count = len(pairings)
+            accepted_inventory_count = len(filter_pairings_for_profile(pairings, {}))
+            synopsis = build_bid_synopsis(pairings)
+            stage_timings["normalize_records"] = round(time.perf_counter() - normalization_started, 3)
             total_records = len(eligible_pairings)
             total_batches = max((total_records + SCORING_BATCH_SIZE - 1) // SCORING_BATCH_SIZE, 1)
             update_job(
@@ -2106,7 +2352,9 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
                 total_batches=total_batches,
             )
             scoring_profile = {**profile, "_monthly_inventory_count": len(pairings)}
+            pairings = []
             results = []
+            ranking_started = time.perf_counter()
             for index, pairing in enumerate(eligible_pairings, 1):
                 check_cancelled(job_id)
                 started = time.perf_counter()
@@ -2115,6 +2363,7 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
                 except Exception:
                     failed_records += 1
                     log.exception("Failed scoring pairing %s in package %s", pairing.get("id"), package_id)
+                eligible_pairings[index - 1] = {}
                 elapsed = time.perf_counter() - started
                 slowest_records.append((elapsed, str(pairing.get("id") or pairing.get("pairing") or "unknown")))
                 slowest_records.sort(reverse=True)
@@ -2131,8 +2380,9 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
                         current_batch=(index + SCORING_BATCH_SIZE - 1) // SCORING_BATCH_SIZE,
                         total_batches=total_batches,
                     )
+            stage_timings["rank_records"] = round(time.perf_counter() - ranking_started, 3)
             item_label = "pairings"
-        scoring_seconds = time.perf_counter() - scoring_started
+        scoring_seconds = stage_timings.get("rank_records", round(time.perf_counter() - scoring_started, 3))
         update_job(
             job_id,
             state="ranking",
@@ -2149,6 +2399,7 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
         for index, result in enumerate(results, 1):
             check_cancelled(job_id)
             summaries.append(recommendation_summary(result))
+            results[index - 1] = compact_result_for_storage(result)
             if index % SCORING_BATCH_SIZE == 0 or index == total_results:
                 progress = 86 + int(index / max(total_results, 1) * 8)
                 update_job(
@@ -2164,8 +2415,11 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
                     total_batches=summary_batches,
                 )
         summary_seconds = time.perf_counter() - summary_started
+        stage_timings["build_summaries"] = round(summary_seconds, 3)
+        validation_started = time.perf_counter()
         package_records(results, package_id)
-        synopsis = build_bid_synopsis(pairings)
+        stage_timings["validate_results"] = round(time.perf_counter() - validation_started, 3)
+        synopsis = synopsis or build_bid_synopsis(pairings)
         total_scored = int(get_job(job_id)["records_processed"] or 0) if get_job(job_id) else len(results)
         throughput = round(total_scored / scoring_seconds, 2) if scoring_seconds > 0 else 0.0
         timings = {
@@ -2174,6 +2428,7 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
             "summary_construction_seconds": round(summary_seconds, 3),
             "time_to_first_usable_results_seconds": round(time.perf_counter() - process_started, 3),
             "records_per_second": throughput,
+            "stage_seconds": stage_timings,
             "slowest_records": [
                 {"trip_id": record_id, "seconds": round(seconds, 3)}
                 for seconds, record_id in slowest_records
@@ -2185,8 +2440,8 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
             "base": next((item.get("airport") for item in synopsis.get("start_airports", []) if item.get("airport")), None),
             "fleet": next((item.get("fleet") for item in synopsis.get("fleets", []) if item.get("fleet")), None),
             "month": infer_bid_month(get_job(job_id)["filename"]),
-            "parsed_candidate_count": len(pairings),
-            "accepted_inventory_count": len(filter_pairings_for_profile(pairings, {})),
+            "parsed_candidate_count": parsed_candidate_count or len(pairings),
+            "accepted_inventory_count": accepted_inventory_count or len(filter_pairings_for_profile(pairings, {})),
             "recommendation_input_count": len(eligible_pairings) if airline != "southwest" else len(lines),
             "recommendation_output_count": len(results),
             "eligible_recommendation_count": sum(result.get("eligible") is True for result in results),
@@ -2204,29 +2459,47 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
                 "cache_key": cache_key,
                 "parser_name": parser_name,
                 "cache_hit": cache_hit,
+                "parse_warnings": parse_warnings,
                 "synopsis": synopsis,
                 "package_diagnostics": diagnostics,
                 "timings": timings,
             }
         )
         check_cancelled(job_id)
+        update_job(
+            job_id, state="ranking", current_stage="validating_results", progress=95,
+            message=f"Validating {len(results)} ranked results",
+        )
+        package_records(results, package_id)
         serialization_started = time.perf_counter()
         summaries_json = json.dumps(summaries, separators=(",", ":"))
-        results_json = json.dumps(results)
+        update_job(
+            job_id, state="ranking", current_stage="persisting_results", progress=97,
+            message="Compacting and serializing canonical result records",
+        )
+        results_json = json.dumps(results, separators=(",", ":"))
         source_json = json.dumps(source)
+        stage_timings["serialize_results"] = round(time.perf_counter() - serialization_started, 3)
         performance = {
             **timings,
             "summary_payload_bytes": len(summaries_json.encode("utf-8")),
             "results_payload_bytes": len(results_json.encode("utf-8")),
             "source_payload_bytes": len(source_json.encode("utf-8")),
             "sqlite_payload_bytes": len(results_json.encode("utf-8")) + len(source_json.encode("utf-8")),
-            "serialization_seconds": round(time.perf_counter() - serialization_started, 3),
+            "serialization_seconds": stage_timings["serialize_results"],
+            "stage_seconds": stage_timings,
         }
         check_cancelled(job_id)
+        update_job(
+            job_id, state="ranking", current_stage="building_indexes", progress=99,
+            message="Persisting summaries and building result indexes",
+        )
+        persistence_started = time.perf_counter()
         update_job(
             job_id, status="complete", state="completed", current_stage="ready", progress=100,
             recoverable=1, error=None, error_code=None,
             message=f"Complete: {len(results)} {item_label} ranked", results_json=results_json,
+            summaries_json=summaries_json,
             source_json=source_json, profile_json=json.dumps(profile),
             performance_json=json.dumps(performance, separators=(",", ":")),
             records_total=len(results),
@@ -2235,6 +2508,10 @@ def process_job(job_id: str, paths: list[Path], profile: dict[str, Any], airline
             current_batch=summary_batches,
             total_batches=summary_batches,
         )
+        stage_timings["persist_and_index"] = round(time.perf_counter() - persistence_started, 3)
+        performance["processing_seconds"] = round(time.perf_counter() - process_started, 3)
+        performance["stage_seconds"] = stage_timings
+        update_job(job_id, performance_json=json.dumps(performance, separators=(",", ":")))
         completed = True
         with job_lock, db() as conn:
             conn.execute(
@@ -2413,20 +2690,33 @@ def job_progress_payload(row: sqlite3.Row) -> dict[str, Any]:
     labels = {
         "idle": "Idle", "file_selected": "File selected", "uploading": "Uploading",
         "upload_complete": "Upload complete", "creating_job": "Creating analysis job", "queued": "Queued",
-        "detecting_package": "Detecting airline and package type", "extracting_text": "Extracting text",
-        "identifying_records": "Identifying trip records", "parsing_details": "Parsing details",
-        "normalizing": "Normalizing trip records", "building_recommendations": "Building recommendation data",
+        "detecting_package": "Detecting airline and package type", "validating_package": "Validating package",
+        "extracting_text": "Extracting text", "extracting_pages": "Extracting pages",
+        "identifying_records": "Identifying trip records", "identifying_sections": "Identifying package sections",
+        "parsing_details": "Parsing details", "parsing_pairings": "Parsing pairings",
+        "normalizing": "Normalizing trip records", "normalizing_records": "Normalizing trip records",
+        "building_recommendations": "Building recommendation data", "validating_results": "Validating results",
+        "persisting_results": "Persisting results", "building_indexes": "Building result indexes",
         "ready": "Ready", "failed": "Failed", "cancelled": "Cancelled", "expired": "Expired",
     }
     label = labels.get(stage, stage.replace("_", " ").title())
 
-    detail: dict[str, int] = {}
+    detail: dict[str, int | str | None] = {}
     page = re.search(r"page\s+(\d+)\s+of\s+(\d+)", message, re.IGNORECASE)
     files = re.search(r"file\s+(\d+)\s+of\s+(\d+)", message, re.IGNORECASE)
     if page:
         detail = {"pages_processed": int(page.group(1)), "pages_total": int(page.group(2))}
     elif files:
         detail = {"files_processed": int(files.group(1)), "files_total": int(files.group(2))}
+    if int(row["pages_total"] or 0):
+        detail.update({
+            "pages_processed": int(row["pages_processed"] or 0),
+            "pages_total": int(row["pages_total"] or 0),
+            "batch_start": int(row["batch_start"] or 0),
+            "batch_end": int(row["batch_end"] or 0),
+            "last_pairing_id": row["last_pairing_id"],
+            "warning_count": int(row["warning_count"] or 0),
+        })
 
     created = datetime.fromisoformat(str(row["created_at"]).replace(" ", "T"))
     end_value = row["updated_at"] if status in {"complete", "failed"} else datetime.utcnow().isoformat(timespec="seconds")
@@ -2602,6 +2892,31 @@ def paginated_recommendation_payload(
         "current_sort": sort,
         "current_filters": {"match_class": match_class} if match_class else {},
     }
+
+
+COMPACT_RESULT_DUPLICATES = {
+    "ordered_events", "ordered_legs", "duty_days", "hotels", "pay_breakdown", "tfp",
+    "ordered_operating_airports", "operating_cities", "route_map_airports", "original_display",
+    "legs", "layovers",
+}
+
+
+def compact_result_for_storage(result: dict[str, Any]) -> dict[str, Any]:
+    """Persist one authoritative canonical trip instead of repeated view models."""
+    output = {key: value for key, value in result.items() if key not in COMPACT_RESULT_DUPLICATES}
+    canonical = dict(result.get("canonical_trip") or {})
+    if canonical:
+        raw = canonical.get("raw_source_fields") or {}
+        canonical["raw_source_fields"] = {
+            key: raw.get(key)
+            for key in (
+                "source_region_code", "source_region", "report_time_provenance",
+                "release_time_provenance", "release_day_offset",
+            )
+            if raw.get(key) is not None
+        }
+        output["canonical_trip"] = canonical
+    return output
 
 
 def job_status_payload(row: sqlite3.Row, *, include_results: bool = True) -> dict[str, Any]:

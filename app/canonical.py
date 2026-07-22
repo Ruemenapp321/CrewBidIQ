@@ -6,6 +6,9 @@ from hashlib import sha256
 import re
 from typing import Any
 
+from app.geography import geography_for_airport
+from app.time_values import format_clock, local_clock_minutes
+
 
 @dataclass(frozen=True)
 class PayBreakdown:
@@ -52,6 +55,9 @@ class TripEvent:
     local_timezone: str | None
     leg_sequence_index: int | None = None
     operating_or_deadhead: str | None = None
+    day_offset: int = 0
+    provenance: str | None = None
+    confidence: str | None = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,12 @@ class Layover:
     end_local: str | None
     duration: str | None
     validated: bool
+    arrival_airport: str | None = None
+    layover_market: str | None = None
+    country_code: str | None = None
+    theater: str | None = None
+    duration_minutes: int | None = None
+    source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -366,7 +378,8 @@ def _layovers(record: dict[str, Any], legs: list[TripLeg]) -> list[Layover]:
         ]
     layovers: list[Layover] = []
     for index, value in enumerate(source):
-        airport = str(value.get("airport") or value.get("city") or "").strip().upper() or None
+        airport = str(value.get("arrival_airport") or value.get("airport") or value.get("city") or "").strip().upper() or None
+        geography = geography_for_airport(airport)
         explicit_day = _positive_int(value.get("after_duty_day"))
         matching_day = next((day for day in unused_days if last_destination.get(day) == airport), None)
         after_day = explicit_day or matching_day or (unused_days[0] if unused_days else index + 1)
@@ -377,13 +390,19 @@ def _layovers(record: dict[str, Any], legs: list[TripLeg]) -> list[Layover]:
         layovers.append(Layover(
             after_duty_day=after_day,
             airport=airport,
-            city=str(value.get("city") or airport or "").strip() or None,
+            city=str(value.get("city_name") or value.get("city") or airport or "").strip() or None,
             hotel=hotel,
             transportation=str(value.get("transportation") or value.get("transportation_provider") or "").strip() or None,
             start_local=str(value.get("start_local") or "").strip() or None,
             end_local=str(value.get("end_local") or "").strip() or None,
             duration=duration,
             validated=bool(value.get("validated", bool(airport and (duration or hotel)))),
+            arrival_airport=airport,
+            layover_market=str(value.get("layover_market") or airport or "").strip() or None,
+            country_code=str(value.get("country_code") or geography.get("country_code") or "").strip().upper() or None,
+            theater=str(value.get("theater") or geography.get("theater") or "UNKNOWN").strip().upper(),
+            duration_minutes=_positive_int(value.get("duration_minutes")),
+            source=str(value.get("source") or "").strip() or None,
         ))
     return layovers
 
@@ -398,15 +417,19 @@ def _report_release_event(
     if local_time in (None, ""):
         return None
     provenance = provenance or {}
+    normalized = provenance.get("normalized_local_time") or provenance.get("local_event_timestamp") or str(local_time)
     return TripEvent(
         sequence_index=0,
         duty_day_index=duty_index,
         event_type=event_type,
         airport=airport,
-        source_time=str(provenance.get("source_time_herb") or local_time),
+        source_time=str(provenance.get("source_time_herb") or provenance.get("source_value") or local_time),
         utc_time=str(provenance.get("normalized_utc_timestamp") or "") or None,
-        local_time=str(provenance.get("local_event_timestamp") or local_time),
+        local_time=str(normalized),
         local_timezone=str(provenance.get("local_event_timezone") or "") or None,
+        day_offset=int(provenance.get("day_offset") or 0),
+        provenance=str(provenance.get("source") or "").strip() or None,
+        confidence=str(provenance.get("confidence") or "").strip() or None,
     )
 
 
@@ -429,8 +452,9 @@ def _duty_days(record: dict[str, Any], legs: list[TripLeg], layovers: list[Layov
         if duty_index == duty_indices[-1]:
             release_time = release_time or record.get("final_release") or record.get("release")
         report_provenance = record.get("report_time_provenance") if duty_index == duty_indices[0] else None
+        release_provenance = record.get("release_time_provenance") if duty_index == duty_indices[-1] else None
         report = _report_release_event("report", duty_index, first_leg.origin, report_time, report_provenance)
-        release = _report_release_event("release", duty_index, last_leg.destination, release_time)
+        release = _report_release_event("release", duty_index, last_leg.destination, release_time, release_provenance)
         source_leg = source_legs[first_leg.sequence_index - 1] if first_leg.sequence_index <= len(source_legs) else {}
         calendar_date = str(source_leg.get("event_date") or "") or None
         layover = next((item for item in layovers if item.after_duty_day == duty_index), None)
@@ -599,6 +623,8 @@ def attach_canonical_trip(record: dict[str, Any], package_id: str | None = None)
         "hotels": canonical["hotels"],
         "pay_breakdown": canonical["pay_breakdown"],
         "tfp": canonical["tfp"],
+        "report": canonical["report"],
+        "release": canonical["release"],
         "operating_dates": canonical["operating_dates"],
         "canonical_trip": canonical,
     })

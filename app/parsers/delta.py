@@ -8,20 +8,22 @@ from typing import Any
 
 from .base import Leg, Layover, Pairing
 from app.airports import is_valid_airport_code
+from app.geography import geography_for_airport
 from app.pay import parse_delta_pay
+from app.time_values import derive_release, duration_minutes, format_clock, local_clock_minutes
 
 
 PAGE_MARKER = re.compile(r"(?m)^<<<CREWBIDIQ_PAGE:(\d+)>>>\s*$")
-HEADER = re.compile(r"(?m)^\s*#([A-Z]?\d{3,5})\b")
+HEADER = re.compile(r"(?m)^\s*#([A-Z0-9]{4})\b")
 LEG = re.compile(
     r"^\s*([A-Z])?\s*(DH\s+)?(\d{1,4})?\s+([A-Z]{3})\s+(\d{4})\s+"
     r"([A-Z]{3})\s+(\d{4})\*?\s+(\d{1,2}\.\d{2})(.*)$"
 )
 LAYOVER = re.compile(r"(?m)^\s*([A-Z]{3})\s+(\d{1,2}\.\d{2})/([^\n]+?)\s+\d+\.\d{2}/")
 CREDIT = re.compile(r"TOTAL CREDIT\s+(\d{1,2}\.\d{2})TL")
-TAFB = re.compile(r"TAFB\s+(\d{1,3}\.\d{2})")
-CHECKIN = re.compile(r"CHECK-IN AT\s+(\d{1,2}\.\d{2})")
-EFFECTIVE = re.compile(r"EFFECTIVE\s+([^\r\n]*?)(?:CHECK-IN|$)", re.I)
+TAFB = re.compile(r"TAFB\s+(\d{1,3}[.:]\d{2})", re.I)
+CHECKIN = re.compile(r"CHECK-IN\s+AT\s+(\d{1,2}[.:]\d{2})", re.I)
+EFFECTIVE = re.compile(r"EFFECTIVE\b(.*?)(?=CHECK-IN\s+AT|TOTAL\s+CREDIT|TAFB|$)", re.I | re.S)
 
 MONTHS = {name: index for index, name in enumerate(("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"), 1)}
 KNOWN_PAY_CODES = {"CRD", "DHD", "MCD", "TRP", "DPA", "ADG", "EDP", "SIT", "HOL"}
@@ -41,6 +43,17 @@ END_SECTION = re.compile(r"\b(?:HOTEL\s+LIST|APPENDIX|TABLE\s+OF\s+CONTENTS|CONT
 PRODUCTION_COLUMNS = re.compile(r"\bDAY\s+FLIGHT\b.*\bDEPARTS\b.*\bARRIVES\b", re.I)
 
 LAST_DIAGNOSTICS: list[dict[str, Any]] = []
+
+ROTATION_REGION_CODES = {
+    "A": "ATLANTIC",
+    "B": "ATLANTIC",
+    "C": "LATIN",
+    "L": "LATIN",
+    "M": "MILITARY",
+    "P": "PACIFIC",
+    "R": "AFRICA",
+    "U": "SOUTH_AMERICA",
+}
 
 
 def detect(text: str) -> float:
@@ -94,7 +107,19 @@ def _classify_page(page: str) -> str:
 
 
 def _package_context(text: str) -> tuple[str | None, str | None]:
-    up = text.upper()
+    pages = _pages(text)
+    up = (pages[0][1] if pages else text)[:12000].upper()
+    cover = re.search(
+        r"\b(ATLANTA|BOSTON|DETROIT|NEW\s+YORK|LOS\s+ANGELES|MINNEAPOLIS|SEATTLE|SALT\s+LAKE)\s+"
+        r"(A?3(?:19|20|21|30|50)|7[3-7][A-Z0-9]*|B\d)\b",
+        up,
+    )
+    if cover:
+        bases = {
+            "ATLANTA": "ATL", "BOSTON": "BOS", "DETROIT": "DTW", "NEW YORK": "JFK",
+            "LOS ANGELES": "LAX", "MINNEAPOLIS": "MSP", "SEATTLE": "SEA", "SALT LAKE": "SLC",
+        }
+        return bases[re.sub(r"\s+", " ", cover.group(1))], cover.group(2)
     combined = re.search(
         r"\b(ATL|BOS|DTW|JFK|LAX|LGA|MSP|SEA|SLC)\s*[-_/ ]?\s*(?:BASE\s*)?(A?3(?:19|20|21|30|50)|7[3-7][A-Z0-9]*|B\d)\b",
         up,
@@ -109,6 +134,12 @@ def _bid_month_context(text: str) -> tuple[int | None, int | None]:
     match = BID_MONTH_YEAR.search(text)
     if match:
         return MONTHS[match.group(1)[:3].upper()], int(match.group(2))
+    pages = _pages(text)
+    cover = (pages[0][1] if pages else text)[:12000].upper()
+    cover_month = re.search(r"\b(JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)\b", cover)
+    cover_year = re.search(r"\b(20\d{2})\b", cover)
+    if cover_month and cover_year:
+        return MONTHS[cover_month.group(1)[:3]], int(cover_year.group(1))
     effective_months = {
         MONTHS[token.upper()]
         for segment in EFFECTIVE.findall(text)
@@ -273,6 +304,27 @@ def _validated_layovers(block: str, legs: list[Leg]) -> list[Layover]:
     ]
 
 
+def _enrich_layover(value: dict[str, Any]) -> dict[str, Any]:
+    airport = str(value.get("city") or "").strip().upper()
+    geography = geography_for_airport(airport)
+    minutes = duration_minutes(value.get("duration"))
+    return {
+        **value,
+        "arrival_airport": airport,
+        "airport": airport,
+        # Keep the airline/airport market value distinct from the human city
+        # label so metro aliases never replace a NavBlue-compatible code.
+        "layover_market": airport,
+        "city": airport,
+        "city_name": geography.get("city") or airport,
+        "country_code": geography.get("country_code"),
+        "theater": geography.get("theater"),
+        "duration_minutes": minutes,
+        "source": "printed_layover_line",
+        "validated": True,
+    }
+
+
 def _diagnose_airport_tokens(
     rotation: str,
     block: str,
@@ -329,16 +381,21 @@ def _diagnose_airport_tokens(
             })
 
 
-def parse(text: str) -> list[dict]:
-    normalized = text.replace("\r", "\n")
-    LAST_DIAGNOSTICS.clear()
-    package_base, package_fleet = _package_context(normalized)
-    bid_month_context = _bid_month_context(normalized)
-    package_id = "delta:" + hashlib.sha256(normalized.encode("utf-8", errors="ignore")).hexdigest()[:16]
+def parse_page_batch(
+    pages: list[tuple[int, str]],
+    *,
+    package_context: str,
+    inventory_open: bool = False,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+    """Parse a bounded set of pages and quarantine malformed rotation blocks."""
+    normalized_context = package_context.replace("\r", "\n")
+    package_base, package_fleet = _package_context(normalized_context)
+    bid_month_context = _bid_month_context(normalized_context)
+    package_id = "delta:" + hashlib.sha256(normalized_context.encode("utf-8", errors="ignore")).hexdigest()[:16]
     results: list[dict[str, Any]] = []
-    inventory_open = False
+    warnings: list[dict[str, Any]] = []
 
-    for page_number, page in _pages(normalized):
+    for page_number, page in pages:
         classification = _classify_page(page)
         heading = _heading(page)
         if END_SECTION.search(heading) or classification in {"CONTENTS", "INSTRUCTIONS", "REFERENCE", "EXAMPLE", "HOTEL_LIST", "APPENDIX"}:
@@ -348,7 +405,7 @@ def parse(text: str) -> list[dict]:
 
         matches = list(HEADER.finditer(page))
         standalone_production = (
-            len(_pages(normalized)) == 1
+            len(pages) == 1
             and bool(CREDIT.search(page) and TAFB.search(page))
             and (bool(PRODUCTION_COLUMNS.search(page)) or any(LEG.match(line) for line in page.splitlines()))
             and not EXAMPLE_SIGNALS.search(page)
@@ -358,69 +415,102 @@ def parse(text: str) -> list[dict]:
             end = matches[index + 1].start() if index + 1 < len(matches) else len(page)
             block = page[match.start():end]
             rotation = match.group(1).upper()
-            has_detail_row = any(LEG.match(line) for line in block.splitlines())
-            production_layout = bool(
-                CREDIT.search(block) and TAFB.search(block)
-                and (PRODUCTION_COLUMNS.search(block) or has_detail_row or (INVENTORY_HEADING.search(page) and CHECKIN.search(block)))
-            )
-            instructional = bool(EXAMPLE_SIGNALS.search(page) or classification in {"EXAMPLE", "INSTRUCTIONS"})
-            confidence = .35 + (.3 if production_layout else 0) + (.2 if page_inventory else 0) + (.1 if package_base else 0) + (.05 if package_fleet else 0)
-            confidence = min(confidence, 1.0)
-            accepted = page_inventory and production_layout and not instructional and confidence >= .75
-            reason = "accepted_confirmed_bidable_inventory"
-            if instructional and not page_inventory:
-                reason = "instructional_example_outside_bidable_inventory"
-            elif not page_inventory:
-                reason = "outside_bidable_inventory"
-            elif instructional:
-                reason = "instructional_or_example_language"
-            elif not production_layout:
-                reason = "rotation_candidate_does_not_match_production_layout"
-            elif confidence < .75:
-                reason = "insufficient_package_context_confidence"
-            _diagnose(rotation, page_number, heading, classification, accepted, reason, confidence)
-            if not accepted:
-                continue
+            try:
+                has_detail_row = any(LEG.match(line) for line in block.splitlines())
+                production_layout = bool(
+                    CREDIT.search(block) and TAFB.search(block)
+                    and (PRODUCTION_COLUMNS.search(block) or has_detail_row or (INVENTORY_HEADING.search(page) and CHECKIN.search(block)))
+                )
+                instructional = bool(EXAMPLE_SIGNALS.search(page) or classification in {"EXAMPLE", "INSTRUCTIONS"})
+                confidence = .35 + (.3 if production_layout else 0) + (.2 if page_inventory else 0) + (.1 if package_base else 0) + (.05 if package_fleet else 0)
+                confidence = min(confidence, 1.0)
+                accepted = page_inventory and production_layout and not instructional and confidence >= .75
+                reason = "accepted_confirmed_bidable_inventory"
+                if instructional and not page_inventory:
+                    reason = "instructional_example_outside_bidable_inventory"
+                elif not page_inventory:
+                    reason = "outside_bidable_inventory"
+                elif instructional:
+                    reason = "instructional_or_example_language"
+                elif not production_layout:
+                    reason = "rotation_candidate_does_not_match_production_layout"
+                elif confidence < .75:
+                    reason = "insufficient_package_context_confidence"
+                _diagnose(rotation, page_number, heading, classification, accepted, reason, confidence)
+                if not accepted:
+                    continue
 
-            legs, airport_event_provenance = _parse_leg_rows(block, page_number)
-            layovers = _validated_layovers(block, legs)
-            credit, tafb, checkin = CREDIT.search(block), TAFB.search(block), CHECKIN.search(block)
-            operating_dates = _operating_dates(block, bid_month_context)
-            result = Pairing(
-                pairing_id=rotation, raw=block, legs=legs, layovers=layovers,
-                credit=credit.group(1) if credit else None, tafb=tafb.group(1) if tafb else None,
-                checkin=checkin.group(1) if checkin else None,
-                effective=", ".join(operating_dates) or None,
-                parser="delta_master_pairing", confidence=confidence,
-            ).to_dict()
-            for leg_index, leg in enumerate(result["legs"], 1):
-                events = [event for event in airport_event_provenance if event["leg_index"] == leg_index]
-                origin = next((event for event in events if event["role"] == "origin"), None)
-                destination = next((event for event in events if event["role"] == "destination"), None)
-                leg.update({
-                    "source_page": page_number,
-                    "source_line": origin["source_line"] if origin else None,
-                    "source_row": origin["source_row"] if origin else None,
-                    "leg_index": leg_index,
-                    "duty_day_index": origin["duty_day_index"] if origin else None,
-                    "origin_validation": origin,
-                    "destination_validation": destination,
+                legs, airport_event_provenance = _parse_leg_rows(block, page_number)
+                layovers = _validated_layovers(block, legs)
+                credit, tafb, checkin = CREDIT.search(block), TAFB.search(block), CHECKIN.search(block)
+                tafb_source = tafb.group(1) if tafb else None
+                checkin_source = checkin.group(1) if checkin else None
+                report_minutes = local_clock_minutes(checkin_source)
+                report_local = format_clock(report_minutes)
+                release = derive_release(checkin_source, tafb_source)
+                operating_dates = _operating_dates(block, bid_month_context)
+                result = Pairing(
+                    pairing_id=rotation, raw=block, legs=legs, layovers=layovers,
+                    credit=credit.group(1) if credit else None, tafb=tafb_source,
+                    checkin=checkin_source, release=release["local_time"] if release else None,
+                    effective=", ".join(operating_dates) or None,
+                    parser="delta_master_pairing", confidence=confidence,
+                ).to_dict()
+                for leg_index, leg in enumerate(result["legs"], 1):
+                    events = [event for event in airport_event_provenance if event["leg_index"] == leg_index]
+                    origin = next((event for event in events if event["role"] == "origin"), None)
+                    destination = next((event for event in events if event["role"] == "destination"), None)
+                    leg.update({
+                        "source_page": page_number,
+                        "source_line": origin["source_line"] if origin else None,
+                        "source_row": origin["source_row"] if origin else None,
+                        "leg_index": leg_index,
+                        "duty_day_index": origin["duty_day_index"] if origin else None,
+                        "origin_validation": origin,
+                        "destination_validation": destination,
+                    })
+                result["layovers"] = [_enrich_layover(value) for value in result["layovers"]]
+                source_region_code = rotation[0] if rotation[0].isalpha() else None
+                result.update(parse_delta_pay(block, result["credit"]))
+                result.update({
+                    "airline": "delta", "package_id": package_id, "source_page": page_number,
+                    "source_pdf_page": page_number, "source_section": heading or "MASTER PAIRINGS",
+                    "page_classification": "BIDABLE_INVENTORY", "package_base": package_base,
+                    "package_fleet": package_fleet, "fleet": package_fleet, "rotation_number": rotation,
+                    "source_rotation_id": rotation, "source_region_code": source_region_code,
+                    "source_region": ROTATION_REGION_CODES.get(source_region_code),
+                    "parser_confidence": confidence, "bidable_inventory_confirmed": True,
+                    "inventory_key": f"{package_id}:{rotation}",
+                    "operating_dates": operating_dates,
+                    "operating_dates_status": "validated" if operating_dates else "unavailable",
+                    "bid_month": bid_month_context[0], "bid_year": bid_month_context[1],
+                    "airport_event_provenance": airport_event_provenance,
+                    "first_report": report_local,
+                    "final_release": release["local_time"] if release else None,
+                    "release_day_offset": release["day_offset"] if release else None,
+                    "tafb_minutes": release["elapsed_minutes"] if release else duration_minutes(tafb_source),
+                    "report_time_provenance": {
+                        "source_value": checkin_source, "normalized_local_time": report_local,
+                        "source": "printed_check_in", "confidence": "high",
+                    },
+                    "release_time_provenance": {
+                        "source_value": None, "normalized_local_time": release["local_time"] if release else None,
+                        "source": "derived_from_report_plus_tafb", "confidence": "derived",
+                        "day_offset": release["day_offset"] if release else None,
+                    } if release else None,
                 })
-            for layover in result["layovers"]:
-                layover["validated"] = True
-            result.update(parse_delta_pay(block, result["credit"]))
-            result.update({
-                "airline": "delta", "package_id": package_id, "source_page": page_number,
-                "source_pdf_page": page_number, "source_section": heading or "MASTER PAIRINGS",
-                "page_classification": "BIDABLE_INVENTORY", "package_base": package_base,
-                "package_fleet": package_fleet, "fleet": package_fleet, "rotation_number": rotation,
-                "parser_confidence": confidence, "bidable_inventory_confirmed": True,
-                "inventory_key": f"{package_id}:{rotation}",
-                "operating_dates": operating_dates,
-                "operating_dates_status": "validated" if operating_dates else "unavailable",
-                "bid_month": bid_month_context[0], "bid_year": bid_month_context[1],
-                "airport_event_provenance": airport_event_provenance,
-            })
-            _diagnose_airport_tokens(rotation, block, page_number, airport_event_provenance)
-            results.append(result)
+                _diagnose_airport_tokens(rotation, block, page_number, airport_event_provenance)
+                results.append(result)
+            except Exception as exc:
+                warnings.append({
+                    "code": "DELTA_ROTATION_QUARANTINED", "rotation": rotation,
+                    "source_page": page_number, "message": str(exc) or exc.__class__.__name__,
+                })
+    return results, warnings, inventory_open
+
+
+def parse(text: str) -> list[dict]:
+    normalized = text.replace("\r", "\n")
+    LAST_DIAGNOSTICS.clear()
+    results, _, _ = parse_page_batch(_pages(normalized), package_context=normalized)
     return results

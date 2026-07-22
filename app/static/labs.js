@@ -67,7 +67,7 @@ function safeLocalStorageRemoveItem(key) {
 function analysisHeaders() { return { Accept: 'application/json', 'X-CrewBidIQ-Session': browserSessionId() }; }
 function storedAnalysis() { return readJson(analysisStateKey, {}) || {}; }
 function lightweightAnalysis(body = {}) {
-  const keys = ['job_id', 'package_id', 'filename', 'airline', 'status', 'state', 'current_stage', 'stage_label', 'progress', 'progress_percent', 'message', 'user_message', 'error', 'error_code', 'created_at', 'updated_at', 'last_successful_poll_at', 'retry_count', 'recoverable', 'package_persisted'];
+  const keys = ['job_id', 'package_id', 'filename', 'airline', 'status', 'state', 'current_stage', 'stage_label', 'progress', 'progress_percent', 'message', 'user_message', 'error', 'error_code', 'created_at', 'updated_at', 'last_successful_poll_at', 'retry_count', 'recoverable', 'package_persisted', 'pages_total', 'pages_processed', 'batch_start', 'batch_end', 'last_pairing_id', 'warning_count', 'records_processed'];
   return Object.fromEntries(keys.filter(key => body[key] !== undefined).map(key => [key, body[key]]));
 }
 function persistAnalysis(body) { const next = { ...lightweightAnalysis(storedAnalysis()), ...lightweightAnalysis(body), progress_percent: Math.max(lastConfirmedProgress, Number(body.progress_percent ?? body.progress ?? 0)) }; safeLocalStorageSetItem(analysisStateKey, JSON.stringify(next)); }
@@ -232,9 +232,11 @@ function uploadProgressPanel() {
   const canResume = stopped || sessionJob?.state === 'reconnecting';
   const stageLabel = sessionJob?.stage_label || normalizeStageLabel(stage, labsUploadBusy ? 'Uploading file' : (sessionJob?.user_message || sessionJob?.message || 'Preparing package'));
   const elapsed = elapsedSeconds(sessionJob);
+  const warningCount = Number(sessionJob?.warning_count || 0);
+  const warningDetail = warningCount ? `${warningCount} recoverable warning${warningCount === 1 ? '' : 's'} recorded` : '';
   const debug = window.CREWBIDIQ_ANALYSIS_DEBUG_ENABLED === true ? `<dl class="analysis-debug"><dt>Package ID</dt><dd>${escapeHtml(activePackageId() || '—')}</dd><dt>Job ID</dt><dd>${escapeHtml(currentJobId() || '—')}</dd><dt>State</dt><dd>${escapeHtml(sessionJob?.state || 'idle')}</dd><dt>Last confirmed progress</dt><dd>${escapeHtml(percent || 0)}%</dd><dt>Last successful poll</dt><dd>${escapeHtml(sessionJob?.last_successful_poll_at || '—')}</dd><dt>Latest status</dt><dd>${escapeHtml(latestStatusCode ?? '—')}</dd><dt>Retry count</dt><dd>${escapeHtml(sessionPollFailures)}</dd></dl>` : '';
   return `<div class="labs-processing ${stopped ? 'failed' : ''}">
-    <div class="labs-processing-heading"><div><span>${stopped ? 'Analysis needs attention' : `Processing ${escapeHtml(packageName)} bid package`}</span><strong>${escapeHtml(stageLabel)}</strong><small>${escapeHtml(pageDetail || fileDetail || sessionJob?.user_message || sessionJob?.message || 'Your progress is saved if you move to another Labs page.')}</small></div><div><strong>${percent == null ? '—' : `${escapeHtml(percent)}%`}</strong><small>${escapeHtml(elapsed)}s elapsed</small></div></div>
+    <div class="labs-processing-heading"><div><span>${stopped ? 'Analysis needs attention' : `Processing ${escapeHtml(packageName)} bid package`}</span><strong>${escapeHtml(stageLabel)}</strong><small>${escapeHtml([pageDetail || fileDetail || sessionJob?.user_message || sessionJob?.message || 'Your progress is saved if you move to another Labs page.', warningDetail].filter(Boolean).join(' · '))}</small></div><div><strong>${percent == null ? '—' : `${escapeHtml(percent)}%`}</strong><small>${escapeHtml(elapsed)}s elapsed</small></div></div>
     <div class="progress"><i style="width:${Math.max(0, Math.min(Number(percent) || (labsUploadBusy ? 4 : 0), 100))}%"></i></div>
     <ol class="labs-stage-list">${processingStages.map(([value, label], index) => `<li class="${index < activeIndex ? 'done' : (index === activeIndex ? 'active' : '')}"><span>${index + 1}</span>${escapeHtml(label)}</li>`).join('')}</ol>
     ${stopped ? `<div class="labs-upload-error"><strong>${escapeHtml(sessionJob?.user_message || sessionJob?.error || 'The server could not analyze this package.')}</strong><p>Resume the saved analysis, select the airline manually, or upload the package again.</p></div>` : ''}
@@ -289,7 +291,10 @@ function packageLabsPath(packageId = activePackageId()) {
 
 function dashboardStatus() {
   const state = sharedJobState(sessionJob || {});
-  if (sessionJob?.status === 'complete' || state === 'completed') return ['ready', 'Analysis ready'];
+  if (sessionJob?.status === 'complete' || state === 'completed') {
+    const warningCount = Number(sessionJob?.warning_count || 0);
+    return warningCount ? ['attention', `Ready with ${warningCount} warning${warningCount === 1 ? '' : 's'}`] : ['ready', 'Analysis ready'];
+  }
   if (state === 'failed' || state === 'expired' || state === 'cancelled') return ['attention', 'Needs attention'];
   if (state === 'reconnecting') return ['processing', 'Reconnecting'];
   return ['processing', sessionJob?.stage_label || 'Processing package'];
@@ -407,17 +412,40 @@ function dashboardStrategy() {
 function dashboardLocationRows() {
   const synopsis = sessionJob?.synopsis || {};
   const rows = [];
-  (synopsis.start_airports || []).forEach(item => rows.push({ code: item.airport, role: 'Bid base', count: item.count, percent: item.percent }));
-  (synopsis.layover_cities || []).forEach(item => {
-    if (!rows.some(row => row.code === item.city)) rows.push({ code: item.city, role: 'Overnight', count: item.count, percent: item.percent });
+  (synopsis.start_airports || []).forEach(item => rows.push({ code: item.airport, name: item.airport, role: 'Bid base', count: item.count, percent: item.percent }));
+  const layovers = synopsis.layover_options?.airports || synopsis.layover_cities || [];
+  layovers.forEach(item => {
+    const code = item.airport || item.city;
+    if (!rows.some(row => row.code === code)) rows.push({ code, name: item.layover_market || item.name || item.city || code, role: 'Overnight', count: item.count, percent: item.percent, theater: item.theater });
   });
-  return rows.filter(item => item.code).slice(0, 12);
+  return rows.filter(item => item.code).slice(0, 24);
+}
+
+const DASHBOARD_COVERAGE_PALETTES = {
+  dark: ['#20344A', '#27516A', '#2F6E86', '#3B8AA0', '#62AFC0'],
+  light: ['#D9E7EC', '#B7D5DE', '#8ABDCB', '#569BAE', '#256D7D'],
+};
+
+function dashboardCoverageBin(count, maximum) {
+  if (!Number(count) || !Number(maximum)) return 0;
+  return Math.min(4, Math.max(0, Math.ceil((Number(count) / Number(maximum)) * 5) - 1));
+}
+
+function dashboardCoveragePalette() {
+  const selected = document.documentElement.dataset.theme;
+  const dark = selected === 'dark' || (selected === 'system' && window.matchMedia?.('(prefers-color-scheme: dark)').matches);
+  return DASHBOARD_COVERAGE_PALETTES[dark ? 'dark' : 'light'];
+}
+
+function dashboardCoverageLegend() {
+  const labels = ['Lowest', 'Low', 'Moderate', 'High', 'Highest'];
+  return `<div class="coverage-legend" aria-label="Published trip records by market density"><strong>Published trip records</strong><div>${labels.map((label, index) => `<span><i data-density-bin="${index}"></i>${label}</span>`).join('')}</div><small>Five package-relative bins · no invented values</small></div>`;
 }
 
 function dashboardLocations() {
   const rows = dashboardLocationRows();
   return `<section id="locations" class="command-card command-locations"><div class="command-card-heading"><span class="command-icon">${dashboardIcon('pin')}</span><div><span class="kicker">BID LOCATIONS</span><h2>Package network</h2></div><span class="data-badge">${rows.length ? `${rows.length} detected` : 'Partial data'}</span></div>
-    <div class="location-layout"><div id="dashboardMap" class="command-map" aria-label="Detected bid locations map">${rows.length ? '' : '<div class="map-empty">No geocoded locations were detected.</div>'}</div><div class="location-table" role="table" aria-label="Detected package locations"><div role="row" class="location-table-head"><span role="columnheader">Location</span><span role="columnheader">Relationship</span><span role="columnheader">Records</span></div>${rows.length ? rows.map(item => `<div role="row"><strong role="cell">${escapeHtml(item.code)}</strong><span role="cell">${escapeHtml(item.role)}</span><span role="cell">${escapeHtml(item.count ?? '—')}</span></div>`).join('') : '<p class="partial-copy">Location records are unavailable for this package.</p>'}</div></div>
+    <div class="location-layout"><div><div id="dashboardMap" class="command-map" aria-label="Package location density map">${rows.length ? '' : '<div class="map-empty">No geocoded locations were detected.</div>'}</div>${dashboardCoverageLegend()}</div><div class="location-table" role="table" aria-label="Detected package locations"><div role="row" class="location-table-head"><span role="columnheader">Location</span><span role="columnheader">Relationship</span><span role="columnheader">Records</span></div>${rows.length ? rows.map(item => `<button type="button" role="row" class="location-row" data-location-code="${escapeHtml(item.code)}"><strong role="cell">${escapeHtml(item.code)}</strong><span role="cell">${escapeHtml(item.role)}</span><span role="cell">${escapeHtml(item.count ?? '—')}</span></button>`).join('') : '<p class="partial-copy">Location records are unavailable for this package.</p>'}</div></div>
   </section>`;
 }
 
@@ -474,11 +502,19 @@ function initializeDashboardMap() {
   window.L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>', maxZoom: 19 }).addTo(dashboardMap);
   dashboardMapLayers = window.L.layerGroup().addTo(dashboardMap);
   const bounds = [];
+  const palette = dashboardCoveragePalette();
+  const maximum = Math.max(...locations.map(item => Number(item.count || 0)), 1);
+  const markerByCode = new Map();
   const coordinateByCode = new Map(locations.map(item => [item.coordinate.code, item.coordinate]));
   locations.forEach(item => {
     const point = [item.coordinate.latitude, item.coordinate.longitude];
     bounds.push(point);
-    window.L.circleMarker(point, { radius: item.role === 'Bid base' ? 8 : 6, weight: 2, color: '#071525', fillColor: item.role === 'Bid base' ? '#22d3ee' : '#8b7cff', fillOpacity: 1 }).bindTooltip(`${item.coordinate.code} · ${item.role}`).addTo(dashboardMapLayers);
+    const bin = dashboardCoverageBin(item.count, maximum);
+    const name = item.name && item.name !== item.code ? item.name : item.coordinate.name;
+    const tooltip = `${name || item.code} (${item.code}) — ${Number(item.count || 0)} published trip records`;
+    const marker = window.L.circleMarker(point, { radius: 6 + bin, weight: 2, color: document.documentElement.dataset.theme === 'dark' ? '#334155' : '#94A3B8', fillColor: palette[bin], fillOpacity: .96 })
+      .bindTooltip(tooltip, { direction: 'top', className: 'coverage-tooltip' }).addTo(dashboardMapLayers);
+    markerByCode.set(item.code, marker);
   });
   (dashboardRecommendations?.results || []).slice(0, 5).forEach(item => {
     const codes = String(item.simplified_route || '').split(/[–—→>\-]+/).map(value => value.trim().toUpperCase()).filter(Boolean);
@@ -486,6 +522,16 @@ function initializeDashboardMap() {
     if (points.length > 1) window.L.polyline(points, { color: '#2e8bff', weight: 2, opacity: .42 }).addTo(dashboardMapLayers);
   });
   dashboardMap.fitBounds(bounds, { padding: [24, 24], maxZoom: 5 });
+  document.querySelectorAll('[data-location-code]').forEach(button => {
+    const marker = markerByCode.get(button.dataset.locationCode);
+    if (!marker) return;
+    const show = () => { marker.setStyle({ weight: 4, color: '#F8FAFC' }); marker.openTooltip(); };
+    const hide = () => { marker.setStyle({ weight: 2, color: document.documentElement.dataset.theme === 'dark' ? '#334155' : '#94A3B8' }); marker.closeTooltip(); };
+    button.addEventListener('focus', show); button.addEventListener('mouseenter', show);
+    button.addEventListener('blur', hide); button.addEventListener('mouseleave', hide);
+    button.addEventListener('click', () => dashboardMap.flyTo(marker.getLatLng(), Math.max(dashboardMap.getZoom(), 5), { duration: .35 }));
+  });
+  document.querySelectorAll('[data-density-bin]').forEach(swatch => { swatch.style.backgroundColor = palette[Number(swatch.dataset.densityBin)]; });
   setTimeout(() => dashboardMap?.invalidateSize(), 0);
 }
 
@@ -567,6 +613,42 @@ function landingPage() {
     </section>`;
 }
 
+function packageLayoverSelector(id, selectedValue, heading) {
+  const groups = sessionJob?.synopsis?.layover_options?.theaters || [];
+  const raw = Array.isArray(selectedValue) ? selectedValue : String(selectedValue || '').split(',');
+  const selected = new Set(raw.map(value => String(value).trim().toUpperCase()).filter(Boolean));
+  const allowed = new Set(groups.flatMap(group => [group.code, ...(group.airports || []).map(item => item.airport)]));
+  const initial = [...selected].filter(value => allowed.has(value));
+  if (!groups.length) return `<div class="layover-selector layover-selector-empty"><span>${escapeHtml(heading)}</span><input id="${id}" type="hidden" value=""><p>No published layovers are available in the active package.</p></div>`;
+  return `<fieldset class="layover-selector" data-layover-selector="${id}"><legend>${escapeHtml(heading)}</legend><input id="${id}" type="hidden" value="${escapeHtml(initial.join(', '))}"><input class="layover-search" type="search" placeholder="Search airport, city, country, alias, or region" aria-label="Search ${escapeHtml(heading.toLowerCase())}"><div class="layover-groups">${groups.map(group => `<details open data-layover-group><summary><label><input type="checkbox" value="${escapeHtml(group.code)}" data-layover-value ${selected.has(group.code) ? 'checked' : ''}><span>${escapeHtml(group.label)}</span><small>${escapeHtml(group.count)} trip records</small></label></summary><div>${(group.airports || []).map(item => `<label data-layover-option data-search-text="${escapeHtml(`${item.airport} ${item.city} ${item.name} ${item.country_code || ''} ${item.country_name || ''} ${group.code} ${group.label} ${(item.aliases || []).join(' ')}`.toLowerCase())}"><input type="checkbox" value="${escapeHtml(item.airport)}" data-layover-value ${selected.has(item.airport) ? 'checked' : ''}><span><strong>${escapeHtml(item.airport)}</strong>${escapeHtml(item.city || item.name || item.airport)}</span><small>${escapeHtml(item.count)}</small></label>`).join('')}</div></details>`).join('')}</div><small class="layover-selector-note">Only layovers found in this package can be selected. Region choices expand to their available airports when the bid plan is generated.</small></fieldset>`;
+}
+
+function syncLayoverSelector(container) {
+  const hidden = document.getElementById(container.dataset.layoverSelector);
+  if (!hidden) return;
+  hidden.value = [...container.querySelectorAll('[data-layover-value]:checked')].map(input => input.value).join(', ');
+}
+
+function setLayoverSelectorValues(id, values) {
+  const container = document.querySelector(`[data-layover-selector="${id}"]`);
+  const wanted = new Set((values || []).map(value => String(value).trim().toUpperCase()));
+  if (!container) { const hidden = document.getElementById(id); if (hidden) hidden.value = [...wanted].join(', '); return; }
+  container.querySelectorAll('[data-layover-value]').forEach(input => { input.checked = wanted.has(input.value); });
+  syncLayoverSelector(container);
+}
+
+function bindLayoverSelectors() {
+  document.querySelectorAll('[data-layover-selector]').forEach(container => {
+    container.querySelectorAll('[data-layover-value]').forEach(input => input.addEventListener('change', () => syncLayoverSelector(container)));
+    container.querySelector('.layover-search')?.addEventListener('input', event => {
+      const query = event.target.value.trim().toLowerCase();
+      container.querySelectorAll('[data-layover-option]').forEach(option => { option.hidden = Boolean(query) && !option.dataset.searchText.includes(query); });
+      container.querySelectorAll('[data-layover-group]').forEach(group => { group.open = true; });
+    });
+    syncLayoverSelector(container);
+  });
+}
+
 function builderPage() {
   const classic = readJson('crewbidiqProfile', {});
   const draft = readJson(draftKey, {}) || {};
@@ -584,8 +666,8 @@ function builderPage() {
         <label>Primary goal<select id="labsFocus"><option value="quality">Quality of life</option><option value="days_off">Protect days off</option><option value="layovers">Preferred layovers</option><option value="credit">${escapeHtml(payGoalLabel())}</option><option value="commute">Commute-friendly trips</option></select></label>
         <label>Required days off<input id="labsRequiredDays" value="${escapeHtml(value('requiredDays', 'required_days_off'))}" placeholder="8/11, 8/18"></label>
         <label>Trip length priority (best to least)<input id="labsTripLengths" value="${escapeHtml(tripLengths)}" placeholder="6+, 5, 4, 3, 2, 1"></label>
-        <label>Highest-priority layovers<input id="labsLayovers" value="${escapeHtml(value('layovers', 'elite_cities'))}" placeholder="HNL, OGG, LIH"></label>
-        <label>Avoid layovers<input id="labsAvoidLayovers" value="${escapeHtml(value('avoidLayovers', 'penalty_cities'))}" placeholder="DFW, IAH"></label>
+        ${packageLayoverSelector('labsLayovers', value('layovers', 'elite_cities'), 'Highest-priority layovers')}
+        ${packageLayoverSelector('labsAvoidLayovers', value('avoidLayovers', 'penalty_cities'), 'Avoid layovers')}
         <label>Maximum legs per duty day<input id="labsMaxLegs" type="number" min="1" value="${escapeHtml(value('maxLegs', 'max_legs_per_day'))}" placeholder="3"></label>
         <label>Earliest report<input id="labsEarliestReport" type="time" value="${escapeHtml(value('earliestReport'))}"></label>
         <label>Latest release<input id="labsLatestRelease" type="time" value="${escapeHtml(value('latestRelease'))}"></label>
@@ -920,6 +1002,7 @@ function bindUploader() {
 function bindBuilder() {
   const button = document.getElementById('saveLabsDraft');
   if (!button) return;
+  bindLayoverSelectors();
   const draft = readJson(draftKey, {}) || {};
   document.getElementById('labsFocus').value = draft.focus || 'quality';
   document.getElementById('labsRiskTolerance').value = draft.riskTolerance || 'balanced';
@@ -984,7 +1067,7 @@ function bindBuilder() {
   document.getElementById('applyLabsIntent')?.addEventListener('click', () => {
     const parsed = (tripIntentResult || draft.tripIntentResult || {}).profile || {};
     if (parsed.trip_length_priority) document.getElementById('labsTripLengths').value = parsed.trip_length_priority.join(', ');
-    if (parsed.secondary_cities) document.getElementById('labsLayovers').value = parsed.secondary_cities.join(', ');
+    if (parsed.secondary_cities) setLayoverSelectorValues('labsLayovers', parsed.secondary_cities);
     if (parsed.max_legs_per_day || parsed.hard_max_legs_per_day) document.getElementById('labsMaxLegs').value = parsed.hard_max_legs_per_day || parsed.max_legs_per_day;
     draft.interpretedProfile = parsed;
     saveCurrentDraft(true);
@@ -1121,7 +1204,7 @@ function applySharedJob(body) {
     if (labsPage === 'analysis_dashboard') loadDashboardRecommendations(jobId);
     if (labsPage === 'recommendations') loadRefinedRecommendations(jobId);
     if (labsPage === 'plan') { loadMonthPlan(jobId); loadNavbluePlan(jobId); }
-  } else if (['queued', 'parsing', 'normalizing', 'ranking'].includes(state)) scheduleSharedPoll(2000);
+  } else if (['queued', 'parsing', 'retrying', 'normalizing', 'ranking'].includes(state)) scheduleSharedPoll(2000);
 }
 function handleSharedFailure(error) {
   const status = Number(error.status || 0), code = error.detail?.error_code || 'POLLING_NETWORK_ERROR';
@@ -1251,7 +1334,15 @@ async function loadSharedSession() {
   finally { sessionPollInFlight = false; }
 }
 
-document.documentElement.dataset.theme = 'dark';
+function applyLabsTheme() {
+  document.documentElement.dataset.theme = localStorage.getItem('crewbidiqTheme') || 'dark';
+}
+applyLabsTheme();
+document.getElementById('labsTheme')?.addEventListener('click', () => {
+  const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+  safeLocalStorageSetItem('crewbidiqTheme', next); applyLabsTheme();
+  if (document.getElementById('dashboardMap')) requestAnimationFrame(initializeDashboardMap);
+});
 render();
 loadSharedSession();
 window.addEventListener('online', () => { if (currentJobId() || activePackageId()) resumeSharedAnalysis(); });

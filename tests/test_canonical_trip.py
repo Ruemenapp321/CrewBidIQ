@@ -45,7 +45,8 @@ def test_typed_canonical_schema_contains_required_cross_airline_fields():
     }
     assert {field.name for field in fields(Layover)} == {
         "after_duty_day", "airport", "city", "hotel", "transportation", "start_local",
-        "end_local", "duration", "validated",
+        "end_local", "duration", "validated", "arrival_airport", "layover_market",
+        "country_code", "theater", "duration_minutes", "source",
     }
     assert {field.name for field in fields(PayBreakdown)} == {
         "trip_credit", "edp", "hol", "sit", "additional_pay", "total_pay",
